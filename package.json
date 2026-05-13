@@ -1,20 +1,73 @@
 {
-  "name": "stateful-ci",
+  "name": "stateful-ci-workspace",
   "private": true,
+  "description": "Persistent CI workspaces for GitHub Actions. Restore, run, and save build state across ephemeral runners using your own Cloudflare backend.",
+  "keywords": [
+    "bun",
+    "cache",
+    "ci",
+    "cloudflare",
+    "durable-objects",
+    "github-actions",
+    "tui"
+  ],
+  "homepage": "https://github.com/eersnington/stateful-ci#readme",
+  "bugs": {
+    "url": "https://github.com/eersnington/stateful-ci/issues"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eersnington/stateful-ci.git"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
-    "lint": "turbo run lint",
-    "format": "prettier --write \"**/*.{ts,tsx,md}\"",
-    "check-types": "turbo run check-types"
+    "test": "turbo run test",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "turbo run build && changeset publish",
+    "typecheck": "turbo run typecheck",
+    "lint": "ultracite check",
+    "lint:fix": "ultracite fix",
+    "prepare": "lefthook install"
   },
   "devDependencies": {
-    "prettier": "^3.7.4",
-    "turbo": "^2.9.12",
-    "typescript": "5.9.2"
+    "@changesets/cli": "2.27.0",
+    "@effect/language-service": "0.85.1",
+    "@effect/tsgo": "0.5.2",
+    "@effect/vitest": "catalog:",
+    "lefthook": "2.1.6",
+    "oxfmt": "0.48.0",
+    "oxlint": "1.63.0",
+    "turbo": "2.9.12",
+    "typescript": "6.0.2",
+    "ultracite": "7.7.0",
+    "vitest": "catalog:"
   },
-  "packageManager": "pnpm@9.0.0",
   "engines": {
-    "node": ">=18"
+    "bun": "^1.3.11",
+    "node": "^24.13.1"
+  },
+  "packageManager": "bun@1.3.13",
+  "catalog": {
+    "effect": "4.0.0-beta.65",
+    "@effect/platform-bun": "4.0.0-beta.65",
+    "@effect/platform-node": "4.0.0-beta.65",
+    "@effect/vitest": "4.0.0-beta.65",
+    "@types/node": "24.3.1",
+    "bun-types": "1.3.13",
+    "vitest": "4.1.5",
+    "tsup": "8.5.1",
+    "@effect/opentelemetry": "4.0.0-beta.65"
   }
 }

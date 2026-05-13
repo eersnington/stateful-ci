@@ -1,159 +1,141 @@
-# Turborepo starter
+# stateful-ci
 
-This Turborepo starter is maintained by the Turborepo core team.
+![Status](https://img.shields.io/badge/status-early%20development-f59e0b?style=flat-square)
 
-## Using this example
+> Experimental: This is an early release of stateful-ci. APIs, config, and behavior may change.
 
-Run the following command:
+stateful-ci gives GitHub Actions jobs a persistent workspace across ephemeral runners.
 
-```sh
-npx create-turbo@latest
+It restores selected paths before a job starts, runs your normal CI steps, then saves the resulting workspace state for the next run. The backend runs in your own Cloudflare account.
+
+In practice:
+
+- The runner can still be disposable, but the workspace state does not have to be.
+- You choose which paths are part of the workspace: package stores, build outputs, framework caches, generated files, browser assets, or anything else your project needs.
+- Snapshots include provenance, so state from untrusted runs cannot become trusted release or deploy state.
+
+## How it works
+
+```
+┌───────────────────────┐
+│ GitHub Actions runner │
+└──────────┬────────────┘
+           │
+           │ restore
+           ▼
+┌───────────────────────┐
+│   stateful-ci CLI     │
+└──────────┬────────────┘
+           │
+           ▼
+┌───────────────────────┐
+│  Cloudflare Worker    │
+└──────────┬────────────┘
+           │
+           ├── Durable Object
+           │   coordinates workspace state and snapshot commits
+           │
+           ├── D1
+           │   stores runs, snapshots, metadata, and decisions
+           │
+           └── R2
+               stores workspace snapshot data
 ```
 
-## What's inside?
+A run has two phases:
 
-This Turborepo includes the following packages/apps:
-
-### Apps and Packages
-
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `eslint-config-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
-
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+```
+restore selected workspace paths
+└─ run normal CI commands
+   └─ save selected workspace paths
+      └─ next run can restore from that snapshot
 ```
 
-Without global `turbo`, use your package manager:
+## Configuration
 
-```sh
-cd my-turborepo
-npx turbo build
-pnpm dlx turbo build
-pnpm exec turbo build
+Start with a preset:
+
+```json
+{
+  "preset": "node"
+}
 ```
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+Or choose paths directly:
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo build --filter=docs
+```json
+{
+  "paths": ["node_modules", ".pnpm-store", ".turbo", ".next/cache"],
+  "exclude": ["coverage"]
+}
 ```
 
-Without global `turbo`:
+## Usage
 
-```sh
-npx turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
+Initialize it in your repo:
+
+```bash
+bunx stateful-ci init
 ```
 
-### Develop
+Deploy the backend:
 
-To develop all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo dev
+```bash
+bunx stateful-ci deploy
 ```
 
-Without global `turbo`, use your package manager:
+Use it in GitHub Actions:
 
-```sh
-cd my-turborepo
-npx turbo dev
-pnpm exec turbo dev
-pnpm exec turbo dev
+```yaml
+- uses: eersnington/stateful-ci@v1
+  with:
+    command: restore
+
+- run: bun install
+- run: bun test
+
+- uses: eersnington/stateful-ci@v1
+  if: always()
+  with:
+    command: save
 ```
 
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+Inspect local state and published CI runs with TUI (OpenTUI):
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
+```bash
+bunx stateful-ci
 ```
 
-Without global `turbo`:
+## Architecture
 
-```sh
-npx turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-pnpm exec turbo dev --filter=web
+stateful-ci has three main pieces:
+
+| Piece                    | Role                                                                                           |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| `stateful-ci` CLI        | Runs locally and inside GitHub Actions. Restores, saves, deploys, and opens the TUI dashboard. |
+| Cloudflare Worker        | Receives restore/save requests and routes workspace operations.                                |
+| Durable Object + D1 + R2 | Coordinates snapshot state, records metadata, and stores workspace data.                       |
+
+The Cloudflare backend is deployed to your own account. There is no hosted service required.
+
+## Security model
+
+Persistent workspace state needs provenance.
+
+stateful-ci records where each snapshot came from and separates state by trust boundary.
+
+```
+trusted branch snapshot
+├─ can seed trusted jobs
+└─ can seed pull request jobs
+
+untrusted pull request snapshot
+├─ can be reused by that pull request
+└─ cannot become state for trusted branches, releases, or deploy jobs
 ```
 
-### Remote Caching
+The goal is workspace continuity without turning persistent state into a cache-poisoning path.
 
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
+## License
 
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
-pnpm exec turbo login
-pnpm exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-pnpm exec turbo link
-pnpm exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+Apache-2.0

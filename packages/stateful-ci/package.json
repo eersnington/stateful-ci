@@ -1,0 +1,22 @@
+{
+  "name": "stateful-ci",
+  "version": "0.0.0",
+  "private": false,
+  "bin": {
+    "stateful-ci": "./src/cli.ts"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "dev": "bun src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@stateful-ci/core": "workspace:*",
+    "effect": "catalog:"
+  }
+}
