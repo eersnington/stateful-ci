@@ -1,12 +1,10 @@
 #!/usr/bin/env node
-import { constants } from "node:fs";
-import { access, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { defaultConfig, StatefulCiConfig } from "@stateful-ci/core";
-import { Console, Effect, Schema } from "effect";
+import type { PlatformError } from "effect";
+import { Console, Effect, FileSystem, Path, Schema } from "effect";
 import { Command } from "effect/unstable/cli";
 
 export const configFileName = "stateful-ci.json";
@@ -16,37 +14,34 @@ interface ConfigAlreadyExists {
   readonly path: string;
 }
 
-const pathExists = (path: string) =>
-  Effect.promise(async () => {
-    try {
-      await access(path, constants.F_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  });
+interface ConfigWriteFailed {
+  readonly _tag: "ConfigWriteFailed";
+  readonly cause: PlatformError.PlatformError;
+  readonly path: string;
+}
 
-export const writeDefaultConfig = (directory: string) =>
+const configText = `${JSON.stringify(
+  Schema.encodeUnknownSync(StatefulCiConfig)(defaultConfig),
+  null,
+  2
+)}\n`;
+
+const configWriteError = (
+  path: string,
+  cause: PlatformError.PlatformError
+): ConfigAlreadyExists | ConfigWriteFailed =>
+  cause.reason._tag === "AlreadyExists"
+    ? { _tag: "ConfigAlreadyExists", path }
+    : { _tag: "ConfigWriteFailed", cause, path };
+
+const writeDefaultConfig = (directory: string) =>
   Effect.gen(function* writeDefaultConfigEffect() {
-    const path = join(directory, configFileName);
+    const fs = yield* FileSystem.FileSystem;
+    const path = (yield* Path.Path).join(directory, configFileName);
 
-    if (yield* pathExists(path)) {
-      return yield* Effect.fail({ _tag: "ConfigAlreadyExists", path } as const);
-    }
-
-    yield* Effect.tryPromise({
-      catch: (cause) => ({ _tag: "ConfigWriteFailed", cause, path }) as const,
-      try: () =>
-        writeFile(
-          path,
-          `${JSON.stringify(
-            Schema.encodeUnknownSync(StatefulCiConfig)(defaultConfig),
-            null,
-            2
-          )}\n`,
-          { flag: "wx" }
-        ),
-    });
+    yield* fs
+      .writeFileString(path, configText, { flag: "wx" })
+      .pipe(Effect.mapError((cause) => configWriteError(path, cause)));
 
     return path;
   });
