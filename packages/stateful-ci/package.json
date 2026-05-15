@@ -1,6 +1,6 @@
 {
   "name": "stateful-ci",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "private": false,
   "bin": {
     "stateful-ci": "./src/cli.ts"
@@ -12,7 +12,7 @@
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target node",
     "dev": "bun src/cli.ts",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
