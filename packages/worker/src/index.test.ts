@@ -2,6 +2,10 @@ import { describe, expect, test } from "vitest";
 
 import worker, { maxProtocolBodyBytes } from "./index";
 
+const env = {
+  STATEFUL_CI_API_TOKEN: "test-token",
+};
+
 const restoreRequest = {
   client: {
     configHash: "sha256:config",
@@ -47,14 +51,18 @@ const saveRequest = {
 const jsonRequest = (path: string, body: unknown) =>
   new Request(`https://stateful-ci.test${path}`, {
     body: JSON.stringify(body),
-    headers: { "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+      "content-type": "application/json",
+    },
     method: "POST",
   });
 
 describe("worker API", () => {
   test("GET /health returns protocol health", async () => {
     const response = await worker.fetch(
-      new Request("https://stateful-ci.test/health")
+      new Request("https://stateful-ci.test/health"),
+      env
     );
 
     expect(response.status).toBe(200);
@@ -67,7 +75,8 @@ describe("worker API", () => {
 
   test("POST /v1/restore validates requests and denies until policy exists", async () => {
     const response = await worker.fetch(
-      jsonRequest("/v1/restore", restoreRequest)
+      jsonRequest("/v1/restore", restoreRequest),
+      env
     );
 
     expect(response.status).toBe(200);
@@ -80,7 +89,10 @@ describe("worker API", () => {
   });
 
   test("POST /v1/save validates requests and denies until policy exists", async () => {
-    const response = await worker.fetch(jsonRequest("/v1/save", saveRequest));
+    const response = await worker.fetch(
+      jsonRequest("/v1/save", saveRequest),
+      env
+    );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
@@ -93,9 +105,13 @@ describe("worker API", () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/v1/restore", {
         body: "{not-json",
-        headers: { "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+          "content-type": "application/json",
+        },
         method: "POST",
-      })
+      }),
+      env
     );
 
     expect(response.status).toBe(400);
@@ -106,7 +122,8 @@ describe("worker API", () => {
 
   test("schema-invalid JSON returns structured 400", async () => {
     const response = await worker.fetch(
-      jsonRequest("/v1/restore", { ...restoreRequest, github: {} })
+      jsonRequest("/v1/restore", { ...restoreRequest, github: {} }),
+      env
     );
 
     expect(response.status).toBe(400);
@@ -119,9 +136,13 @@ describe("worker API", () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/v1/restore", {
         body: JSON.stringify({ payload: "a".repeat(maxProtocolBodyBytes) }),
-        headers: { "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+          "content-type": "application/json",
+        },
         method: "POST",
-      })
+      }),
+      env
     );
 
     expect(response.status).toBe(413);
@@ -133,7 +154,8 @@ describe("worker API", () => {
 
   test("unknown routes return structured 404", async () => {
     const response = await worker.fetch(
-      new Request("https://stateful-ci.test/missing")
+      new Request("https://stateful-ci.test/missing"),
+      env
     );
 
     expect(response.status).toBe(404);
@@ -144,7 +166,8 @@ describe("worker API", () => {
 
   test("wrong methods return structured 405", async () => {
     const response = await worker.fetch(
-      new Request("https://stateful-ci.test/v1/restore")
+      new Request("https://stateful-ci.test/v1/restore"),
+      env
     );
 
     expect(response.status).toBe(405);
@@ -152,6 +175,41 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       _tag: "MethodNotAllowed",
       allowed: ["POST"],
+    });
+  });
+
+  test("restore without an authorization token returns structured 401", async () => {
+    const response = await worker.fetch(
+      new Request("https://stateful-ci.test/v1/restore", {
+        body: JSON.stringify(restoreRequest),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }),
+      env
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "Unauthorized",
+    });
+  });
+
+  test("restore with the wrong authorization token returns structured 403", async () => {
+    const response = await worker.fetch(
+      new Request("https://stateful-ci.test/v1/restore", {
+        body: JSON.stringify(restoreRequest),
+        headers: {
+          authorization: "Bearer wrong-token",
+          "content-type": "application/json",
+        },
+        method: "POST",
+      }),
+      env
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "Forbidden",
     });
   });
 });
