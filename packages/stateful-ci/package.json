@@ -16,7 +16,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@effect/platform-node": "catalog:",
     "@stateful-ci/core": "workspace:*",
     "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:"
   }
 }
