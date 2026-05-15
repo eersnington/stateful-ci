@@ -1,4 +1,17 @@
 export { ApiError, type ApiError as ApiErrorType } from "./errors/api-error";
+export {
+  defaultConfig,
+  ExplicitWorkspaceConfig,
+  NodePresetConfig,
+  StatefulCiConfig,
+  WorkspacePath,
+} from "./config";
+export type {
+  ExplicitWorkspaceConfig as ExplicitWorkspaceConfigType,
+  NodePresetConfig as NodePresetConfigType,
+  StatefulCiConfig as StatefulCiConfigType,
+  WorkspacePath as WorkspacePathType,
+} from "./config";
 export { Forbidden } from "./errors/forbidden";
 export { InvalidJsonBody } from "./errors/invalid-json-body";
 export { InvalidProtocolPayload } from "./errors/invalid-protocol-payload";
