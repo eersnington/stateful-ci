@@ -1,7 +1,14 @@
 import { Result, Schema } from "effect";
 import { describe, expect, test } from "vitest";
 
-import { StatefulCiConfig } from "./index";
+import {
+  excludedPathsForConfig,
+  isBuiltInDeniedWorkspacePath,
+  isUserExcludedWorkspacePath,
+  nodePresetPaths,
+  StatefulCiConfig,
+  workspacePathsForConfig,
+} from "./index";
 
 const decodeResult = Schema.decodeUnknownResult(StatefulCiConfig);
 
@@ -40,6 +47,26 @@ describe("config schemas", () => {
   test("rejects paths that escape the workspace", () => {
     expect(
       Result.isFailure(decodeResult({ paths: ["../node_modules"] }))
+    ).toBeTruthy();
+  });
+
+  test("expands preset and explicit workspace path policy", () => {
+    const explicitConfig = Schema.decodeUnknownSync(StatefulCiConfig)({
+      exclude: ["coverage"],
+      paths: [".turbo"],
+    });
+
+    expect(workspacePathsForConfig({ preset: "node" })).toBe(nodePresetPaths);
+    expect(workspacePathsForConfig(explicitConfig)).toStrictEqual([".turbo"]);
+    expect(excludedPathsForConfig(explicitConfig)).toStrictEqual(["coverage"]);
+  });
+
+  test("matches built-in and user workspace path safety rules", () => {
+    expect(isBuiltInDeniedWorkspacePath(".env")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath(".ssh/id_rsa")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath(".turbo/cache")).toBeFalsy();
+    expect(
+      isUserExcludedWorkspacePath(".turbo/cache/index.db", [".turbo/cache"])
     ).toBeTruthy();
   });
 });
