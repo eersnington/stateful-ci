@@ -27,7 +27,7 @@ import {
 } from "./metadata";
 import type { RefRow, RefTarget, SnapshotHeader } from "./metadata";
 import { evaluateRestorePolicy, evaluateSavePolicy } from "./policy";
-import { classifyRunTrust } from "./run-classification";
+import { classifyRunTrust, defaultTrustedRefs } from "./run-classification";
 
 /**
  * Maximum accepted size for JSON protocol request bodies.
@@ -56,10 +56,15 @@ const protocolBodyTooLarge = new RequestBodyTooLarge({
 
 const defaultMetadata = createInMemoryMetadataBackend();
 
-const trustedRefsFromEnv = (env: WorkerEnv | undefined) =>
-  env?.STATEFUL_CI_TRUSTED_REFS?.split(",")
+const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
+  const configured = env?.STATEFUL_CI_TRUSTED_REFS?.split(",")
     .map((ref) => ref.trim())
     .filter((ref) => ref.length > 0);
+
+  return configured === undefined || configured.length === 0
+    ? defaultTrustedRefs
+    : configured;
+};
 
 const isApiError = (error: unknown): error is ApiErrorType =>
   typeof error === "object" &&
@@ -200,15 +205,18 @@ const refSegment = (ref: string) => {
 
 const metadataTargetForRestore = (
   request: RestoreRequest,
-  env: WorkerEnv | undefined
+  trustedRefs: readonly string[]
 ): RefTarget => ({
   namespace: `repo=${request.workspace.repo}/workflow=${request.workspace.workflow}/job=${request.workspace.job}/config=${request.client.configHash}`,
-  refName: `${classifyRunTrust(request, { trustedRefs: trustedRefsFromEnv(env) })}/${refSegment(request.git.ref)}/latest`,
+  refName: `${classifyRunTrust(request, { trustedRefs })}/${refSegment(request.git.ref)}/latest`,
 });
 
-const trustedSeedTargetFor = (target: RefTarget): RefTarget => ({
+const trustedSeedTargetFor = (
+  target: RefTarget,
+  trustedRefs: readonly string[]
+): RefTarget => ({
   namespace: target.namespace,
-  refName: "trusted/main/latest",
+  refName: `trusted/${refSegment(trustedRefs[0] ?? defaultTrustedRefs[0])}/latest`,
 });
 
 const scopeKeyForTarget = (target: RefTarget) =>
@@ -216,11 +224,12 @@ const scopeKeyForTarget = (target: RefTarget) =>
 
 const restoreCandidateTargets = (
   target: RefTarget,
-  trustClass: ReturnType<typeof classifyRunTrust>
+  trustClass: ReturnType<typeof classifyRunTrust>,
+  trustedRefs: readonly string[]
 ) =>
   trustClass === "trusted" || trustClass === "unknown"
     ? [target]
-    : [target, trustedSeedTargetFor(target)];
+    : [target, trustedSeedTargetFor(target, trustedRefs)];
 
 const candidateProducerScope = (
   target: RefTarget,
@@ -247,10 +256,9 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(RestoreRequest))
     );
-    const trustClass = classifyRunTrust(restoreRequest, {
-      trustedRefs: trustedRefsFromEnv(env),
-    });
-    const target = metadataTargetForRestore(restoreRequest, env);
+    const trustedRefs = trustedRefsForEnv(env);
+    const trustClass = classifyRunTrust(restoreRequest, { trustedRefs });
+    const target = metadataTargetForRestore(restoreRequest, trustedRefs);
     const workspaceId = workspaceIdForTarget(target);
     const runId = runIdFromRestore(restoreRequest);
 
@@ -277,7 +285,7 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       );
     }
 
-    const candidates = restoreCandidateTargets(target, trustClass);
+    const candidates = restoreCandidateTargets(target, trustClass, trustedRefs);
     let deniedReason: DenialReason | null = null;
     let deniedSnapshotId: SnapshotHeader["snapshotId"] | null = null;
     let restored: {
@@ -350,6 +358,7 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
             ? { allowed: true, target: target.refName }
             : { allowed: false },
           trustClass,
+          ...(savePolicy.allowed ? { workspaceId } : {}),
         })
       );
     }

@@ -1,6 +1,9 @@
 import type { RestoreRequest, TrustClass } from "@stateful-ci/core";
 
-const defaultTrustedRefs = Object.freeze(["refs/heads/main", "refs/heads/master"]);
+export const defaultTrustedRefs = Object.freeze([
+  "refs/heads/main",
+  "refs/heads/master",
+] as const);
 
 export interface RunClassificationOptions {
   readonly trustedRefs?: readonly string[] | undefined;

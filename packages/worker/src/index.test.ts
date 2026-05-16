@@ -1,6 +1,7 @@
 import {
   ManifestKey,
   RestoreAllowedResponse,
+  RestoreDeniedResponse,
   RunId,
   Sha256Digest,
   SnapshotId,
@@ -179,6 +180,7 @@ describe("worker API", () => {
       reason: "no_compatible_snapshot",
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
+      workspaceId: seededWorkspaceId,
     });
   });
 
@@ -286,6 +288,7 @@ describe("worker API", () => {
       reason: "restore_policy_denied",
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
+      workspaceId: seededWorkspaceId,
     });
     await expect(
       Effect.runPromise(metadata.listAuditEvents)
@@ -326,6 +329,7 @@ describe("worker API", () => {
       reason: "restore_policy_denied",
       save: { allowed: true, target: featureRefName },
       trustClass: "internal",
+      workspaceId: workspaceIdFor(seededNamespace, featureRefName),
     });
   });
 
@@ -432,6 +436,10 @@ describe("worker API", () => {
       reason: "no_compatible_snapshot",
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
+      workspaceId: workspaceIdFor(
+        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:different-config",
+        seededRefName
+      ),
     });
   });
 
@@ -558,18 +566,86 @@ describe("worker API", () => {
   });
 
   test("POST /v1/restore lets a trusted first run save when no compatible snapshot exists", async () => {
+    const metadata = createInMemoryMetadataBackend();
     const response = await handleFetch(
       jsonRequest("/v1/restore", restoreRequest),
       env,
-      { metadata: createInMemoryMetadataBackend() }
+      { metadata }
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toStrictEqual({
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
+      await response.json()
+    );
+
+    expect(restoreBody).toStrictEqual({
       decision: "denied",
       reason: "no_compatible_snapshot",
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
+      workspaceId: seededWorkspaceId,
+    });
+
+    const saveResponse = await handleFetch(
+      jsonRequest("/v1/save", {
+        ...saveRequest,
+        baseSnapshotId: null,
+        workspaceId: restoreBody.workspaceId,
+      }),
+      env,
+      { metadata }
+    );
+
+    await expect(saveResponse.json()).resolves.toStrictEqual({
+      decision: "committed",
+      latest: true,
+      snapshotId: "snap_124",
+      workspaceId: seededWorkspaceId,
+    });
+    await expect(
+      Effect.runPromise(
+        metadata.getSnapshotHeader(Schema.decodeSync(SnapshotId)("snap_124"))
+      )
+    ).resolves.toMatchObject({
+      parentSnapshotId: null,
+      snapshotId: "snap_124",
+      workspaceId: seededWorkspaceId,
+    });
+    await expect(
+      Effect.runPromise(metadata.getRef(seededNamespace, seededRefName))
+    ).resolves.toMatchObject({
+      snapshotId: "snap_124",
+      trustClass: "trusted",
+    });
+  });
+
+  test("POST /v1/restore uses configured trusted refs for seed snapshots", async () => {
+    const masterRefName = "trusted/master/latest";
+    const masterSnapshotId = "snap_130";
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(masterRefName, masterSnapshotId, "trusted")],
+      snapshots: [
+        snapshotFor(
+          masterSnapshotId,
+          "trusted",
+          workspaceIdFor(seededNamespace, masterRefName)
+        ),
+      ],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", internalPullRequest),
+      {
+        ...env,
+        STATEFUL_CI_TRUSTED_REFS: "refs/heads/master",
+      },
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "allowed",
+      snapshot: { id: masterSnapshotId },
+      trustClass: "internal",
     });
   });
 
