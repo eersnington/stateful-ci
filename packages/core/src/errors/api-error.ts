@@ -1,10 +1,12 @@
 import { Schema } from "effect";
 
+import { Forbidden } from "./forbidden";
 import { InvalidJsonBody } from "./invalid-json-body";
 import { InvalidProtocolPayload } from "./invalid-protocol-payload";
 import { MethodNotAllowed } from "./method-not-allowed";
 import { RequestBodyTooLarge } from "./request-body-too-large";
 import { RouteNotFound } from "./route-not-found";
+import { Unauthorized } from "./unauthorized";
 
 export const ApiError = Schema.Union([
   InvalidJsonBody,
@@ -12,5 +14,7 @@ export const ApiError = Schema.Union([
   RouteNotFound,
   MethodNotAllowed,
   RequestBodyTooLarge,
+  Unauthorized,
+  Forbidden,
 ]);
 export type ApiError = Schema.Schema.Type<typeof ApiError>;

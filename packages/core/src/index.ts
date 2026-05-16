@@ -1,9 +1,11 @@
 export { ApiError, type ApiError as ApiErrorType } from "./errors/api-error";
+export { Forbidden } from "./errors/forbidden";
 export { InvalidJsonBody } from "./errors/invalid-json-body";
 export { InvalidProtocolPayload } from "./errors/invalid-protocol-payload";
 export { MethodNotAllowed } from "./errors/method-not-allowed";
 export { RequestBodyTooLarge } from "./errors/request-body-too-large";
 export { RouteNotFound } from "./errors/route-not-found";
+export { Unauthorized } from "./errors/unauthorized";
 export { ClientContext, GitContext, GitHubContext } from "./github";
 export {
   ManifestKey,
