@@ -85,7 +85,32 @@ describe("worker API", () => {
       decision: "denied",
       reason: "backend_policy_not_configured",
       save: { allowed: false },
-      trustClass: "unknown",
+      trustClass: "trusted",
+    });
+  });
+
+  test("POST /v1/restore includes derived fork pull request trust class", async () => {
+    const response = await worker.fetch(
+      jsonRequest("/v1/restore", {
+        ...restoreRequest,
+        git: {
+          ...restoreRequest.git,
+          baseRef: "main",
+          headRef: "feature",
+          headRepo: "contributor/stateful-ci",
+          ref: "refs/pull/12/merge",
+        },
+        github: { ...restoreRequest.github, event: "pull_request" },
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "backend_policy_not_configured",
+      save: { allowed: false },
+      trustClass: "external",
     });
   });
 

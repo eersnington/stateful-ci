@@ -16,6 +16,8 @@ import {
 } from "@stateful-ci/core";
 import { Effect, Exit, Schema } from "effect";
 
+import { classifyRunTrust } from "./run-classification";
+
 /**
  * Maximum accepted size for JSON protocol request bodies.
  *
@@ -153,15 +155,18 @@ const invalidProtocolPayload = () =>
 
 const decodeProtocolPayload =
   <A>(schema: Schema.Decoder<A>) =>
-  (body: unknown) =>
-    Exit.isFailure(Schema.decodeUnknownExit(schema)(body))
+  (body: unknown) => {
+    const decoded = Schema.decodeUnknownExit(schema)(body);
+
+    return Exit.isFailure(decoded)
       ? Effect.fail(invalidProtocolPayload())
-      : Effect.succeed(body);
+      : Effect.succeed(decoded.value);
+  };
 
 const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
   Effect.gen(function* handleRestoreEffect() {
     yield* authorizeRequest(request, env);
-    yield* readProtocolBody(request).pipe(
+    const restoreRequest = yield* readProtocolBody(request).pipe(
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(RestoreRequest))
     );
@@ -171,7 +176,7 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
         decision: "denied",
         reason: "backend_policy_not_configured",
         save: { allowed: false },
-        trustClass: "unknown",
+        trustClass: classifyRunTrust(restoreRequest),
       })
     );
   });
