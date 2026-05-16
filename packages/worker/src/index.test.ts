@@ -92,6 +92,56 @@ const seededRef = {
   version: 1,
 } satisfies RefRow;
 
+const workspaceIdFor = (namespace: string, refName: string) =>
+  Schema.decodeSync(WorkspaceId)(`ws:${namespace}:${refName}`);
+
+const snapshotFor = (
+  snapshotId: string,
+  trustClass: SnapshotHeader["trustClass"],
+  workspaceId: WorkspaceId
+) =>
+  ({
+    ...seededSnapshot,
+    snapshotId: Schema.decodeSync(SnapshotId)(snapshotId),
+    trustClass,
+    workspaceId,
+  }) satisfies SnapshotHeader;
+
+const refFor = (
+  refName: string,
+  snapshotId: string,
+  trustClass: RefRow["trustClass"]
+) =>
+  ({
+    ...seededRef,
+    refName,
+    snapshotId: Schema.decodeSync(SnapshotId)(snapshotId),
+    trustClass,
+  }) satisfies RefRow;
+
+const internalPullRequest = {
+  ...restoreRequest,
+  git: {
+    ...restoreRequest.git,
+    baseRef: "main",
+    headRef: "feature",
+    headRepo: "eersnington/stateful-ci",
+    ref: "refs/pull/12/merge",
+  },
+  github: { ...restoreRequest.github, event: "pull_request" },
+};
+
+const externalPullRequest = {
+  ...internalPullRequest,
+  git: { ...internalPullRequest.git, headRepo: "contributor/stateful-ci" },
+};
+
+const privilegedRelease = {
+  ...restoreRequest,
+  git: { ...restoreRequest.git, ref: "refs/tags/v1.0.0" },
+  github: { ...restoreRequest.github, event: "release" },
+};
+
 const jsonRequest = (path: string, body: unknown) =>
   new Request(`https://stateful-ci.test${path}`, {
     body: JSON.stringify(body),
@@ -127,7 +177,7 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
       reason: "no_compatible_snapshot",
-      save: { allowed: false },
+      save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
     });
   });
@@ -159,6 +209,206 @@ describe("worker API", () => {
     });
   });
 
+  test("POST /v1/restore lets trusted main seed same-repo pull requests", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", internalPullRequest),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "allowed",
+      save: { allowed: true, target: "internal/refs-pull-12-merge/latest" },
+      snapshot: { id: "snap_123" },
+      trustClass: "internal",
+    });
+  });
+
+  test("POST /v1/restore lets trusted main seed fork pull requests", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", externalPullRequest),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "allowed",
+      save: { allowed: false },
+      snapshot: { id: "snap_123" },
+      trustClass: "external",
+    });
+  });
+
+  test("POST /v1/restore lets trusted main seed privileged release runs", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", privilegedRelease),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "allowed",
+      save: { allowed: false },
+      snapshot: { id: "snap_123" },
+      trustClass: "privileged",
+    });
+  });
+
+  test("POST /v1/restore denies external snapshots renamed into trusted latest", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(seededRefName, "snap_125", "external")],
+      snapshots: [snapshotFor("snap_125", "external", seededWorkspaceId)],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "restore_policy_denied",
+      save: { allowed: true, target: seededRefName },
+      trustClass: "trusted",
+    });
+    await expect(
+      Effect.runPromise(metadata.listAuditEvents)
+    ).resolves.toStrictEqual([
+      expect.objectContaining({
+        decision: "denied",
+        reason: "restore_policy_denied",
+        snapshotId: "snap_125",
+      }),
+    ]);
+  });
+
+  test("POST /v1/restore denies internal snapshots retargeted across internal scopes", async () => {
+    const featureRefName = "internal/feature/latest";
+    const otherRefName = "internal/other/latest";
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(featureRefName, "snap_128", "internal")],
+      snapshots: [
+        snapshotFor(
+          "snap_128",
+          "internal",
+          workspaceIdFor(seededNamespace, otherRefName)
+        ),
+      ],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", {
+        ...restoreRequest,
+        git: { ...restoreRequest.git, ref: "refs/heads/feature" },
+      }),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "restore_policy_denied",
+      save: { allowed: true, target: featureRefName },
+      trustClass: "internal",
+    });
+  });
+
+  test("POST /v1/restore denies external snapshots retargeted across external scopes", async () => {
+    const pr12RefName = "external/refs-pull-12-merge/latest";
+    const pr13RefName = "external/refs-pull-13-merge/latest";
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(pr12RefName, "snap_129", "external")],
+      snapshots: [
+        snapshotFor(
+          "snap_129",
+          "external",
+          workspaceIdFor(seededNamespace, pr13RefName)
+        ),
+      ],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", externalPullRequest),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "restore_policy_denied",
+      save: { allowed: false },
+      trustClass: "external",
+    });
+  });
+
+  test("POST /v1/restore denies external snapshots in privileged runs", async () => {
+    const privilegedRefName = "privileged/v1.0.0/latest";
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(privilegedRefName, "snap_126", "external")],
+      snapshots: [
+        snapshotFor(
+          "snap_126",
+          "external",
+          workspaceIdFor(seededNamespace, privilegedRefName)
+        ),
+      ],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", privilegedRelease),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "restore_policy_denied",
+      trustClass: "privileged",
+    });
+  });
+
+  test("POST /v1/restore denies internal branch snapshots in privileged runs", async () => {
+    const privilegedRefName = "privileged/v1.0.0/latest";
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(privilegedRefName, "snap_127", "internal")],
+      snapshots: [
+        snapshotFor(
+          "snap_127",
+          "internal",
+          workspaceIdFor(seededNamespace, privilegedRefName)
+        ),
+      ],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", privilegedRelease),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "restore_policy_denied",
+      trustClass: "privileged",
+    });
+  });
+
   test("POST /v1/restore denies latest snapshots from a different config hash", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
@@ -180,7 +430,7 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
       reason: "no_compatible_snapshot",
-      save: { allowed: false },
+      save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
     });
   });
@@ -269,6 +519,180 @@ describe("worker API", () => {
     ).resolves.toMatchObject({
       snapshotId: "snap_124",
       version: 2,
+    });
+  });
+
+  test("POST /v1/save rejects saves whose run id does not match the restored run", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const restoreResponse = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      env,
+      { metadata }
+    );
+    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+      await restoreResponse.json()
+    );
+    const response = await handleFetch(
+      jsonRequest("/v1/save", {
+        ...saveRequest,
+        runId: "987654321",
+        workspaceId: restoreBody.workspaceId,
+      }),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "denied",
+    });
+    await expect(
+      Effect.runPromise(
+        metadata.getSnapshotHeader(Schema.decodeSync(SnapshotId)("snap_124"))
+      )
+    ).resolves.toBeNull();
+  });
+
+  test("POST /v1/restore lets a trusted first run save when no compatible snapshot exists", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      env,
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "no_compatible_snapshot",
+      save: { allowed: true, target: seededRefName },
+      trustClass: "trusted",
+    });
+  });
+
+  test("default worker fetches preserve restore targets for the following save request", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const restoreResponse = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      env,
+      { metadata }
+    );
+    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+      await restoreResponse.json()
+    );
+    const response = await worker.fetch(
+      jsonRequest("/v1/save", {
+        ...saveRequest,
+        workspaceId: restoreBody.workspaceId,
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "committed",
+      snapshotId: "snap_124",
+      workspaceId: restoreBody.workspaceId,
+    });
+  });
+
+  test("POST /v1/save commits same-repo pull request snapshots to internal refs", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const restoreResponse = await handleFetch(
+      jsonRequest("/v1/restore", internalPullRequest),
+      env,
+      { metadata }
+    );
+    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+      await restoreResponse.json()
+    );
+    const response = await handleFetch(
+      jsonRequest("/v1/save", {
+        ...saveRequest,
+        workspaceId: restoreBody.workspaceId,
+      }),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "committed",
+      snapshotId: "snap_124",
+    });
+    await expect(
+      Effect.runPromise(
+        metadata.getRef(seededNamespace, "internal/refs-pull-12-merge/latest")
+      )
+    ).resolves.toMatchObject({
+      snapshotId: "snap_124",
+      trustClass: "internal",
+    });
+  });
+
+  test("POST /v1/save has no remembered target for fork pull requests", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const restoreResponse = await handleFetch(
+      jsonRequest("/v1/restore", externalPullRequest),
+      env,
+      { metadata }
+    );
+    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+      await restoreResponse.json()
+    );
+    const response = await handleFetch(
+      jsonRequest("/v1/save", {
+        ...saveRequest,
+        workspaceId: restoreBody.workspaceId,
+      }),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "restore_required_before_save",
+    });
+  });
+
+  test("POST /v1/save has no remembered target for privileged snapshots", async () => {
+    const metadata = createInMemoryMetadataBackend({
+      refs: [seededRef],
+      snapshots: [seededSnapshot],
+    });
+    const restoreResponse = await handleFetch(
+      jsonRequest("/v1/restore", privilegedRelease),
+      env,
+      { metadata }
+    );
+    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+      await restoreResponse.json()
+    );
+    const response = await handleFetch(
+      jsonRequest("/v1/save", {
+        ...saveRequest,
+        workspaceId: restoreBody.workspaceId,
+      }),
+      env,
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "restore_required_before_save",
     });
   });
 
