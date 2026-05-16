@@ -56,6 +56,7 @@ export const RestoreDeniedResponse = Schema.Struct({
   reason: DenialReason,
   save: RestoreSavePlan,
   trustClass: TrustClass,
+  workspaceId: Schema.optional(WorkspaceId),
 });
 export type RestoreDeniedResponse = Schema.Schema.Type<
   typeof RestoreDeniedResponse

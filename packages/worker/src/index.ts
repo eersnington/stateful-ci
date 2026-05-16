@@ -1,4 +1,4 @@
-import type { ApiErrorType } from "@stateful-ci/core";
+import type { ApiErrorType, DenialReason } from "@stateful-ci/core";
 import {
   Forbidden,
   HealthResponse,
@@ -25,8 +25,9 @@ import {
   MetadataBackend,
   snapshotHeaderFromManifest,
 } from "./metadata";
-import type { RefTarget } from "./metadata";
-import { classifyRunTrust } from "./run-classification";
+import type { RefRow, RefTarget, SnapshotHeader } from "./metadata";
+import { evaluateRestorePolicy, evaluateSavePolicy } from "./policy";
+import { classifyRunTrust, defaultTrustedRefs } from "./run-classification";
 
 /**
  * Maximum accepted size for JSON protocol request bodies.
@@ -40,6 +41,7 @@ export const maxProtocolBodyBytes = 64 * 1024;
 
 interface WorkerEnv {
   readonly STATEFUL_CI_API_TOKEN?: string;
+  readonly STATEFUL_CI_TRUSTED_REFS?: string;
 }
 
 export interface HandleFetchOptions {
@@ -51,6 +53,18 @@ const protocolBodyTooLarge = new RequestBodyTooLarge({
   message:
     "The request body exceeded the Stateful CI protocol limit. Restore/save requests are metadata-only; upload snapshot bytes through the object-store data plane.",
 });
+
+const defaultMetadata = createInMemoryMetadataBackend();
+
+const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
+  const configured = env?.STATEFUL_CI_TRUSTED_REFS?.split(",")
+    .map((ref) => ref.trim())
+    .filter((ref) => ref.length > 0);
+
+  return configured === undefined || configured.length === 0
+    ? defaultTrustedRefs
+    : configured;
+};
 
 const isApiError = (error: unknown): error is ApiErrorType =>
   typeof error === "object" &&
@@ -189,9 +203,42 @@ const refSegment = (ref: string) => {
   return ref.replaceAll("/", "-");
 };
 
-const metadataTargetForRestore = (request: RestoreRequest): RefTarget => ({
+const metadataTargetForRestore = (
+  request: RestoreRequest,
+  trustedRefs: readonly string[]
+): RefTarget => ({
   namespace: `repo=${request.workspace.repo}/workflow=${request.workspace.workflow}/job=${request.workspace.job}/config=${request.client.configHash}`,
-  refName: `${classifyRunTrust(request)}/${refSegment(request.git.ref)}/latest`,
+  refName: `${classifyRunTrust(request, { trustedRefs })}/${refSegment(request.git.ref)}/latest`,
+});
+
+const trustedSeedTargetsFor = (
+  target: RefTarget,
+  trustedRefs: readonly string[]
+): readonly RefTarget[] =>
+  trustedRefs.map((trustedRef) => ({
+    namespace: target.namespace,
+    refName: `trusted/${refSegment(trustedRef)}/latest`,
+  }));
+
+const scopeKeyForTarget = (target: RefTarget) =>
+  `${target.namespace}\n${target.refName}`;
+
+const restoreCandidateTargets = (
+  target: RefTarget,
+  trustClass: ReturnType<typeof classifyRunTrust>,
+  trustedRefs: readonly string[]
+) =>
+  trustClass === "trusted" || trustClass === "unknown"
+    ? [target]
+    : [target, ...trustedSeedTargetsFor(target, trustedRefs)];
+
+const candidateProducerScope = (
+  target: RefTarget,
+  ref: RefRow,
+  snapshot: SnapshotHeader
+) => ({
+  scopeKey: scopeKeyForTarget(target),
+  trustClass: snapshot.trustClass ?? ref.trustClass,
 });
 
 const workspaceIdForTarget = (target: RefTarget) =>
@@ -210,8 +257,9 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(RestoreRequest))
     );
-    const trustClass = classifyRunTrust(restoreRequest);
-    const target = metadataTargetForRestore(restoreRequest);
+    const trustedRefs = trustedRefsForEnv(env);
+    const trustClass = classifyRunTrust(restoreRequest, { trustedRefs });
+    const target = metadataTargetForRestore(restoreRequest, trustedRefs);
     const workspaceId = workspaceIdForTarget(target);
     const runId = runIdFromRestore(restoreRequest);
 
@@ -238,19 +286,67 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       );
     }
 
-    const ref = yield* metadata.getRef(target.namespace, target.refName);
-    const snapshot =
-      ref === null ? null : yield* metadata.getSnapshotHeader(ref.snapshotId);
+    const candidates = restoreCandidateTargets(target, trustClass, trustedRefs);
+    let deniedReason: DenialReason | null = null;
+    let deniedSnapshotId: SnapshotHeader["snapshotId"] | null = null;
+    let restored: {
+      readonly snapshot: SnapshotHeader;
+    } | null = null;
 
-    if (ref === null || snapshot === null) {
+    for (const candidateTarget of candidates) {
+      const ref = yield* metadata.getRef(
+        candidateTarget.namespace,
+        candidateTarget.refName
+      );
+      const snapshot =
+        ref === null ? null : yield* metadata.getSnapshotHeader(ref.snapshotId);
+
+      if (ref !== null && snapshot !== null) {
+        const decision =
+          snapshot.workspaceId === workspaceIdForTarget(candidateTarget)
+            ? evaluateRestorePolicy({
+                consumer: { scopeKey: scopeKeyForTarget(target), trustClass },
+                producer: candidateProducerScope(
+                  candidateTarget,
+                  ref,
+                  snapshot
+                ),
+              })
+            : ({ allowed: false, reason: "restore_policy_denied" } as const);
+
+        if (decision.allowed) {
+          restored = { snapshot };
+          break;
+        }
+
+        deniedReason = decision.reason;
+        deniedSnapshotId = snapshot.snapshotId;
+      }
+    }
+
+    if (restored === null) {
+      const savePolicy = evaluateSavePolicy({
+        scopeKey: scopeKeyForTarget(target),
+        trustClass,
+      });
+
+      if (savePolicy.allowed) {
+        yield* metadata.rememberWorkspaceTarget({
+          ...target,
+          runId,
+          trustClass,
+          workspaceId,
+        });
+      }
+
       yield* metadata.appendAuditEvent({
         ...target,
         createdAt: nowIso(),
         decision: "denied",
         eventType: "restore",
-        reason: "no_compatible_snapshot",
+        reason: deniedReason ?? "no_compatible_snapshot",
         runId,
-        snapshotId: ref?.snapshotId ?? null,
+        snapshotId: deniedSnapshotId,
         trustClass,
         workspaceId,
       });
@@ -258,18 +354,29 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       return Response.json(
         Schema.encodeUnknownSync(RestoreDeniedResponse)({
           decision: "denied",
-          reason: "no_compatible_snapshot",
-          save: { allowed: false },
+          reason: deniedReason ?? "no_compatible_snapshot",
+          save: savePolicy.allowed
+            ? { allowed: true, target: target.refName }
+            : { allowed: false },
           trustClass,
+          ...(savePolicy.allowed ? { workspaceId } : {}),
         })
       );
     }
 
-    yield* metadata.rememberWorkspaceTarget({
-      ...target,
+    const savePolicy = evaluateSavePolicy({
+      scopeKey: scopeKeyForTarget(target),
       trustClass,
-      workspaceId,
     });
+
+    if (savePolicy.allowed) {
+      yield* metadata.rememberWorkspaceTarget({
+        ...target,
+        runId,
+        trustClass,
+        workspaceId,
+      });
+    }
 
     yield* metadata.appendAuditEvent({
       ...target,
@@ -278,7 +385,7 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       eventType: "restore",
       reason: null,
       runId,
-      snapshotId: snapshot.snapshotId,
+      snapshotId: restored.snapshot.snapshotId,
       trustClass,
       workspaceId,
     });
@@ -286,11 +393,13 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
     return Response.json(
       Schema.encodeUnknownSync(RestoreAllowedResponse)({
         decision: "allowed",
-        save: { allowed: true, target: target.refName },
+        save: savePolicy.allowed
+          ? { allowed: true, target: target.refName }
+          : { allowed: false },
         snapshot: {
-          id: snapshot.snapshotId,
-          manifestKey: snapshot.manifestKey,
-          parent: snapshot.parentSnapshotId,
+          id: restored.snapshot.snapshotId,
+          manifestKey: restored.snapshot.manifestKey,
+          parent: restored.snapshot.parentSnapshotId,
         },
         trustClass,
         workspaceId,
@@ -330,13 +439,13 @@ const handleSave = (request: Request, env: WorkerEnv | undefined) =>
       );
     }
 
-    if (target.trustClass === "external" || target.trustClass === "unknown") {
+    if (target.runId !== saveRequest.runId) {
       yield* metadata.appendAuditEvent({
         createdAt: nowIso(),
         decision: "denied",
         eventType: "save",
         namespace: target.namespace,
-        reason: "external_snapshot_cannot_update_trusted_workspace",
+        reason: "save_run_context_mismatch",
         refName: target.refName,
         runId: saveRequest.runId,
         snapshotId: saveRequest.manifest.id,
@@ -347,7 +456,34 @@ const handleSave = (request: Request, env: WorkerEnv | undefined) =>
       return Response.json(
         Schema.encodeUnknownSync(SaveDeniedResponse)({
           decision: "denied",
-          reason: "external_snapshot_cannot_update_trusted_workspace",
+          reason: "save_run_context_mismatch",
+        })
+      );
+    }
+
+    const savePolicy = evaluateSavePolicy({
+      scopeKey: scopeKeyForTarget(target),
+      trustClass: target.trustClass,
+    });
+
+    if (!savePolicy.allowed) {
+      yield* metadata.appendAuditEvent({
+        createdAt: nowIso(),
+        decision: "denied",
+        eventType: "save",
+        namespace: target.namespace,
+        reason: savePolicy.reason,
+        refName: target.refName,
+        runId: saveRequest.runId,
+        snapshotId: saveRequest.manifest.id,
+        trustClass: target.trustClass,
+        workspaceId: saveRequest.workspaceId,
+      });
+
+      return Response.json(
+        Schema.encodeUnknownSync(SaveDeniedResponse)({
+          decision: "denied",
+          reason: savePolicy.reason,
         })
       );
     }
@@ -497,7 +633,7 @@ export const handleFetch = (
         MetadataBackend,
         // Until D1/DO bindings exist, default Worker fetches are intentionally
         // request-local. Tests and local dev can inject a shared backend.
-        options.metadata ?? createInMemoryMetadataBackend()
+        options.metadata ?? defaultMetadata
       ),
       Effect.match({
         onFailure: apiErrorResponse,
