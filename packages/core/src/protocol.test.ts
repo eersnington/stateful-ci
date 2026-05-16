@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Result, Schema } from "effect";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -51,6 +51,12 @@ const saveRequest = {
   workspaceId: "ws_123",
 };
 
+const decodeRestoreRequest = Schema.decodeUnknownResult(RestoreRequest);
+const decodeRestoreSavePlan = Schema.decodeUnknownResult(RestoreSavePlan);
+const decodeSaveRequest = Schema.decodeUnknownResult(SaveRequest);
+const decodeSha256Digest = Schema.decodeUnknownResult(Sha256Digest);
+const decodeTrustClass = Schema.decodeUnknownResult(TrustClass);
+
 describe("protocol schemas", () => {
   test("RestoreRequest decodes the PRD restore payload shape", () => {
     expect(
@@ -59,12 +65,14 @@ describe("protocol schemas", () => {
   });
 
   test("RestoreRequest rejects missing GitHub run context", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(RestoreRequest)({
-        ...restoreRequest,
-        github: { actor: "eersnington", event: "push" },
-      })
-    ).toThrow(/Missing key/u);
+    expect(
+      Result.isFailure(
+        decodeRestoreRequest({
+          ...restoreRequest,
+          github: { actor: "eersnington", event: "push" },
+        })
+      )
+    ).toBeTruthy();
   });
 
   test("SaveRequest decodes manifest metadata and safety summary", () => {
@@ -74,20 +82,27 @@ describe("protocol schemas", () => {
   });
 
   test("SaveRequest rejects malformed manifest digests", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(SaveRequest)({
-        ...saveRequest,
-        manifest: { ...saveRequest.manifest, hash: "sha256:not-a-real-digest" },
-      })
-    ).toThrow(/RegExp/u);
+    expect(
+      Result.isFailure(
+        decodeSaveRequest({
+          ...saveRequest,
+          manifest: {
+            ...saveRequest.manifest,
+            hash: "sha256:not-a-real-digest",
+          },
+        })
+      )
+    ).toBeTruthy();
   });
 
   test("Sha256Digest rejects non-canonical uppercase hex", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(Sha256Digest)(
-        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    expect(
+      Result.isFailure(
+        decodeSha256Digest(
+          "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
       )
-    ).toThrow(/RegExp/u);
+    ).toBeTruthy();
   });
 
   test("RestoreSavePlan accepts allowed plans with targets", () => {
