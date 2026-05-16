@@ -44,6 +44,7 @@ const saveRequest = {
     safety: {
       skippedByBuiltInDenylist: 3,
       skippedByUserExclude: 12,
+      skippedUnsupportedType: 1,
     },
     totalBytes: 481_203_912,
   },

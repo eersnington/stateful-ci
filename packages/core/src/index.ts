@@ -1,10 +1,18 @@
 export { ApiError, type ApiError as ApiErrorType } from "./errors/api-error";
 export {
+  builtInDeniedPathParts,
+  clientVersion,
+  configFileName,
   defaultConfig,
+  excludedPathsForConfig,
   ExplicitWorkspaceConfig,
+  isBuiltInDeniedWorkspacePath,
+  isUserExcludedWorkspacePath,
+  nodePresetPaths,
   NodePresetConfig,
   StatefulCiConfig,
   WorkspacePath,
+  workspacePathsForConfig,
 } from "./config";
 export type {
   ExplicitWorkspaceConfig as ExplicitWorkspaceConfigType,
