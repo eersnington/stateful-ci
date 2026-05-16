@@ -1,16 +1,9 @@
-import { Schema } from "effect";
+import { Result, Schema } from "effect";
 import { describe, expect, test } from "vitest";
 
 import { StatefulCiConfig } from "./index";
 
-const decodeFails = (value: unknown) => {
-  try {
-    Schema.decodeUnknownSync(StatefulCiConfig)(value);
-    return false;
-  } catch {
-    return true;
-  }
-};
+const decodeResult = Schema.decodeUnknownResult(StatefulCiConfig);
 
 describe("config schemas", () => {
   test("decodes the default node preset", () => {
