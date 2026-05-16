@@ -18,7 +18,7 @@ export const builtInDeniedPathParts = Object.freeze([
   ".aws",
   ".azure",
   ".config/gcloud",
-  ".docker/config.json",
+  ".docker",
   ".env",
   ".env.local",
   ".env.production",

@@ -81,9 +81,7 @@ describe("config schemas", () => {
     expect(
       isBuiltInDeniedWorkspacePath("apps/.config/gcloud/config.json")
     ).toBeTruthy();
-    expect(
-      isBuiltInDeniedWorkspacePath("apps/.docker/config.json")
-    ).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("apps/.docker/trust")).toBeTruthy();
     expect(isBuiltInDeniedWorkspacePath("apps/not.ssh/id_rsa")).toBeFalsy();
   });
 
