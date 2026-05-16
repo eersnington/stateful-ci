@@ -38,6 +38,12 @@ describe("trust policy", () => {
         producer: scope("internal", "branch:feature"),
       })
     ).toStrictEqual({ allowed: true });
+    expect(
+      evaluateRestorePolicy({
+        consumer: scope("privileged", "release"),
+        producer: scope("privileged", "release"),
+      })
+    ).toStrictEqual({ allowed: true });
   });
 
   test("denies untrusted state flowing upward", () => {
