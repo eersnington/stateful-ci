@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { readdir, stat } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
@@ -56,6 +56,7 @@ interface ScannedWorkspace {
   readonly fileCount: number;
   readonly missingPaths: readonly string[];
   readonly skippedByBuiltInDenylist: number;
+  readonly skippedUnsupportedType: number;
   readonly skippedByUserExclude: number;
   readonly totalBytes: number;
 }
@@ -196,27 +197,36 @@ const protocolUrl = (api: ApiConfig, route: string) =>
   new URL(route, api.url.endsWith("/") ? api.url : `${api.url}/`).href;
 
 const postProtocol = (api: ApiConfig, route: string, body: string) =>
-  Effect.tryPromise({
-    catch: () =>
-      cliFailure(
-        `Could not reach Stateful CI backend at ${api.url}. Check STATEFUL_CI_API_URL and network access.`
-      ),
-    try: async () => {
-      const response = await fetch(protocolUrl(api, route), {
-        body,
-        headers: {
-          authorization: `Bearer ${api.token}`,
-          "content-type": "application/json",
-        },
-        method: "POST",
-      });
+  Effect.gen(function* postProtocolEffect() {
+    const response = yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          `Could not reach Stateful CI backend at ${api.url}. Check STATEFUL_CI_API_URL and network access.`
+        ),
+      try: () =>
+        fetch(protocolUrl(api, route), {
+          body,
+          headers: {
+            authorization: `Bearer ${api.token}`,
+            "content-type": "application/json",
+          },
+          method: "POST",
+        }),
+    });
 
-      if (!response.ok) {
-        throw new Error(`Backend returned HTTP ${response.status}.`);
-      }
+    if (!response.ok) {
+      return yield* Effect.fail(
+        cliFailure(`Stateful CI backend returned HTTP ${response.status}.`)
+      );
+    }
 
-      return response.text();
-    },
+    return yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          `Could not read Stateful CI backend response body after HTTP ${response.status}. Retry or check backend logs.`
+        ),
+      try: () => response.text(),
+    });
   });
 
 const decodeProtocolResponse = <A>(
@@ -247,6 +257,7 @@ const scanPath = async (
       missingPaths: [],
       skippedByBuiltInDenylist: 1,
       skippedByUserExclude: 0,
+      skippedUnsupportedType: 0,
       totalBytes: 0,
     };
   }
@@ -257,12 +268,13 @@ const scanPath = async (
       missingPaths: [],
       skippedByBuiltInDenylist: 0,
       skippedByUserExclude: 1,
+      skippedUnsupportedType: 0,
       totalBytes: 0,
     };
   }
 
   const path = `${root}/${relativePath}`;
-  const info = await stat(path).catch(() => null);
+  const info = await lstat(path).catch(() => null);
 
   if (info === null) {
     return {
@@ -270,6 +282,7 @@ const scanPath = async (
       missingPaths: [relativePath],
       skippedByBuiltInDenylist: 0,
       skippedByUserExclude: 0,
+      skippedUnsupportedType: 0,
       totalBytes: 0,
     };
   }
@@ -280,6 +293,7 @@ const scanPath = async (
       missingPaths: [],
       skippedByBuiltInDenylist: 0,
       skippedByUserExclude: 0,
+      skippedUnsupportedType: 0,
       totalBytes: info.size,
     };
   }
@@ -288,8 +302,9 @@ const scanPath = async (
     return {
       fileCount: 0,
       missingPaths: [],
-      skippedByBuiltInDenylist: 1,
+      skippedByBuiltInDenylist: 0,
       skippedByUserExclude: 0,
+      skippedUnsupportedType: 1,
       totalBytes: 0,
     };
   }
@@ -303,6 +318,7 @@ const scanPath = async (
     missingPaths: [] as string[],
     skippedByBuiltInDenylist: 0,
     skippedByUserExclude: 0,
+    skippedUnsupportedType: 0,
     totalBytes: 0,
   };
 
@@ -310,6 +326,7 @@ const scanPath = async (
     total.fileCount += scanned.fileCount;
     total.missingPaths.push(...scanned.missingPaths);
     total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
+    total.skippedUnsupportedType += scanned.skippedUnsupportedType;
     total.skippedByUserExclude += scanned.skippedByUserExclude;
     total.totalBytes += scanned.totalBytes;
   }
@@ -335,6 +352,7 @@ const scanWorkspace = (directory: string, config: StatefulCiConfigType) =>
         missingPaths: [] as string[],
         skippedByBuiltInDenylist: 0,
         skippedByUserExclude: 0,
+        skippedUnsupportedType: 0,
         totalBytes: 0,
       };
 
@@ -342,6 +360,7 @@ const scanWorkspace = (directory: string, config: StatefulCiConfigType) =>
         total.fileCount += scanned.fileCount;
         total.missingPaths.push(...scanned.missingPaths);
         total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
+        total.skippedUnsupportedType += scanned.skippedUnsupportedType;
         total.skippedByUserExclude += scanned.skippedByUserExclude;
         total.totalBytes += scanned.totalBytes;
       }
@@ -365,6 +384,7 @@ const saveRequestFromRestore = (
         String(scanned.fileCount),
         String(scanned.totalBytes),
         String(scanned.skippedByBuiltInDenylist),
+        String(scanned.skippedUnsupportedType),
         String(scanned.skippedByUserExclude),
         scanned.missingPaths.join("\0"),
       ].join("\n")
@@ -381,6 +401,7 @@ const saveRequestFromRestore = (
         safety: {
           skippedByBuiltInDenylist: scanned.skippedByBuiltInDenylist,
           skippedByUserExclude: scanned.skippedByUserExclude,
+          skippedUnsupportedType: scanned.skippedUnsupportedType,
         },
         totalBytes: scanned.totalBytes,
       },

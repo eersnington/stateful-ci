@@ -1,13 +1,24 @@
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { NodeServices } from "@effect/platform-node";
-import { configFileName } from "@stateful-ci/core";
-import { Effect } from "effect";
+import {
+  configFileName,
+  RestoreDeniedResponse,
+  SaveDeniedResponse,
+} from "@stateful-ci/core";
+import { Effect, Schema } from "effect";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { restoreProgram, runCli, saveProgram } from "./cli";
@@ -30,15 +41,15 @@ const withProtocolServer = async <A>(
   handler: (
     request: IncomingMessage,
     response: ServerResponse
-  ) => Promise<void>,
+  ) => Promise<void> | void,
   run: (url: string) => Promise<A>
 ) => {
   const server = createServer(async (request, response) => {
     try {
       await handler(request, response);
     } catch (error) {
-      response.writeHead(500, { "content-type": "application/json" });
-      response.end(await Response.json({ error: String(error) }).text());
+      response.writeHead(500, { "content-type": "text/plain" });
+      response.end(String(error));
     }
   });
 
@@ -123,12 +134,14 @@ describe("stateful-ci restore", () => {
         body = await new Response(request).json();
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
-          await Response.json({
+          Schema.encodeUnknownSync(
+            Schema.fromJsonString(RestoreDeniedResponse)
+          )({
             decision: "denied",
             reason: "backend_policy_not_configured",
             save: { allowed: false },
             trustClass: "unknown",
-          }).text()
+          })
         );
       },
       (url) =>
@@ -162,6 +175,60 @@ describe("stateful-ci restore", () => {
       )
     ).rejects.toMatchObject({ _tag: "CliFailure" });
   });
+
+  test("restore reports reachable backend HTTP errors separately from network failures", async () => {
+    await withProtocolServer(
+      (_request, response) => {
+        response.writeHead(403, { "content-type": "text/plain" });
+        response.end("forbidden");
+      },
+      async (url) => {
+        await expect(
+          Effect.runPromise(
+            restoreProgram({
+              ...githubEnv,
+              STATEFUL_CI_API_TOKEN: "test-token",
+              STATEFUL_CI_API_URL: url,
+            }).pipe(Effect.provide(NodeServices.layer))
+          )
+        ).rejects.toMatchObject({
+          _tag: "CliFailure",
+          message: expect.stringContaining("HTTP 403"),
+        });
+      }
+    );
+  });
+
+  test("restore reports unreachable backends as network failures", async () => {
+    const server = createServer();
+
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+
+    const address = server.address();
+
+    if (address === null || typeof address === "string") {
+      throw new Error("Test server did not bind to a TCP address.");
+    }
+
+    const url = `http://127.0.0.1:${address.port}`;
+
+    server.close();
+    await once(server, "close");
+
+    await expect(
+      Effect.runPromise(
+        restoreProgram({
+          ...githubEnv,
+          STATEFUL_CI_API_TOKEN: "test-token",
+          STATEFUL_CI_API_URL: url,
+        }).pipe(Effect.provide(NodeServices.layer))
+      )
+    ).rejects.toMatchObject({
+      _tag: "CliFailure",
+      message: expect.stringContaining("Could not reach Stateful CI backend"),
+    });
+  });
 });
 
 describe("stateful-ci save", () => {
@@ -175,11 +242,12 @@ describe("stateful-ci save", () => {
     await mkdir(join(tempDir, ".turbo/cache"), { recursive: true });
     await writeFile(
       configFileName,
-      '{"paths":[".turbo",".env"],"exclude":[".turbo/cache/skip.txt"]}\n'
+      '{"paths":[".turbo",".env","linked-cache"],"exclude":[".turbo/cache/skip.txt"]}\n'
     );
     await writeFile(join(tempDir, ".turbo/cache/result.txt"), "cached output");
     await writeFile(join(tempDir, ".turbo/cache/skip.txt"), "ignored output");
     await writeFile(join(tempDir, ".env"), "SECRET=value");
+    await symlink(join(tempDir, ".turbo/cache/result.txt"), "linked-cache");
   });
 
   afterEach(async () => {
@@ -196,10 +264,10 @@ describe("stateful-ci save", () => {
         body = await new Response(request).json();
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
-          await Response.json({
+          Schema.encodeUnknownSync(Schema.fromJsonString(SaveDeniedResponse))({
             decision: "denied",
             reason: "backend_policy_not_configured",
-          }).text()
+          })
         );
       },
       (url) =>
@@ -220,6 +288,7 @@ describe("stateful-ci save", () => {
         safety: {
           skippedByBuiltInDenylist: 1,
           skippedByUserExclude: 1,
+          skippedUnsupportedType: 1,
         },
         totalBytes: 13,
       },
