@@ -115,14 +115,14 @@ describe("protocol schemas", () => {
   });
 
   test("RestoreSavePlan rejects allowed plans without targets", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(RestoreSavePlan)({ allowed: true })
-    ).toThrow(/Missing key/u);
+    expect(
+      Result.isFailure(decodeRestoreSavePlan({ allowed: true }))
+    ).toBeTruthy();
   });
 
   test("TrustClass rejects unknown trust classes", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(TrustClass)("release-candidate")
-    ).toThrow(/Expected/u);
+    expect(
+      Result.isFailure(decodeTrustClass("release-candidate"))
+    ).toBeTruthy();
   });
 });
