@@ -24,18 +24,22 @@ describe("config schemas", () => {
   });
 
   test("rejects unknown presets", () => {
-    expect(decodeFails({ preset: "rust" })).toBeTruthy();
+    expect(Result.isFailure(decodeResult({ preset: "rust" }))).toBeTruthy();
   });
 
   test("rejects empty explicit paths", () => {
-    expect(decodeFails({ paths: [] })).toBeTruthy();
+    expect(Result.isFailure(decodeResult({ paths: [] }))).toBeTruthy();
   });
 
   test("rejects absolute paths", () => {
-    expect(decodeFails({ paths: ["/tmp/cache"] })).toBeTruthy();
+    expect(
+      Result.isFailure(decodeResult({ paths: ["/tmp/cache"] }))
+    ).toBeTruthy();
   });
 
   test("rejects paths that escape the workspace", () => {
-    expect(decodeFails({ paths: ["../node_modules"] })).toBeTruthy();
+    expect(
+      Result.isFailure(decodeResult({ paths: ["../node_modules"] }))
+    ).toBeTruthy();
   });
 });
