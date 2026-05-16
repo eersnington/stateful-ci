@@ -18,6 +18,10 @@ export const SafetySummary = Schema.Struct({
     Schema.isInt(),
     Schema.isGreaterThanOrEqualTo(0)
   ),
+  skippedUnsupportedType: Schema.Number.check(
+    Schema.isInt(),
+    Schema.isGreaterThanOrEqualTo(0)
+  ),
 });
 export type SafetySummary = Schema.Schema.Type<typeof SafetySummary>;
 
