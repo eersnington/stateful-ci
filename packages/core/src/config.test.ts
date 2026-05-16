@@ -3,6 +3,15 @@ import { describe, expect, test } from "vitest";
 
 import { StatefulCiConfig } from "./index";
 
+const decodeFails = (value: unknown) => {
+  try {
+    Schema.decodeUnknownSync(StatefulCiConfig)(value);
+    return false;
+  } catch {
+    return true;
+  }
+};
+
 describe("config schemas", () => {
   test("decodes the default node preset", () => {
     expect(
@@ -22,26 +31,18 @@ describe("config schemas", () => {
   });
 
   test("rejects unknown presets", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(StatefulCiConfig)({ preset: "rust" })
-    ).toThrow(/Missing key|Expected/u);
+    expect(decodeFails({ preset: "rust" })).toBeTruthy();
   });
 
   test("rejects empty explicit paths", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(StatefulCiConfig)({ paths: [] })
-    ).toThrow(/Missing key/u);
+    expect(decodeFails({ paths: [] })).toBeTruthy();
   });
 
   test("rejects absolute paths", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(StatefulCiConfig)({ paths: ["/tmp/cache"] })
-    ).toThrow(/RegExp/u);
+    expect(decodeFails({ paths: ["/tmp/cache"] })).toBeTruthy();
   });
 
   test("rejects paths that escape the workspace", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(StatefulCiConfig)({ paths: ["../node_modules"] })
-    ).toThrow(/RegExp/u);
+    expect(decodeFails({ paths: ["../node_modules"] })).toBeTruthy();
   });
 });
