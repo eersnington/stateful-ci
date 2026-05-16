@@ -7,14 +7,14 @@ export const configFileName = "stateful-ci.json";
 
 export const clientVersion = "0.0.1";
 
-export const nodePresetPaths = [
+export const nodePresetPaths = Object.freeze([
   "node_modules",
   ".pnpm-store",
   ".turbo",
   ".next/cache",
-] as const;
+] as const);
 
-export const builtInDeniedPathParts = [
+export const builtInDeniedPathParts = Object.freeze([
   ".aws",
   ".azure",
   ".config/gcloud",
@@ -26,7 +26,7 @@ export const builtInDeniedPathParts = [
   ".npmrc",
   ".pypirc",
   ".ssh",
-] as const;
+] as const);
 
 export const WorkspacePath = Schema.String.check(
   Schema.isPattern(WORKSPACE_PATH_PATTERN)
@@ -54,8 +54,45 @@ export type StatefulCiConfig = Schema.Schema.Type<typeof StatefulCiConfig>;
 
 export const defaultConfig: StatefulCiConfig = { preset: "node" };
 
-const matchesPathOrDescendant = (path: string, candidate: string) =>
-  path === candidate || path.startsWith(`${candidate}/`);
+const normalizeWorkspacePath = (path: string) => {
+  const segments: string[] = [];
+
+  for (const segment of path.replaceAll("\\", "/").split("/")) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+
+    segments.push(segment);
+  }
+
+  return segments.join("/");
+};
+
+const matchesPathOrDescendant = (path: string, candidate: string) => {
+  const normalizedPath = normalizeWorkspacePath(path);
+  const normalizedCandidate = normalizeWorkspacePath(candidate);
+
+  return (
+    normalizedPath === normalizedCandidate ||
+    normalizedPath.startsWith(`${normalizedCandidate}/`)
+  );
+};
+
+const pathSuffixes = (path: string) => {
+  const segments = normalizeWorkspacePath(path).split("/").filter(Boolean);
+
+  return segments.map((_, index) => segments.slice(index).join("/"));
+};
+
+const hasDotenvSegment = (path: string) =>
+  normalizeWorkspacePath(path)
+    .split("/")
+    .some((segment) => segment === ".env" || segment.startsWith(".env."));
 
 export const workspacePathsForConfig = (
   config: StatefulCiConfig
@@ -66,8 +103,11 @@ export const excludedPathsForConfig = (
 ): readonly string[] => ("preset" in config ? [] : (config.exclude ?? []));
 
 export const isBuiltInDeniedWorkspacePath = (path: string) =>
-  builtInDeniedPathParts.some((denied) =>
-    matchesPathOrDescendant(path, denied)
+  hasDotenvSegment(path) ||
+  pathSuffixes(path).some((suffix) =>
+    builtInDeniedPathParts.some((denied) =>
+      matchesPathOrDescendant(suffix, denied)
+    )
   );
 
 export const isUserExcludedWorkspacePath = (

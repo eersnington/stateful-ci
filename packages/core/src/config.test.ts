@@ -2,6 +2,7 @@ import { Result, Schema } from "effect";
 import { describe, expect, test } from "vitest";
 
 import {
+  builtInDeniedPathParts,
   excludedPathsForConfig,
   isBuiltInDeniedWorkspacePath,
   isUserExcludedWorkspacePath,
@@ -61,12 +62,35 @@ describe("config schemas", () => {
     expect(excludedPathsForConfig(explicitConfig)).toStrictEqual(["coverage"]);
   });
 
-  test("matches built-in and user workspace path safety rules", () => {
+  test("freezes exported workspace path defaults", () => {
+    expect(Object.isFrozen(nodePresetPaths)).toBeTruthy();
+    expect(Object.isFrozen(builtInDeniedPathParts)).toBeTruthy();
+  });
+
+  test("matches built-in dotenv workspace path safety rules", () => {
     expect(isBuiltInDeniedWorkspacePath(".env")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("./.env")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath(".env.test")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("apps/.env.preview")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("apps/.environment")).toBeFalsy();
+  });
+
+  test("matches built-in nested credential path safety rules", () => {
     expect(isBuiltInDeniedWorkspacePath(".ssh/id_rsa")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("apps/.ssh/id_rsa")).toBeTruthy();
+    expect(
+      isBuiltInDeniedWorkspacePath("apps/.config/gcloud/config.json")
+    ).toBeTruthy();
+    expect(
+      isBuiltInDeniedWorkspacePath("apps/.docker/config.json")
+    ).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("apps/not.ssh/id_rsa")).toBeFalsy();
+  });
+
+  test("matches workspace excludes with normalized paths", () => {
     expect(isBuiltInDeniedWorkspacePath(".turbo/cache")).toBeFalsy();
     expect(
-      isUserExcludedWorkspacePath(".turbo/cache/index.db", [".turbo/cache"])
+      isUserExcludedWorkspacePath("./.turbo/cache/index.db", [".turbo/cache"])
     ).toBeTruthy();
   });
 });
