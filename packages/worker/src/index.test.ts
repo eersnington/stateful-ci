@@ -649,6 +649,36 @@ describe("worker API", () => {
     });
   });
 
+  test("POST /v1/restore tries each configured trusted ref for seed snapshots", async () => {
+    const releaseRefName = "trusted/release/latest";
+    const releaseSnapshotId = "snap_131";
+    const metadata = createInMemoryMetadataBackend({
+      refs: [refFor(releaseRefName, releaseSnapshotId, "trusted")],
+      snapshots: [
+        snapshotFor(
+          releaseSnapshotId,
+          "trusted",
+          workspaceIdFor(seededNamespace, releaseRefName)
+        ),
+      ],
+    });
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", internalPullRequest),
+      {
+        ...env,
+        STATEFUL_CI_TRUSTED_REFS: "refs/heads/main,refs/heads/release",
+      },
+      { metadata }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "allowed",
+      snapshot: { id: releaseSnapshotId },
+      trustClass: "internal",
+    });
+  });
+
   test("default worker fetches preserve restore targets for the following save request", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],

@@ -211,13 +211,14 @@ const metadataTargetForRestore = (
   refName: `${classifyRunTrust(request, { trustedRefs })}/${refSegment(request.git.ref)}/latest`,
 });
 
-const trustedSeedTargetFor = (
+const trustedSeedTargetsFor = (
   target: RefTarget,
   trustedRefs: readonly string[]
-): RefTarget => ({
-  namespace: target.namespace,
-  refName: `trusted/${refSegment(trustedRefs[0] ?? defaultTrustedRefs[0])}/latest`,
-});
+): readonly RefTarget[] =>
+  trustedRefs.map((trustedRef) => ({
+    namespace: target.namespace,
+    refName: `trusted/${refSegment(trustedRef)}/latest`,
+  }));
 
 const scopeKeyForTarget = (target: RefTarget) =>
   `${target.namespace}\n${target.refName}`;
@@ -229,7 +230,7 @@ const restoreCandidateTargets = (
 ) =>
   trustClass === "trusted" || trustClass === "unknown"
     ? [target]
-    : [target, trustedSeedTargetFor(target, trustedRefs)];
+    : [target, ...trustedSeedTargetsFor(target, trustedRefs)];
 
 const candidateProducerScope = (
   target: RefTarget,
