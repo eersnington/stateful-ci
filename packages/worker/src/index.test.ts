@@ -546,8 +546,9 @@ describe("worker API", () => {
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
+    await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
+      reason: "save_run_context_mismatch",
     });
     await expect(
       Effect.runPromise(
