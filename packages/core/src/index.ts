@@ -29,6 +29,7 @@ export { RouteNotFound } from "./errors/route-not-found";
 export { Unauthorized } from "./errors/unauthorized";
 export { ClientContext, GitContext, GitHubContext } from "./github";
 export {
+  ArchiveKey,
   ManifestKey,
   RunId,
   Sha256Digest,

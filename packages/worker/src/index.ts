@@ -398,6 +398,7 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
           : { allowed: false },
         snapshot: {
           id: restored.snapshot.snapshotId,
+          manifestDigest: restored.snapshot.manifestDigest,
           manifestKey: restored.snapshot.manifestKey,
           parent: restored.snapshot.parentSnapshotId,
         },

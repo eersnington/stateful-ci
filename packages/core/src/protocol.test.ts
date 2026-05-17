@@ -2,6 +2,8 @@ import { Result, Schema } from "effect";
 import { describe, expect, test } from "vitest";
 
 import {
+  ArchiveKey,
+  ManifestKey,
   RestoreRequest,
   RestoreSavePlan,
   SaveRequest,
@@ -36,11 +38,16 @@ const restoreRequest = {
 const saveRequest = {
   baseSnapshotId: "snap_123",
   manifest: {
+    archiveDigest:
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    archiveKey:
+      "archives/sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sciar",
     chunkCount: 1,
     fileCount: 21_903,
-    hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     id: "snap_124",
-    key: "manifests/snap_124.json",
+    key: "manifests/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+    manifestDigest:
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     safety: {
       skippedByBuiltInDenylist: 3,
       skippedByUserExclude: 12,
@@ -55,6 +62,8 @@ const saveRequest = {
 const decodeRestoreRequest = Schema.decodeUnknownResult(RestoreRequest);
 const decodeRestoreSavePlan = Schema.decodeUnknownResult(RestoreSavePlan);
 const decodeSaveRequest = Schema.decodeUnknownResult(SaveRequest);
+const decodeArchiveKey = Schema.decodeUnknownResult(ArchiveKey);
+const decodeManifestKey = Schema.decodeUnknownResult(ManifestKey);
 const decodeSha256Digest = Schema.decodeUnknownResult(Sha256Digest);
 const decodeTrustClass = Schema.decodeUnknownResult(TrustClass);
 
@@ -89,9 +98,34 @@ describe("protocol schemas", () => {
           ...saveRequest,
           manifest: {
             ...saveRequest.manifest,
-            hash: "sha256:not-a-real-digest",
+            manifestDigest: "sha256:not-a-real-digest",
           },
         })
+      )
+    ).toBeTruthy();
+  });
+
+  test("object keys reject traversal and unexpected prefixes", () => {
+    expect(Result.isFailure(decodeManifestKey("../snap.json"))).toBeTruthy();
+    expect(
+      Result.isFailure(
+        decodeManifestKey(
+          "archives/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sciar"
+        )
+      )
+    ).toBeTruthy();
+    expect(
+      Result.isFailure(
+        decodeArchiveKey(
+          "manifests/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+        )
+      )
+    ).toBeTruthy();
+    expect(
+      Result.isFailure(
+        decodeArchiveKey(
+          "archives/../sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sciar"
+        )
       )
     ).toBeTruthy();
   });

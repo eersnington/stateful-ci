@@ -1,4 +1,5 @@
 import type {
+  ArchiveKey,
   DenialReason,
   ManifestKey,
   RunId,
@@ -23,6 +24,8 @@ export interface RefRow extends RefTarget {
 }
 
 export interface SnapshotHeader {
+  readonly archiveDigest: Sha256Digest;
+  readonly archiveKey: ArchiveKey;
   readonly chunkCount: number;
   readonly createdAt: string;
   readonly manifestDigest: Sha256Digest;
@@ -101,9 +104,11 @@ export const snapshotHeaderFromManifest = (
     readonly workspaceId: WorkspaceId;
   }
 ): SnapshotHeader => ({
+  archiveDigest: manifest.archiveDigest,
+  archiveKey: manifest.archiveKey,
   chunkCount: manifest.chunkCount,
   createdAt: options.createdAt,
-  manifestDigest: manifest.hash,
+  manifestDigest: manifest.manifestDigest,
   manifestKey: manifest.key,
   parentSnapshotId: options.parentSnapshotId,
   runId: options.runId,

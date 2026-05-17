@@ -1,4 +1,5 @@
 import {
+  ArchiveKey,
   ManifestKey,
   RestoreAllowedResponse,
   RestoreDeniedResponse,
@@ -45,11 +46,16 @@ const restoreRequest = {
 const saveRequest = {
   baseSnapshotId: "snap_123",
   manifest: {
+    archiveDigest:
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    archiveKey:
+      "archives/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sciar",
     chunkCount: 1,
     fileCount: 21_903,
-    hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     id: "snap_124",
-    key: "manifests/snap_124.json",
+    key: "manifests/sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+    manifestDigest:
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     safety: {
       skippedByBuiltInDenylist: 3,
       skippedByUserExclude: 12,
@@ -70,12 +76,20 @@ const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
 const seededSnapshotId = Schema.decodeSync(SnapshotId)("snap_123");
 
 const seededSnapshot = {
+  archiveDigest: Schema.decodeSync(Sha256Digest)(
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ),
+  archiveKey: Schema.decodeSync(ArchiveKey)(
+    "archives/sha256-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.sciar"
+  ),
   chunkCount: 1,
   createdAt: "2026-05-16T00:00:00.000Z",
   manifestDigest: Schema.decodeSync(Sha256Digest)(
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   ),
-  manifestKey: Schema.decodeSync(ManifestKey)("manifests/snap_123.json"),
+  manifestKey: Schema.decodeSync(ManifestKey)(
+    "manifests/sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"
+  ),
   parentSnapshotId: null,
   runId: Schema.decodeSync(RunId)("123456788"),
   snapshotId: seededSnapshotId,
@@ -203,7 +217,10 @@ describe("worker API", () => {
       save: { allowed: true, target: seededRefName },
       snapshot: {
         id: "snap_123",
-        manifestKey: "manifests/snap_123.json",
+        manifestDigest:
+          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        manifestKey:
+          "manifests/sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
         parent: null,
       },
       trustClass: "trusted",
@@ -517,7 +534,14 @@ describe("worker API", () => {
         metadata.getSnapshotHeader(Schema.decodeSync(SnapshotId)("snap_124"))
       )
     ).resolves.toMatchObject({
-      manifestKey: "manifests/snap_124.json",
+      archiveDigest:
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      archiveKey:
+        "archives/sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sciar",
+      manifestDigest:
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      manifestKey:
+        "manifests/sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
       parentSnapshotId: "snap_123",
       snapshotId: "snap_124",
       workspaceId: seededWorkspaceId,
