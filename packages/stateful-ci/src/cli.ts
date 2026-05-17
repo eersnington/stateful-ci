@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { lstat, readdir } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
@@ -9,20 +8,26 @@ import {
   clientVersion,
   configFileName,
   defaultConfig,
-  excludedPathsForConfig,
-  isBuiltInDeniedWorkspacePath,
-  isUserExcludedWorkspacePath,
   RestoreRequest,
   RestoreResponse,
   routes,
   SaveRequest,
   SaveResponse,
   StatefulCiConfig,
-  workspacePathsForConfig,
 } from "@stateful-ci/core";
 import type { PlatformError } from "effect";
 import { Console, Effect, Exit, FileSystem, Path, Schema } from "effect";
 import { Command } from "effect/unstable/cli";
+
+import {
+  createSnapshotArchiveEffect,
+  defaultLocalStorePath,
+  restoreSnapshotArchiveEffect,
+} from "./snapshot-archive";
+import type {
+  SnapshotArchiveError,
+  SnapshotArchiveSummary,
+} from "./snapshot-archive";
 
 interface ConfigAlreadyExists {
   readonly _tag: "ConfigAlreadyExists";
@@ -37,6 +42,7 @@ interface ConfigWriteFailed {
 
 interface CliFailure {
   readonly _tag: "CliFailure";
+  readonly cause?: string;
   readonly message: string;
 }
 
@@ -52,18 +58,9 @@ interface ApiConfig {
   readonly url: string;
 }
 
-interface ScannedWorkspace {
-  readonly fileCount: number;
-  readonly missingPaths: readonly string[];
-  readonly skippedByBuiltInDenylist: number;
-  readonly skippedUnsupportedType: number;
-  readonly skippedByUserExclude: number;
-  readonly totalBytes: number;
-}
-
 interface PreparedSaveRequest {
   readonly request: SaveRequest;
-  readonly scanned: ScannedWorkspace;
+  readonly archive: SnapshotArchiveSummary;
 }
 
 const configText = `${Schema.encodeUnknownSync(
@@ -95,8 +92,9 @@ const failExistingConfig = (error: ConfigAlreadyExists) =>
     `${configFileName} already exists at ${error.path}; leaving it unchanged.`
   ).pipe(Effect.flatMap(() => Effect.fail(error)));
 
-const cliFailure = (message: string): CliFailure => ({
+const cliFailure = (message: string, cause?: string): CliFailure => ({
   _tag: "CliFailure",
+  ...(cause === undefined ? {} : { cause }),
   message,
 });
 
@@ -110,6 +108,10 @@ const optionalEnv = (env: RuntimeEnv, key: string) => {
   const value = env[key];
   return value === undefined || value.length === 0 ? null : value;
 };
+
+const localStoreRoot = (env: RuntimeEnv, directory: string) =>
+  optionalEnv(env, "STATEFUL_CI_LOCAL_STORE_DIR") ??
+  defaultLocalStorePath(directory);
 
 const requiredEnv = (env: RuntimeEnv, key: string) => {
   const value = env[key];
@@ -246,164 +248,50 @@ const decodeProtocolResponse = <A>(
     : Effect.succeed(decoded.value);
 };
 
-const scanPath = async (
-  root: string,
-  relativePath: string,
-  excludes: readonly string[]
-): Promise<ScannedWorkspace> => {
-  if (isBuiltInDeniedWorkspacePath(relativePath)) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 1,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  if (isUserExcludedWorkspacePath(relativePath, excludes)) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 1,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  const path = `${root}/${relativePath}`;
-  const info = await lstat(path).catch(() => null);
-
-  if (info === null) {
-    return {
-      fileCount: 0,
-      missingPaths: [relativePath],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  if (info.isFile()) {
-    return {
-      fileCount: 1,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: info.size,
-    };
-  }
-
-  if (!info.isDirectory()) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 1,
-      totalBytes: 0,
-    };
-  }
-
-  const entries = await readdir(path);
-  const scannedEntries = await Promise.all(
-    entries.map((entry) => scanPath(root, `${relativePath}/${entry}`, excludes))
-  );
-  const total = {
-    fileCount: 0,
-    missingPaths: [] as string[],
-    skippedByBuiltInDenylist: 0,
-    skippedByUserExclude: 0,
-    skippedUnsupportedType: 0,
-    totalBytes: 0,
-  };
-
-  for (const scanned of scannedEntries) {
-    total.fileCount += scanned.fileCount;
-    total.missingPaths.push(...scanned.missingPaths);
-    total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
-    total.skippedUnsupportedType += scanned.skippedUnsupportedType;
-    total.skippedByUserExclude += scanned.skippedByUserExclude;
-    total.totalBytes += scanned.totalBytes;
-  }
-
-  return total;
-};
-
-const scanWorkspace = (directory: string, config: StatefulCiConfigType) =>
-  Effect.tryPromise({
-    catch: () =>
-      cliFailure(
-        "Could not scan configured workspace paths. Check file permissions and retry."
-      ),
-    try: async () => {
-      const excludes = excludedPathsForConfig(config);
-      const scannedPaths = await Promise.all(
-        workspacePathsForConfig(config).map((path) =>
-          scanPath(directory, path, excludes)
-        )
-      );
-      const total = {
-        fileCount: 0,
-        missingPaths: [] as string[],
-        skippedByBuiltInDenylist: 0,
-        skippedByUserExclude: 0,
-        skippedUnsupportedType: 0,
-        totalBytes: 0,
-      };
-
-      for (const scanned of scannedPaths) {
-        total.fileCount += scanned.fileCount;
-        total.missingPaths.push(...scanned.missingPaths);
-        total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
-        total.skippedUnsupportedType += scanned.skippedUnsupportedType;
-        total.skippedByUserExclude += scanned.skippedByUserExclude;
-        total.totalBytes += scanned.totalBytes;
-      }
-
-      return total;
-    },
-  });
+const cliFailureFromArchiveError = (
+  error: SnapshotArchiveError,
+  message: string
+) => cliFailure(message, error.cause ?? error.message);
 
 const saveRequestFromRestore = (
   restoreRequest: RestoreRequest,
-  loaded: LoadedConfig
+  loaded: LoadedConfig,
+  storeRoot: string
 ) =>
   Effect.gen(function* saveRequestFromRestoreEffect() {
-    const scanned = yield* scanWorkspace(process.cwd(), loaded.config);
-    const hash = sha256(
-      [
-        loaded.hash,
-        restoreRequest.workspace.repo,
-        restoreRequest.workspace.workflow,
-        restoreRequest.workspace.job,
-        String(scanned.fileCount),
-        String(scanned.totalBytes),
-        String(scanned.skippedByBuiltInDenylist),
-        String(scanned.skippedUnsupportedType),
-        String(scanned.skippedByUserExclude),
-        scanned.missingPaths.join("\0"),
-      ].join("\n")
+    const archive = yield* createSnapshotArchiveEffect({
+      config: loaded.config,
+      identity: {
+        configHash: loaded.hash,
+        gitSha: restoreRequest.git.sha,
+        job: restoreRequest.workspace.job,
+        repo: restoreRequest.workspace.repo,
+        runId: restoreRequest.github.runId,
+        workflow: restoreRequest.workspace.workflow,
+      },
+      root: process.cwd(),
+      storeRoot,
+    }).pipe(
+      Effect.mapError((error) =>
+        cliFailureFromArchiveError(error, error.message)
+      )
     );
-    const snapshotId = `snap_${hash.slice("sha256:".length, "sha256:".length + 24)}`;
     const request = {
       baseSnapshotId: null,
       manifest: {
-        chunkCount: 0,
-        fileCount: scanned.fileCount,
-        hash,
-        id: snapshotId,
-        key: `manifests/${snapshotId}.json`,
+        archiveDigest: archive.archiveDigest,
+        archiveKey: archive.archiveKey,
+        chunkCount: archive.fileCount === 0 ? 0 : 1,
+        fileCount: archive.fileCount,
+        id: archive.snapshotId,
+        key: archive.manifestKey,
+        manifestDigest: archive.manifestDigest,
         safety: {
-          skippedByBuiltInDenylist: scanned.skippedByBuiltInDenylist,
-          skippedByUserExclude: scanned.skippedByUserExclude,
-          skippedUnsupportedType: scanned.skippedUnsupportedType,
+          skippedByBuiltInDenylist: archive.safety.skippedByBuiltInDenylist,
+          skippedByUserExclude: archive.safety.skippedByUserExclude,
+          skippedUnsupportedType: archive.safety.skippedUnsupportedType,
         },
-        totalBytes: scanned.totalBytes,
+        totalBytes: archive.totalBytes,
       },
       runId: restoreRequest.github.runId,
       workspaceId: `ws_${sha256([restoreRequest.workspace.repo, restoreRequest.workspace.workflow, restoreRequest.workspace.job].join("\n")).slice("sha256:".length, "sha256:".length + 24)}`,
@@ -416,17 +304,23 @@ const saveRequestFromRestore = (
             "The scanned workspace did not produce a valid save request."
           )
         )
-      : ({ request: decoded.value, scanned } satisfies PreparedSaveRequest);
+      : ({ archive, request: decoded.value } satisfies PreparedSaveRequest);
   });
 
-const printRestoreResponse = (response: RestoreResponse) =>
-  response.decision === "denied"
-    ? Console.log(
-        `Restore denied: ${response.reason} (trust class: ${response.trustClass}). Save allowed: ${response.save.allowed ? "yes" : "no"}.`
-      )
-    : Console.log(
-        `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}). Snapshot data restore is not implemented yet.`
-      );
+const printRestoreDenied = (
+  response: Extract<RestoreResponse, { decision: "denied" }>
+) =>
+  Console.log(
+    `Restore denied: ${response.reason} (trust class: ${response.trustClass}). Save allowed: ${response.save.allowed ? "yes" : "no"}.`
+  );
+
+const printRestoreAllowed = (
+  response: Extract<RestoreResponse, { decision: "allowed" }>,
+  restored: { readonly fileCount: number; readonly totalBytes: number }
+) =>
+  Console.log(
+    `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}). Restored ${restored.fileCount} files (${restored.totalBytes} bytes).`
+  );
 
 const printSaveResponse = (response: SaveResponse) =>
   response.decision === "denied"
@@ -435,16 +329,17 @@ const printSaveResponse = (response: SaveResponse) =>
         `Save committed: snapshot ${response.snapshotId} for workspace ${response.workspaceId}. Latest: ${response.latest ? "yes" : "no"}.`
       );
 
-const printScanSummary = (scanned: ScannedWorkspace) =>
-  scanned.missingPaths.length === 0
+const printScanSummary = (archive: SnapshotArchiveSummary) =>
+  archive.missingPaths.length === 0
     ? Effect.void
     : Console.log(
-        `Configured workspace paths not found and skipped: ${scanned.missingPaths.join(", ")}.`
+        `Configured workspace paths not found and skipped: ${archive.missingPaths.join(", ")}.`
       );
 
 export const restoreProgram = (env: RuntimeEnv) =>
   Effect.gen(function* restoreProgramEffect() {
-    const loaded = yield* loadConfig(process.cwd());
+    const directory = process.cwd();
+    const loaded = yield* loadConfig(directory);
     const api = yield* apiConfigFromEnv(env);
     const request = yield* restoreRequestFromEnv(env, loaded.hash);
     const responseText = yield* postProtocol(
@@ -457,16 +352,40 @@ export const restoreProgram = (env: RuntimeEnv) =>
       responseText
     );
 
-    yield* printRestoreResponse(response);
+    if (response.decision === "denied") {
+      return yield* printRestoreDenied(response);
+    }
+
+    const restored = yield* restoreSnapshotArchiveEffect({
+      manifestDigest: response.snapshot.manifestDigest,
+      manifestKey: response.snapshot.manifestKey,
+      root: directory,
+      snapshotId: response.snapshot.id,
+      storeRoot: localStoreRoot(env, directory),
+    }).pipe(
+      Effect.mapError((error) =>
+        cliFailureFromArchiveError(
+          error,
+          `Could not restore snapshot ${response.snapshot.id}: ${error.message}`
+        )
+      )
+    );
+
+    yield* printRestoreAllowed(response, restored);
   }).pipe(Effect.catchTag("CliFailure", failCliFailure));
 
 export const saveProgram = (env: RuntimeEnv) =>
   Effect.gen(function* saveProgramEffect() {
-    const loaded = yield* loadConfig(process.cwd());
+    const directory = process.cwd();
+    const loaded = yield* loadConfig(directory);
     const api = yield* apiConfigFromEnv(env);
     const restoreRequest = yield* restoreRequestFromEnv(env, loaded.hash);
-    const prepared = yield* saveRequestFromRestore(restoreRequest, loaded);
-    yield* printScanSummary(prepared.scanned);
+    const prepared = yield* saveRequestFromRestore(
+      restoreRequest,
+      loaded,
+      localStoreRoot(env, directory)
+    );
+    yield* printScanSummary(prepared.archive);
     const responseText = yield* postProtocol(
       api,
       routes.save.path,
