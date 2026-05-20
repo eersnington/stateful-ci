@@ -131,7 +131,7 @@ describe("snapshot object graph schemas", () => {
     }
   });
 
-  test("manifest schema stores file tree and complete object inventory", () => {
+  test("manifest schema stores file tree and immutable payload inventory", () => {
     const manifest = {
       createdAt: "2026-05-20T00:00:00.000Z",
       entries: [
@@ -139,7 +139,7 @@ describe("snapshot object graph schemas", () => {
       ],
       formatVersion: 1,
       managedRoots: [".turbo"],
-      objects,
+      objects: objects.filter((object) => object.kind !== "manifest"),
       provenance: {
         git: {
           baseRef: null,
@@ -196,7 +196,7 @@ describe("snapshot object graph schemas", () => {
           entries: [],
           formatVersion: 1,
           managedRoots: [".turbo"],
-          objects: [objects[1]],
+          objects: [objects[0]],
           provenance: {
             git: {
               baseRef: null,
@@ -218,7 +218,7 @@ describe("snapshot object graph schemas", () => {
             chunkCount: 0,
             directoryCount: 0,
             fileCount: 0,
-            packCount: 1,
+            packCount: 0,
             symlinkCount: 0,
             totalBytes: 0,
           },

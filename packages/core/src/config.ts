@@ -19,14 +19,22 @@ export const builtInDeniedPathParts = Object.freeze([
   ".azure",
   ".config/gcloud",
   ".docker",
+  ".docker/config.json",
   ".env",
   ".env.local",
   ".env.production",
+  ".gcp",
+  ".kube",
   ".netrc",
   ".npmrc",
   ".pypirc",
   ".ssh",
+  "id_ed25519",
+  "id_rsa",
 ] as const);
+
+const deniedCredentialFilePattern =
+  /(?:^|\/)(?:[^/]+\.(?:key|p12|pem|pfx)|id_ed25519|id_rsa)$/u;
 
 export const WorkspacePath = Schema.String.check(
   Schema.isPattern(WORKSPACE_PATH_PATTERN)
@@ -104,6 +112,7 @@ export const excludedPathsForConfig = (
 
 export const isBuiltInDeniedWorkspacePath = (path: string) =>
   hasDotenvSegment(path) ||
+  deniedCredentialFilePattern.test(normalizeWorkspacePath(path)) ||
   pathSuffixes(path).some((suffix) =>
     builtInDeniedPathParts.some((denied) =>
       matchesPathOrDescendant(suffix, denied)

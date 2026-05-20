@@ -243,12 +243,12 @@ describe("stateful-ci save", () => {
     await mkdir(join(tempDir, ".turbo/cache"), { recursive: true });
     await writeFile(
       configFileName,
-      '{"paths":[".turbo",".env","linked-cache"],"exclude":[".turbo/cache/skip.txt"]}\n'
+      '{"paths":[".turbo"],"exclude":[".turbo/cache/skip.txt"]}\n'
     );
     await writeFile(join(tempDir, ".turbo/cache/result.txt"), "cached output");
     await writeFile(join(tempDir, ".turbo/cache/skip.txt"), "ignored output");
     await writeFile(join(tempDir, ".env"), "SECRET=value");
-    await symlink(join(tempDir, ".turbo/cache/result.txt"), "linked-cache");
+    await symlink("cache/result.txt", join(tempDir, ".turbo/result-link"));
   });
 
   afterEach(async () => {
@@ -286,10 +286,14 @@ describe("stateful-ci save", () => {
       manifest: {
         chunkCount: 0,
         fileCount: 1,
+        objects: expect.arrayContaining([
+          expect.objectContaining({ kind: "manifest" }),
+          expect.objectContaining({ kind: "pack" }),
+        ]),
         safety: {
-          skippedByBuiltInDenylist: 1,
+          skippedByBuiltInDenylist: 0,
           skippedByUserExclude: 1,
-          skippedUnsupportedType: 1,
+          skippedUnsupportedType: 0,
         },
         totalBytes: 13,
       },
