@@ -58,6 +58,22 @@ export type Sha256Digest = Schema.Schema.Type<typeof Sha256Digest>;
 export const sha256DigestFromHex = (hex: string) =>
   Schema.decodeSync(Sha256Digest)(`sha256:${hex}`);
 
+export const sha256HexFromDigest = (digest: Sha256Digest) =>
+  digest.slice("sha256:".length);
+
+export const manifestKeyFromDigest = (digest: Sha256Digest) =>
+  Schema.decodeSync(ManifestKey)(
+    `manifests/sha256/${sha256HexFromDigest(digest)}.json`
+  );
+
+export const packKeyFromDigest = (digest: Sha256Digest) =>
+  Schema.decodeSync(PackKey)(
+    `packs/sha256/${sha256HexFromDigest(digest)}.scipack`
+  );
+
+export const chunkKeyFromDigest = (digest: Sha256Digest) =>
+  Schema.decodeSync(ChunkKey)(`chunks/sha256/${sha256HexFromDigest(digest)}`);
+
 export const sha256DigestFromObjectKey = (key: SnapshotObjectKey) => {
   const digest = SHA256_HEX_PATTERN.exec(key)?.[0];
 
