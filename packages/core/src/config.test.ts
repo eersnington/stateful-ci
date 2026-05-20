@@ -82,7 +82,12 @@ describe("config schemas", () => {
       isBuiltInDeniedWorkspacePath("apps/.config/gcloud/config.json")
     ).toBeTruthy();
     expect(isBuiltInDeniedWorkspacePath("apps/.docker/trust")).toBeTruthy();
-    expect(isBuiltInDeniedWorkspacePath("apps/not.ssh/id_rsa")).toBeFalsy();
+    expect(isBuiltInDeniedWorkspacePath("apps/not.ssh/readme.md")).toBeFalsy();
+  });
+
+  test("matches built-in private key filename safety rules", () => {
+    expect(isBuiltInDeniedWorkspacePath("apps/not.ssh/id_rsa")).toBeTruthy();
+    expect(isBuiltInDeniedWorkspacePath("apps/key.pem")).toBeTruthy();
   });
 
   test("matches workspace excludes with normalized paths", () => {

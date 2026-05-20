@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { lstat, readdir } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
@@ -9,9 +8,6 @@ import {
   clientVersion,
   configFileName,
   defaultConfig,
-  excludedPathsForConfig,
-  isBuiltInDeniedWorkspacePath,
-  isUserExcludedWorkspacePath,
   protocolVersion,
   RestoreRequest,
   RestoreResponse,
@@ -24,6 +20,11 @@ import {
 import type { PlatformError } from "effect";
 import { Console, Effect, Exit, FileSystem, Path, Schema } from "effect";
 import { Command } from "effect/unstable/cli";
+
+import {
+  createWorkspaceSnapshot,
+  restoreWorkspaceSnapshot,
+} from "./snapshot-engine";
 
 interface ConfigAlreadyExists {
   readonly _tag: "ConfigAlreadyExists";
@@ -53,18 +54,8 @@ interface ApiConfig {
   readonly url: string;
 }
 
-interface ScannedWorkspace {
-  readonly fileCount: number;
-  readonly missingPaths: readonly string[];
-  readonly skippedByBuiltInDenylist: number;
-  readonly skippedUnsupportedType: number;
-  readonly skippedByUserExclude: number;
-  readonly totalBytes: number;
-}
-
 interface PreparedSaveRequest {
   readonly request: SaveRequest;
-  readonly scanned: ScannedWorkspace;
 }
 
 const configText = `${Schema.encodeUnknownSync(
@@ -253,175 +244,30 @@ const decodeProtocolResponse = <A>(
     : Effect.succeed(decoded.value);
 };
 
-const scanPath = async (
-  root: string,
-  relativePath: string,
-  excludes: readonly string[]
-): Promise<ScannedWorkspace> => {
-  if (isBuiltInDeniedWorkspacePath(relativePath)) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 1,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  if (isUserExcludedWorkspacePath(relativePath, excludes)) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 1,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  const path = `${root}/${relativePath}`;
-  const info = await lstat(path).catch(() => null);
-
-  if (info === null) {
-    return {
-      fileCount: 0,
-      missingPaths: [relativePath],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  if (info.isFile()) {
-    return {
-      fileCount: 1,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: info.size,
-    };
-  }
-
-  if (!info.isDirectory()) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 1,
-      totalBytes: 0,
-    };
-  }
-
-  const entries = await readdir(path);
-  const scannedEntries = await Promise.all(
-    entries.map((entry) => scanPath(root, `${relativePath}/${entry}`, excludes))
-  );
-  const total = {
-    fileCount: 0,
-    missingPaths: [] as string[],
-    skippedByBuiltInDenylist: 0,
-    skippedByUserExclude: 0,
-    skippedUnsupportedType: 0,
-    totalBytes: 0,
-  };
-
-  for (const scanned of scannedEntries) {
-    total.fileCount += scanned.fileCount;
-    total.missingPaths.push(...scanned.missingPaths);
-    total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
-    total.skippedUnsupportedType += scanned.skippedUnsupportedType;
-    total.skippedByUserExclude += scanned.skippedByUserExclude;
-    total.totalBytes += scanned.totalBytes;
-  }
-
-  return total;
-};
-
-const scanWorkspace = (directory: string, config: StatefulCiConfigType) =>
-  Effect.tryPromise({
-    catch: () =>
-      cliFailure(
-        "Could not scan configured workspace paths. Check file permissions and retry."
-      ),
-    try: async () => {
-      const excludes = excludedPathsForConfig(config);
-      const scannedPaths = await Promise.all(
-        workspacePathsForConfig(config).map((path) =>
-          scanPath(directory, path, excludes)
-        )
-      );
-      const total = {
-        fileCount: 0,
-        missingPaths: [] as string[],
-        skippedByBuiltInDenylist: 0,
-        skippedByUserExclude: 0,
-        skippedUnsupportedType: 0,
-        totalBytes: 0,
-      };
-
-      for (const scanned of scannedPaths) {
-        total.fileCount += scanned.fileCount;
-        total.missingPaths.push(...scanned.missingPaths);
-        total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
-        total.skippedUnsupportedType += scanned.skippedUnsupportedType;
-        total.skippedByUserExclude += scanned.skippedByUserExclude;
-        total.totalBytes += scanned.totalBytes;
-      }
-
-      return total;
-    },
-  });
-
 const saveRequestFromRestore = (
   restoreRequest: RestoreRequest,
   loaded: LoadedConfig
 ) =>
   Effect.gen(function* saveRequestFromRestoreEffect() {
-    const scanned = yield* scanWorkspace(process.cwd(), loaded.config);
-    const hash = sha256(
-      [
-        loaded.hash,
-        restoreRequest.workspace.repo,
-        restoreRequest.workspace.workflow,
-        restoreRequest.workspace.job,
-        String(scanned.fileCount),
-        String(scanned.totalBytes),
-        String(scanned.skippedByBuiltInDenylist),
-        String(scanned.skippedUnsupportedType),
-        String(scanned.skippedByUserExclude),
-        scanned.missingPaths.join("\0"),
-      ].join("\n")
-    );
-    const snapshotId = `snap_${hash.slice("sha256:".length, "sha256:".length + 24)}`;
-    const manifestKey = `manifests/sha256/${hash.slice("sha256:".length)}.json`;
-    const objects = [
-      {
-        digest: hash,
-        key: manifestKey,
-        kind: "manifest",
-        size: 0,
+    const snapshot = yield* createWorkspaceSnapshot({
+      config: loaded.config,
+      provenance: {
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        runId: restoreRequest.github.runId,
       },
-    ];
+      workspace: restoreRequest.workspace,
+      workspaceRoot: process.cwd(),
+    }).pipe(
+      Effect.mapError((error) =>
+        cliFailure(
+          `${error.message} Stateful CI did not send a save request because the local snapshot is incomplete.`
+        )
+      )
+    );
     const request = {
       baseSnapshotId: null,
-      manifest: {
-        chunkCount: 0,
-        fileCount: scanned.fileCount,
-        hash,
-        id: snapshotId,
-        key: manifestKey,
-        objects,
-        safety: {
-          skippedByBuiltInDenylist: scanned.skippedByBuiltInDenylist,
-          skippedByUserExclude: scanned.skippedByUserExclude,
-          skippedUnsupportedType: scanned.skippedUnsupportedType,
-        },
-        totalBytes: scanned.totalBytes,
-      },
+      manifest: snapshot.saveManifest,
       protocolVersion,
       runId: restoreRequest.github.runId,
       workspaceId: `ws_${sha256([restoreRequest.workspace.repo, restoreRequest.workspace.workflow, restoreRequest.workspace.job].join("\n")).slice("sha256:".length, "sha256:".length + 24)}`,
@@ -434,7 +280,7 @@ const saveRequestFromRestore = (
             "The scanned workspace did not produce a valid save request."
           )
         )
-      : ({ request: decoded.value, scanned } satisfies PreparedSaveRequest);
+      : ({ request: decoded.value } satisfies PreparedSaveRequest);
   });
 
 const printRestoreResponse = (response: RestoreResponse) =>
@@ -443,7 +289,7 @@ const printRestoreResponse = (response: RestoreResponse) =>
         `Restore denied: ${response.reason} (trust class: ${response.trustClass}). Save allowed: ${response.save.allowed ? "yes" : "no"}.`
       )
     : Console.log(
-        `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}). Snapshot data restore is not implemented yet.`
+        `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}).`
       );
 
 const printSaveResponse = (response: SaveResponse) =>
@@ -451,13 +297,6 @@ const printSaveResponse = (response: SaveResponse) =>
     ? Console.log(`Save denied: ${response.reason}.`)
     : Console.log(
         `Save committed: snapshot ${response.snapshotId} for workspace ${response.workspaceId}. Latest: ${response.latest ? "yes" : "no"}.`
-      );
-
-const printScanSummary = (scanned: ScannedWorkspace) =>
-  scanned.missingPaths.length === 0
-    ? Effect.void
-    : Console.log(
-        `Configured workspace paths not found and skipped: ${scanned.missingPaths.join(", ")}.`
       );
 
 export const restoreProgram = (env: RuntimeEnv) =>
@@ -475,6 +314,17 @@ export const restoreProgram = (env: RuntimeEnv) =>
       responseText
     );
 
+    if (response.decision === "allowed") {
+      yield* restoreWorkspaceSnapshot({
+        manifest: response.manifest,
+        workspaceRoot: process.cwd(),
+      }).pipe(
+        Effect.mapError((error) =>
+          cliFailure(`${error.message} Restore did not mutate the workspace.`)
+        )
+      );
+    }
+
     yield* printRestoreResponse(response);
   }).pipe(Effect.catchTag("CliFailure", failCliFailure));
 
@@ -484,7 +334,6 @@ export const saveProgram = (env: RuntimeEnv) =>
     const api = yield* apiConfigFromEnv(env);
     const restoreRequest = yield* restoreRequestFromEnv(env, loaded);
     const prepared = yield* saveRequestFromRestore(restoreRequest, loaded);
-    yield* printScanSummary(prepared.scanned);
     const responseText = yield* postProtocol(
       api,
       routes.save.path,

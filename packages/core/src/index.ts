@@ -118,6 +118,7 @@ export {
   SnapshotFileEntry,
   SnapshotManifest,
   SnapshotManifestEntry,
+  SnapshotManifestObjectInventory,
   SnapshotManifestProvenance,
   SnapshotManifestStats,
   SnapshotObjectInventory,
