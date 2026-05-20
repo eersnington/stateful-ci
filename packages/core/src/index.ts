@@ -27,16 +27,43 @@ export { MethodNotAllowed } from "./errors/method-not-allowed";
 export { RequestBodyTooLarge } from "./errors/request-body-too-large";
 export { RouteNotFound } from "./errors/route-not-found";
 export { Unauthorized } from "./errors/unauthorized";
-export { ClientContext, GitContext, GitHubContext } from "./github";
 export {
+  ClientContext,
+  GitContext,
+  GitHubContext,
+  GitHubOidcIdentity,
+  GitHubOidcToken,
+} from "./github";
+export {
+  ChunkKey,
+  HeadGeneration,
+  IdempotencyKey,
   ManifestKey,
+  PackKey,
   RunId,
   Sha256Digest,
+  sha256DigestFromHex,
+  sha256DigestFromObjectKey,
+  SnapshotObjectKey,
   SnapshotId,
   WorkspaceId,
 } from "./ids";
 export {
+  CommitSaveCommittedResponse,
+  CommitSaveConflictResponse,
+  CommitSaveDeniedResponse,
+  CommitSaveIdempotentResponse,
+  CommitSaveRequest,
+  CommitSaveResponse,
+  CommitTarget,
   HealthResponse,
+  ObjectTransferMethod,
+  ObjectTransferPlan,
+  ObjectTransferPlanEntry,
+  PrepareSaveAllowedResponse,
+  PrepareSaveDeniedResponse,
+  PrepareSaveRequest,
+  PrepareSaveResponse,
   protocolVersion,
   RestoreAllowedResponse,
   RestoreDeniedResponse,
@@ -48,7 +75,20 @@ export {
   SaveDeniedResponse,
   SaveRequest,
   SaveResponse,
+  SignedUrlTransferPlanEntry,
+  WorkerRouteTransferPlanEntry,
 } from "./protocol";
-export { SafetySummary, SaveManifest, SnapshotRef } from "./snapshot";
+export {
+  ChunkObjectInventoryEntry,
+  ManifestDescriptor,
+  ManifestObjectInventoryEntry,
+  PackObjectInventoryEntry,
+  SafetySummary,
+  SaveManifest,
+  SnapshotObjectInventory,
+  SnapshotObjectInventoryEntry,
+  SnapshotObjectKind,
+  SnapshotRef,
+} from "./snapshot";
 export { DenialReason, TrustClass } from "./trust";
 export { WorkspaceRef } from "./workspace";

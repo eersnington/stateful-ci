@@ -1,8 +1,28 @@
 import { Schema } from "effect";
 
-import { ClientContext, GitContext, GitHubContext } from "./github";
-import { RunId, SnapshotId, WorkspaceId } from "./ids";
-import { SaveManifest, SnapshotRef } from "./snapshot";
+import { WorkspacePath } from "./config";
+import {
+  ClientContext,
+  GitContext,
+  GitHubContext,
+  GitHubOidcIdentity,
+} from "./github";
+import {
+  HeadGeneration,
+  IdempotencyKey,
+  ManifestKey,
+  RunId,
+  Sha256Digest,
+  SnapshotId,
+  WorkspaceId,
+} from "./ids";
+import {
+  ManifestDescriptor,
+  SaveManifest,
+  SnapshotObjectInventory,
+  SnapshotObjectInventoryEntry,
+  SnapshotRef,
+} from "./snapshot";
 import { DenialReason, TrustClass } from "./trust";
 import { WorkspaceRef } from "./workspace";
 
@@ -19,13 +39,66 @@ export const RestoreRequest = Schema.Struct({
   client: ClientContext,
   git: GitContext,
   github: GitHubContext,
+  identity: GitHubOidcIdentity,
+  managedRoots: Schema.Array(WorkspacePath),
+  protocolVersion: Schema.Literal(protocolVersion),
   workspace: WorkspaceRef,
 });
 export type RestoreRequest = Schema.Schema.Type<typeof RestoreRequest>;
 
+export const CommitTarget = Schema.Struct({
+  namespace: Schema.String.check(Schema.isMinLength(1)),
+  refName: Schema.String.check(Schema.isMinLength(1)),
+});
+export type CommitTarget = Schema.Schema.Type<typeof CommitTarget>;
+
+export const ObjectTransferMethod = Schema.Literals(["GET", "PUT"]);
+export type ObjectTransferMethod = Schema.Schema.Type<
+  typeof ObjectTransferMethod
+>;
+
+const TransferHeaders = Schema.Record(Schema.String, Schema.String);
+
+const TransferPlanBase = {
+  headers: Schema.optional(TransferHeaders),
+  method: ObjectTransferMethod,
+  object: SnapshotObjectInventoryEntry,
+} as const;
+
+export const WorkerRouteTransferPlanEntry = Schema.Struct({
+  ...TransferPlanBase,
+  route: Schema.String.check(Schema.isMinLength(1)),
+  transport: Schema.Literal("worker-route"),
+});
+export type WorkerRouteTransferPlanEntry = Schema.Schema.Type<
+  typeof WorkerRouteTransferPlanEntry
+>;
+
+export const SignedUrlTransferPlanEntry = Schema.Struct({
+  ...TransferPlanBase,
+  expiresAt: Schema.String.check(Schema.isMinLength(1)),
+  transport: Schema.Literal("signed-url"),
+  url: Schema.String.check(Schema.isMinLength(1)),
+});
+export type SignedUrlTransferPlanEntry = Schema.Schema.Type<
+  typeof SignedUrlTransferPlanEntry
+>;
+
+export const ObjectTransferPlanEntry = Schema.Union([
+  WorkerRouteTransferPlanEntry,
+  SignedUrlTransferPlanEntry,
+]);
+export type ObjectTransferPlanEntry = Schema.Schema.Type<
+  typeof ObjectTransferPlanEntry
+>;
+
+export const ObjectTransferPlan = Schema.Array(ObjectTransferPlanEntry);
+export type ObjectTransferPlan = Schema.Schema.Type<typeof ObjectTransferPlan>;
+
 export const SaveRequest = Schema.Struct({
   baseSnapshotId: Schema.NullOr(SnapshotId),
   manifest: SaveManifest,
+  protocolVersion: Schema.Literal(protocolVersion),
   runId: RunId,
   workspaceId: WorkspaceId,
 });
@@ -42,6 +115,8 @@ export type RestoreSavePlan = Schema.Schema.Type<typeof RestoreSavePlan>;
 
 export const RestoreAllowedResponse = Schema.Struct({
   decision: Schema.Literal("allowed"),
+  downloadPlan: ObjectTransferPlan,
+  manifest: ManifestDescriptor,
   save: RestoreSavePlan,
   snapshot: SnapshotRef,
   trustClass: TrustClass,
@@ -90,8 +165,113 @@ export const SaveResponse = Schema.Union([
 ]);
 export type SaveResponse = Schema.Schema.Type<typeof SaveResponse>;
 
+export const PrepareSaveRequest = Schema.Struct({
+  client: ClientContext,
+  git: GitContext,
+  github: GitHubContext,
+  idempotencyKey: IdempotencyKey,
+  identity: GitHubOidcIdentity,
+  manifest: ManifestDescriptor,
+  objects: SnapshotObjectInventory,
+  protocolVersion: Schema.Literal(protocolVersion),
+  workspace: WorkspaceRef,
+});
+export type PrepareSaveRequest = Schema.Schema.Type<typeof PrepareSaveRequest>;
+
+export const PrepareSaveDeniedResponse = Schema.Struct({
+  decision: Schema.Literal("denied"),
+  reason: DenialReason,
+  trustClass: TrustClass,
+  workspaceId: Schema.optional(WorkspaceId),
+});
+export type PrepareSaveDeniedResponse = Schema.Schema.Type<
+  typeof PrepareSaveDeniedResponse
+>;
+
+export const PrepareSaveAllowedResponse = Schema.Struct({
+  baseSnapshotId: Schema.NullOr(SnapshotId),
+  commitTarget: CommitTarget,
+  decision: Schema.Literal("allowed"),
+  expectedHeadGeneration: HeadGeneration,
+  missingObjects: ObjectTransferPlan,
+  trustClass: TrustClass,
+  workspaceId: WorkspaceId,
+});
+export type PrepareSaveAllowedResponse = Schema.Schema.Type<
+  typeof PrepareSaveAllowedResponse
+>;
+
+export const PrepareSaveResponse = Schema.Union([
+  PrepareSaveAllowedResponse,
+  PrepareSaveDeniedResponse,
+]);
+export type PrepareSaveResponse = Schema.Schema.Type<
+  typeof PrepareSaveResponse
+>;
+
+export const CommitSaveRequest = Schema.Struct({
+  baseSnapshotId: Schema.NullOr(SnapshotId),
+  expectedHeadGeneration: HeadGeneration,
+  idempotencyKey: IdempotencyKey,
+  manifestDigest: Sha256Digest,
+  manifestKey: ManifestKey,
+  objects: SnapshotObjectInventory,
+  protocolVersion: Schema.Literal(protocolVersion),
+  runId: RunId,
+  target: CommitTarget,
+  workspaceId: WorkspaceId,
+});
+export type CommitSaveRequest = Schema.Schema.Type<typeof CommitSaveRequest>;
+
+export const CommitSaveCommittedResponse = Schema.Struct({
+  decision: Schema.Literal("committed"),
+  headGeneration: HeadGeneration,
+  snapshotId: SnapshotId,
+  workspaceId: WorkspaceId,
+});
+export type CommitSaveCommittedResponse = Schema.Schema.Type<
+  typeof CommitSaveCommittedResponse
+>;
+
+export const CommitSaveIdempotentResponse = Schema.Struct({
+  decision: Schema.Literal("idempotent"),
+  headGeneration: HeadGeneration,
+  snapshotId: SnapshotId,
+  workspaceId: WorkspaceId,
+});
+export type CommitSaveIdempotentResponse = Schema.Schema.Type<
+  typeof CommitSaveIdempotentResponse
+>;
+
+export const CommitSaveConflictResponse = Schema.Struct({
+  actualHeadGeneration: HeadGeneration,
+  decision: Schema.Literal("conflict"),
+  reason: Schema.Literal("head_generation_mismatch"),
+});
+export type CommitSaveConflictResponse = Schema.Schema.Type<
+  typeof CommitSaveConflictResponse
+>;
+
+export const CommitSaveDeniedResponse = Schema.Struct({
+  decision: Schema.Literal("denied"),
+  reason: DenialReason,
+});
+export type CommitSaveDeniedResponse = Schema.Schema.Type<
+  typeof CommitSaveDeniedResponse
+>;
+
+export const CommitSaveResponse = Schema.Union([
+  CommitSaveCommittedResponse,
+  CommitSaveIdempotentResponse,
+  CommitSaveConflictResponse,
+  CommitSaveDeniedResponse,
+]);
+export type CommitSaveResponse = Schema.Schema.Type<typeof CommitSaveResponse>;
+
 export const routes = {
+  commitSave: { method: "POST", path: "/v1/save/commit" },
   health: { method: "GET", path: "/health" },
+  prepareSave: { method: "POST", path: "/v1/save/prepare" },
   restore: { method: "POST", path: "/v1/restore" },
   save: { method: "POST", path: "/v1/save" },
 } as const;

@@ -20,7 +20,8 @@ const env = {
 
 const restoreRequest = {
   client: {
-    configHash: "sha256:config",
+    configHash:
+      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     version: "0.1.0",
   },
   git: {
@@ -35,6 +36,12 @@ const restoreRequest = {
     event: "push",
     runId: "123456789",
   },
+  identity: {
+    provider: "github-actions",
+    token: "oidc.jwt.token",
+  },
+  managedRoots: [".turbo"],
+  protocolVersion: 1,
   workspace: {
     job: "test",
     repo: "eersnington/stateful-ci",
@@ -42,14 +49,32 @@ const restoreRequest = {
   },
 };
 
+const manifestDigest =
+  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const manifestKey =
+  "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+const seededManifestDigest =
+  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const seededManifestKey =
+  "manifests/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json";
+const saveObjects = [
+  {
+    digest: manifestDigest,
+    key: manifestKey,
+    kind: "manifest",
+    size: 512,
+  },
+] as const;
+
 const saveRequest = {
   baseSnapshotId: "snap_123",
   manifest: {
     chunkCount: 1,
     fileCount: 21_903,
-    hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    hash: manifestDigest,
     id: "snap_124",
-    key: "manifests/snap_124.json",
+    key: manifestKey,
+    objects: saveObjects,
     safety: {
       skippedByBuiltInDenylist: 3,
       skippedByUserExclude: 12,
@@ -57,12 +82,13 @@ const saveRequest = {
     },
     totalBytes: 481_203_912,
   },
+  protocolVersion: 1,
   runId: "123456789",
   workspaceId: "ws_123",
 };
 
 const seededNamespace =
-  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:config";
+  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
 const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${seededNamespace}:${seededRefName}`
@@ -72,10 +98,8 @@ const seededSnapshotId = Schema.decodeSync(SnapshotId)("snap_123");
 const seededSnapshot = {
   chunkCount: 1,
   createdAt: "2026-05-16T00:00:00.000Z",
-  manifestDigest: Schema.decodeSync(Sha256Digest)(
-    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  ),
-  manifestKey: Schema.decodeSync(ManifestKey)("manifests/snap_123.json"),
+  manifestDigest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
+  manifestKey: Schema.decodeSync(ManifestKey)(seededManifestKey),
   parentSnapshotId: null,
   runId: Schema.decodeSync(RunId)("123456788"),
   snapshotId: seededSnapshotId,
@@ -200,10 +224,29 @@ describe("worker API", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
       decision: "allowed",
+      downloadPlan: [
+        {
+          method: "GET",
+          object: {
+            digest: seededManifestDigest,
+            key: seededManifestKey,
+            kind: "manifest",
+            size: 0,
+          },
+          route: `/v1/objects/${seededManifestKey}`,
+          transport: "worker-route",
+        },
+      ],
+      manifest: {
+        digest: seededManifestDigest,
+        key: seededManifestKey,
+        size: 0,
+        snapshotId: "snap_123",
+      },
       save: { allowed: true, target: seededRefName },
       snapshot: {
         id: "snap_123",
-        manifestKey: "manifests/snap_123.json",
+        manifestKey: seededManifestKey,
         parent: null,
       },
       trustClass: "trusted",
@@ -423,7 +466,8 @@ describe("worker API", () => {
         ...restoreRequest,
         client: {
           ...restoreRequest.client,
-          configHash: "sha256:different-config",
+          configHash:
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         },
       }),
       env,
@@ -437,7 +481,7 @@ describe("worker API", () => {
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
       workspaceId: workspaceIdFor(
-        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:different-config",
+        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         seededRefName
       ),
     });
@@ -517,7 +561,7 @@ describe("worker API", () => {
         metadata.getSnapshotHeader(Schema.decodeSync(SnapshotId)("snap_124"))
       )
     ).resolves.toMatchObject({
-      manifestKey: "manifests/snap_124.json",
+      manifestKey,
       parentSnapshotId: "snap_123",
       snapshotId: "snap_124",
       workspaceId: seededWorkspaceId,

@@ -393,6 +393,25 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
     return Response.json(
       Schema.encodeUnknownSync(RestoreAllowedResponse)({
         decision: "allowed",
+        downloadPlan: [
+          {
+            method: "GET",
+            object: {
+              digest: restored.snapshot.manifestDigest,
+              key: restored.snapshot.manifestKey,
+              kind: "manifest",
+              size: 0,
+            },
+            route: `/v1/objects/${restored.snapshot.manifestKey}`,
+            transport: "worker-route",
+          },
+        ],
+        manifest: {
+          digest: restored.snapshot.manifestDigest,
+          key: restored.snapshot.manifestKey,
+          size: 0,
+          snapshotId: restored.snapshot.snapshotId,
+        },
         save: savePolicy.allowed
           ? { allowed: true, target: target.refName }
           : { allowed: false },

@@ -12,6 +12,7 @@ import {
   excludedPathsForConfig,
   isBuiltInDeniedWorkspacePath,
   isUserExcludedWorkspacePath,
+  protocolVersion,
   RestoreRequest,
   RestoreResponse,
   routes,
@@ -160,10 +161,10 @@ const apiConfigFromEnv = (env: RuntimeEnv) =>
     } satisfies ApiConfig;
   });
 
-const restoreRequestFromEnv = (env: RuntimeEnv, configHash: string) =>
+const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
   Effect.gen(function* restoreRequestFromEnvEffect() {
     const request = {
-      client: { configHash, version: clientVersion },
+      client: { configHash: loaded.hash, version: clientVersion },
       git: {
         baseRef: optionalEnv(env, "GITHUB_BASE_REF"),
         headRef: optionalEnv(env, "GITHUB_HEAD_REF"),
@@ -176,6 +177,12 @@ const restoreRequestFromEnv = (env: RuntimeEnv, configHash: string) =>
         event: yield* requiredEnv(env, "GITHUB_EVENT_NAME"),
         runId: yield* requiredEnv(env, "GITHUB_RUN_ID"),
       },
+      identity: {
+        provider: "github-actions",
+        token: yield* requiredEnv(env, "STATEFUL_CI_OIDC_TOKEN"),
+      },
+      managedRoots: workspacePathsForConfig(loaded.config),
+      protocolVersion,
       workspace: {
         job: yield* requiredEnv(env, "GITHUB_JOB"),
         repo: yield* requiredEnv(env, "GITHUB_REPOSITORY"),
@@ -390,6 +397,15 @@ const saveRequestFromRestore = (
       ].join("\n")
     );
     const snapshotId = `snap_${hash.slice("sha256:".length, "sha256:".length + 24)}`;
+    const manifestKey = `manifests/sha256/${hash.slice("sha256:".length)}.json`;
+    const objects = [
+      {
+        digest: hash,
+        key: manifestKey,
+        kind: "manifest",
+        size: 0,
+      },
+    ];
     const request = {
       baseSnapshotId: null,
       manifest: {
@@ -397,7 +413,8 @@ const saveRequestFromRestore = (
         fileCount: scanned.fileCount,
         hash,
         id: snapshotId,
-        key: `manifests/${snapshotId}.json`,
+        key: manifestKey,
+        objects,
         safety: {
           skippedByBuiltInDenylist: scanned.skippedByBuiltInDenylist,
           skippedByUserExclude: scanned.skippedByUserExclude,
@@ -405,6 +422,7 @@ const saveRequestFromRestore = (
         },
         totalBytes: scanned.totalBytes,
       },
+      protocolVersion,
       runId: restoreRequest.github.runId,
       workspaceId: `ws_${sha256([restoreRequest.workspace.repo, restoreRequest.workspace.workflow, restoreRequest.workspace.job].join("\n")).slice("sha256:".length, "sha256:".length + 24)}`,
     };
@@ -446,7 +464,7 @@ export const restoreProgram = (env: RuntimeEnv) =>
   Effect.gen(function* restoreProgramEffect() {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const request = yield* restoreRequestFromEnv(env, loaded.hash);
+    const request = yield* restoreRequestFromEnv(env, loaded);
     const responseText = yield* postProtocol(
       api,
       routes.restore.path,
@@ -464,7 +482,7 @@ export const saveProgram = (env: RuntimeEnv) =>
   Effect.gen(function* saveProgramEffect() {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const restoreRequest = yield* restoreRequestFromEnv(env, loaded.hash);
+    const restoreRequest = yield* restoreRequestFromEnv(env, loaded);
     const prepared = yield* saveRequestFromRestore(restoreRequest, loaded);
     yield* printScanSummary(prepared.scanned);
     const responseText = yield* postProtocol(

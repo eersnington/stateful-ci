@@ -1,11 +1,13 @@
-import type { RestoreRequest } from "@stateful-ci/core";
+import { RestoreRequest } from "@stateful-ci/core";
+import { Schema } from "effect";
 import { describe, expect, test } from "vitest";
 
 import { classifyRunTrust } from "./run-classification";
 
-const restoreRequest = {
+const restoreRequest = Schema.decodeSync(RestoreRequest)({
   client: {
-    configHash: "sha256:config",
+    configHash:
+      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     version: "0.1.0",
   },
   git: {
@@ -20,12 +22,18 @@ const restoreRequest = {
     event: "push",
     runId: "123456789",
   },
+  identity: {
+    provider: "github-actions",
+    token: "oidc.jwt.token",
+  },
+  managedRoots: [".turbo"],
+  protocolVersion: 1,
   workspace: {
     job: "test",
     repo: "eersnington/stateful-ci",
     workflow: "ci.yml",
   },
-} satisfies RestoreRequest;
+});
 
 describe("run classification", () => {
   test("classifies push to refs/heads/main as trusted", () => {
