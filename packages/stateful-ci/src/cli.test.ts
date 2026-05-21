@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { NodeServices } from "@effect/platform-node";
 import {
   configFileName,
+  RestoreAllowedResponse,
   RestoreDeniedResponse,
   SaveDeniedResponse,
 } from "@stateful-ci/core";
@@ -230,6 +231,59 @@ describe("stateful-ci restore", () => {
       message: expect.stringContaining("Could not reach Stateful CI backend"),
     });
   });
+
+  test("restore rejects authorized snapshots without object downloads before mutation", async () => {
+    await mkdir(join(tempDir, ".turbo/cache"), { recursive: true });
+    await writeFile(join(tempDir, ".turbo/cache/current.txt"), "current");
+
+    await withProtocolServer(
+      (_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          Schema.encodeUnknownSync(
+            Schema.fromJsonString(RestoreAllowedResponse)
+          )({
+            decision: "allowed",
+            downloadPlan: [],
+            manifest: {
+              digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              key: "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+              size: 128,
+              snapshotId: "snap_123",
+            },
+            save: { allowed: true, target: "trusted/main/latest" },
+            snapshot: {
+              id: "snap_123",
+              manifestKey:
+                "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+              parent: null,
+            },
+            trustClass: "trusted",
+            workspaceId: "ws_123",
+          })
+        );
+      },
+      async (url) => {
+        await expect(
+          Effect.runPromise(
+            restoreProgram({
+              ...githubEnv,
+              STATEFUL_CI_API_TOKEN: "test-token",
+              STATEFUL_CI_API_URL: url,
+            }).pipe(Effect.provide(NodeServices.layer))
+          )
+        ).rejects.toMatchObject({
+          _tag: "CliFailure",
+          message: expect.stringContaining("did not provide object downloads"),
+        });
+      }
+    );
+
+    await expect(
+      readFile(join(tempDir, ".turbo/cache/current.txt"), "utf-8")
+    ).resolves.toBe("current");
+  });
 });
 
 describe("stateful-ci save", () => {
@@ -249,6 +303,11 @@ describe("stateful-ci save", () => {
     await writeFile(join(tempDir, ".turbo/cache/skip.txt"), "ignored output");
     await writeFile(join(tempDir, ".env"), "SECRET=value");
     await symlink("cache/result.txt", join(tempDir, ".turbo/result-link"));
+    await mkdir(join(tempDir, ".stateful-ci"), { recursive: true });
+    await writeFile(
+      join(tempDir, ".stateful-ci/restore-session.json"),
+      '{"baseSnapshotId":null,"runId":"123456789","workspaceId":"ws_123"}\n'
+    );
   });
 
   afterEach(async () => {
@@ -298,6 +357,7 @@ describe("stateful-ci save", () => {
         totalBytes: 13,
       },
       runId: "123456789",
+      workspaceId: "ws_123",
     });
   });
 });

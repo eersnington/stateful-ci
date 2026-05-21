@@ -320,6 +320,19 @@ const verifyObjectBytes = (
   return Effect.void;
 };
 
+export const storeVerifiedSnapshotObject = Effect.fn(
+  "storeVerifiedSnapshotObject"
+)(function* storeVerifiedSnapshotObjectEffect(input: {
+  readonly digest: Sha256Digest;
+  readonly key: string;
+  readonly size: number;
+  readonly bytes: Uint8Array;
+  readonly workspaceRoot: string;
+}) {
+  yield* verifyObjectBytes(input.key, input.digest, input.size, input.bytes);
+  yield* writeImmutableObject(input.workspaceRoot, input.key, input.bytes);
+});
+
 const addPath = (state: ScanState, manifestPath: SafeManifestPath) => {
   if (state.paths.has(manifestPath)) {
     return Effect.fail(
