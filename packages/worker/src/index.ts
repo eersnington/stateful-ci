@@ -18,10 +18,11 @@ import {
   Unauthorized,
   WorkspaceId,
 } from "@stateful-ci/core";
-import { Effect, Exit, Schema } from "effect";
+import { Clock, Effect, Exit, Schema } from "effect";
 
 import {
   createInMemoryMetadataBackend,
+  manifestDescriptorFromSnapshotHeader,
   MetadataBackend,
   snapshotHeaderFromManifest,
 } from "./metadata";
@@ -247,123 +248,86 @@ const workspaceIdForTarget = (target: RefTarget) =>
 const runIdFromRestore = (request: RestoreRequest) =>
   Schema.decodeSync(RunId)(request.github.runId);
 
-const nowIso = () => new Date().toISOString();
+const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
+  Effect.map((millis) => new Date(millis).toISOString())
+);
 
-const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
-  Effect.gen(function* handleRestoreEffect() {
-    const metadata = yield* MetadataBackend;
-    yield* authorizeRequest(request, env);
-    const restoreRequest = yield* readProtocolBody(request).pipe(
-      Effect.flatMap(parseProtocolJson),
-      Effect.flatMap(decodeProtocolPayload(RestoreRequest))
-    );
-    const trustedRefs = trustedRefsForEnv(env);
-    const trustClass = classifyRunTrust(restoreRequest, { trustedRefs });
-    const target = metadataTargetForRestore(restoreRequest, trustedRefs);
-    const workspaceId = workspaceIdForTarget(target);
-    const runId = runIdFromRestore(restoreRequest);
+const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
+  request: Request,
+  env: WorkerEnv | undefined
+) {
+  const metadata = yield* MetadataBackend;
+  yield* authorizeRequest(request, env);
+  const restoreRequest = yield* readProtocolBody(request).pipe(
+    Effect.flatMap(parseProtocolJson),
+    Effect.flatMap(decodeProtocolPayload(RestoreRequest))
+  );
+  const trustedRefs = trustedRefsForEnv(env);
+  const trustClass = classifyRunTrust(restoreRequest, { trustedRefs });
+  const target = metadataTargetForRestore(restoreRequest, trustedRefs);
+  const workspaceId = workspaceIdForTarget(target);
+  const runId = runIdFromRestore(restoreRequest);
 
-    if (trustClass === "unknown") {
-      yield* metadata.appendAuditEvent({
-        ...target,
-        createdAt: nowIso(),
+  if (trustClass === "unknown") {
+    const createdAt = yield* currentIsoTimestamp;
+
+    yield* metadata.appendAuditEvent({
+      ...target,
+      createdAt,
+      decision: "denied",
+      eventType: "restore",
+      reason: "unable_to_classify_run_context",
+      runId,
+      snapshotId: null,
+      trustClass,
+      workspaceId,
+    });
+
+    return Response.json(
+      Schema.encodeUnknownSync(RestoreDeniedResponse)({
         decision: "denied",
-        eventType: "restore",
         reason: "unable_to_classify_run_context",
-        runId,
-        snapshotId: null,
+        save: { allowed: false },
         trustClass,
-        workspaceId,
-      });
+      })
+    );
+  }
 
-      return Response.json(
-        Schema.encodeUnknownSync(RestoreDeniedResponse)({
-          decision: "denied",
-          reason: "unable_to_classify_run_context",
-          save: { allowed: false },
-          trustClass,
-        })
-      );
-    }
+  const candidates = restoreCandidateTargets(target, trustClass, trustedRefs);
+  let deniedReason: DenialReason | null = null;
+  let deniedSnapshotId: SnapshotHeader["snapshotId"] | null = null;
+  let restored: {
+    readonly snapshot: SnapshotHeader;
+  } | null = null;
 
-    const candidates = restoreCandidateTargets(target, trustClass, trustedRefs);
-    let deniedReason: DenialReason | null = null;
-    let deniedSnapshotId: SnapshotHeader["snapshotId"] | null = null;
-    let restored: {
-      readonly snapshot: SnapshotHeader;
-    } | null = null;
+  for (const candidateTarget of candidates) {
+    const ref = yield* metadata.getRef(
+      candidateTarget.namespace,
+      candidateTarget.refName
+    );
+    const snapshot =
+      ref === null ? null : yield* metadata.getSnapshotHeader(ref.snapshotId);
 
-    for (const candidateTarget of candidates) {
-      const ref = yield* metadata.getRef(
-        candidateTarget.namespace,
-        candidateTarget.refName
-      );
-      const snapshot =
-        ref === null ? null : yield* metadata.getSnapshotHeader(ref.snapshotId);
+    if (ref !== null && snapshot !== null) {
+      const decision =
+        snapshot.workspaceId === workspaceIdForTarget(candidateTarget)
+          ? evaluateRestorePolicy({
+              consumer: { scopeKey: scopeKeyForTarget(target), trustClass },
+              producer: candidateProducerScope(candidateTarget, ref, snapshot),
+            })
+          : ({ allowed: false, reason: "restore_policy_denied" } as const);
 
-      if (ref !== null && snapshot !== null) {
-        const decision =
-          snapshot.workspaceId === workspaceIdForTarget(candidateTarget)
-            ? evaluateRestorePolicy({
-                consumer: { scopeKey: scopeKeyForTarget(target), trustClass },
-                producer: candidateProducerScope(
-                  candidateTarget,
-                  ref,
-                  snapshot
-                ),
-              })
-            : ({ allowed: false, reason: "restore_policy_denied" } as const);
-
-        if (decision.allowed) {
-          restored = { snapshot };
-          break;
-        }
-
-        deniedReason = decision.reason;
-        deniedSnapshotId = snapshot.snapshotId;
-      }
-    }
-
-    if (restored === null) {
-      const savePolicy = evaluateSavePolicy({
-        scopeKey: scopeKeyForTarget(target),
-        trustClass,
-      });
-
-      if (savePolicy.allowed) {
-        yield* metadata.rememberWorkspaceTarget({
-          ...target,
-          runId,
-          trustClass,
-          workspaceId,
-        });
+      if (decision.allowed) {
+        restored = { snapshot };
+        break;
       }
 
-      yield* metadata.appendAuditEvent({
-        ...target,
-        createdAt: nowIso(),
-        decision: "denied",
-        eventType: "restore",
-        reason: deniedReason ?? "no_compatible_snapshot",
-        runId,
-        snapshotId: deniedSnapshotId,
-        trustClass,
-        workspaceId,
-      });
-
-      return Response.json(
-        Schema.encodeUnknownSync(RestoreDeniedResponse)({
-          decision: "denied",
-          reason: deniedReason ?? "no_compatible_snapshot",
-          save: savePolicy.allowed
-            ? { allowed: true, target: target.refName }
-            : { allowed: false },
-          trustClass,
-          ...(savePolicy.allowed ? { workspaceId } : {}),
-        })
-      );
+      deniedReason = decision.reason;
+      deniedSnapshotId = snapshot.snapshotId;
     }
+  }
 
+  if (restored === null) {
     const savePolicy = evaluateSavePolicy({
       scopeKey: scopeKeyForTarget(target),
       trustClass,
@@ -378,151 +342,126 @@ const handleRestore = (request: Request, env: WorkerEnv | undefined) =>
       });
     }
 
+    const createdAt = yield* currentIsoTimestamp;
+
     yield* metadata.appendAuditEvent({
       ...target,
-      createdAt: nowIso(),
-      decision: "allowed",
+      createdAt,
+      decision: "denied",
       eventType: "restore",
-      reason: null,
+      reason: deniedReason ?? "no_compatible_snapshot",
       runId,
-      snapshotId: restored.snapshot.snapshotId,
+      snapshotId: deniedSnapshotId,
       trustClass,
       workspaceId,
     });
 
     return Response.json(
-      Schema.encodeUnknownSync(RestoreAllowedResponse)({
-        decision: "allowed",
-        downloadPlan: [
-          {
-            method: "GET",
-            object: {
-              digest: restored.snapshot.manifestDigest,
-              key: restored.snapshot.manifestKey,
-              kind: "manifest",
-              size: 0,
-            },
-            route: `/v1/objects/${restored.snapshot.manifestKey}`,
-            transport: "worker-route",
-          },
-        ],
-        manifest: {
-          digest: restored.snapshot.manifestDigest,
-          key: restored.snapshot.manifestKey,
-          size: 0,
-          snapshotId: restored.snapshot.snapshotId,
-        },
+      Schema.encodeUnknownSync(RestoreDeniedResponse)({
+        decision: "denied",
+        reason: deniedReason ?? "no_compatible_snapshot",
         save: savePolicy.allowed
           ? { allowed: true, target: target.refName }
           : { allowed: false },
-        snapshot: {
-          id: restored.snapshot.snapshotId,
-          manifestKey: restored.snapshot.manifestKey,
-          parent: restored.snapshot.parentSnapshotId,
-        },
         trustClass,
-        workspaceId,
+        ...(savePolicy.allowed ? { workspaceId } : {}),
       })
     );
+  }
+
+  const savePolicy = evaluateSavePolicy({
+    scopeKey: scopeKeyForTarget(target),
+    trustClass,
   });
 
-const handleSave = (request: Request, env: WorkerEnv | undefined) =>
-  Effect.gen(function* handleSaveEffect() {
-    const metadata = yield* MetadataBackend;
-    yield* authorizeRequest(request, env);
-    const saveRequest = yield* readProtocolBody(request).pipe(
-      Effect.flatMap(parseProtocolJson),
-      Effect.flatMap(decodeProtocolPayload(SaveRequest))
-    );
-    const target = yield* metadata.getWorkspaceTarget(saveRequest.workspaceId);
+  if (savePolicy.allowed) {
+    yield* metadata.rememberWorkspaceTarget({
+      ...target,
+      runId,
+      trustClass,
+      workspaceId,
+    });
+  }
 
-    if (target === null) {
-      yield* metadata.appendAuditEvent({
-        createdAt: nowIso(),
-        decision: "denied",
-        eventType: "save",
-        namespace: "",
-        reason: "restore_required_before_save",
-        refName: "",
-        runId: saveRequest.runId,
-        snapshotId: saveRequest.manifest.id,
-        trustClass: null,
-        workspaceId: saveRequest.workspaceId,
-      });
+  const createdAt = yield* currentIsoTimestamp;
 
-      return Response.json(
-        Schema.encodeUnknownSync(SaveDeniedResponse)({
-          decision: "denied",
-          reason: "restore_required_before_save",
-        })
-      );
-    }
+  yield* metadata.appendAuditEvent({
+    ...target,
+    createdAt,
+    decision: "allowed",
+    eventType: "restore",
+    reason: null,
+    runId,
+    snapshotId: restored.snapshot.snapshotId,
+    trustClass,
+    workspaceId,
+  });
 
-    if (target.runId !== saveRequest.runId) {
-      yield* metadata.appendAuditEvent({
-        createdAt: nowIso(),
-        decision: "denied",
-        eventType: "save",
-        namespace: target.namespace,
-        reason: "save_run_context_mismatch",
-        refName: target.refName,
-        runId: saveRequest.runId,
-        snapshotId: saveRequest.manifest.id,
-        trustClass: target.trustClass,
-        workspaceId: saveRequest.workspaceId,
-      });
+  return Response.json(
+    Schema.encodeUnknownSync(RestoreAllowedResponse)({
+      decision: "allowed",
+      downloadPlan: [],
+      manifest: manifestDescriptorFromSnapshotHeader(restored.snapshot),
+      save: savePolicy.allowed
+        ? { allowed: true, target: target.refName }
+        : { allowed: false },
+      snapshot: {
+        id: restored.snapshot.snapshotId,
+        manifestKey: restored.snapshot.manifestKey,
+        parent: restored.snapshot.parentSnapshotId,
+      },
+      trustClass,
+      workspaceId,
+    })
+  );
+});
 
-      return Response.json(
-        Schema.encodeUnknownSync(SaveDeniedResponse)({
-          decision: "denied",
-          reason: "save_run_context_mismatch",
-        })
-      );
-    }
+const handleSave = Effect.fn("handleSave")(function* handleSaveEffect(
+  request: Request,
+  env: WorkerEnv | undefined
+) {
+  const metadata = yield* MetadataBackend;
+  yield* authorizeRequest(request, env);
+  const saveRequest = yield* readProtocolBody(request).pipe(
+    Effect.flatMap(parseProtocolJson),
+    Effect.flatMap(decodeProtocolPayload(SaveRequest))
+  );
+  const target = yield* metadata.getWorkspaceTarget(saveRequest.workspaceId);
 
-    const savePolicy = evaluateSavePolicy({
-      scopeKey: scopeKeyForTarget(target),
-      trustClass: target.trustClass,
+  if (target === null) {
+    const createdAt = yield* currentIsoTimestamp;
+
+    yield* metadata.appendAuditEvent({
+      createdAt,
+      decision: "denied",
+      eventType: "save",
+      namespace: "",
+      reason: "restore_required_before_save",
+      refName: "",
+      runId: saveRequest.runId,
+      snapshotId: saveRequest.manifest.id,
+      trustClass: null,
+      workspaceId: saveRequest.workspaceId,
     });
 
-    if (!savePolicy.allowed) {
-      yield* metadata.appendAuditEvent({
-        createdAt: nowIso(),
+    return Response.json(
+      Schema.encodeUnknownSync(SaveDeniedResponse)({
         decision: "denied",
-        eventType: "save",
-        namespace: target.namespace,
-        reason: savePolicy.reason,
-        refName: target.refName,
-        runId: saveRequest.runId,
-        snapshotId: saveRequest.manifest.id,
-        trustClass: target.trustClass,
-        workspaceId: saveRequest.workspaceId,
-      });
-
-      return Response.json(
-        Schema.encodeUnknownSync(SaveDeniedResponse)({
-          decision: "denied",
-          reason: savePolicy.reason,
-        })
-      );
-    }
-
-    yield* metadata.putSnapshotHeader(
-      snapshotHeaderFromManifest(saveRequest.manifest, {
-        createdAt: nowIso(),
-        parentSnapshotId: saveRequest.baseSnapshotId,
-        runId: saveRequest.runId,
-        trustClass: target.trustClass,
-        workspaceId: saveRequest.workspaceId,
+        reason: "restore_required_before_save",
       })
     );
-    yield* metadata.setRef(target, saveRequest.manifest.id, target.trustClass);
+  }
+
+  if (target.runId !== saveRequest.runId) {
+    const createdAt = yield* currentIsoTimestamp;
+
     yield* metadata.appendAuditEvent({
-      ...target,
-      createdAt: nowIso(),
-      decision: "committed",
+      createdAt,
+      decision: "denied",
       eventType: "save",
-      reason: null,
+      namespace: target.namespace,
+      reason: "save_run_context_mismatch",
+      refName: target.refName,
       runId: saveRequest.runId,
       snapshotId: saveRequest.manifest.id,
       trustClass: target.trustClass,
@@ -530,14 +469,84 @@ const handleSave = (request: Request, env: WorkerEnv | undefined) =>
     });
 
     return Response.json(
-      Schema.encodeUnknownSync(SaveCommittedResponse)({
-        decision: "committed",
-        latest: true,
-        snapshotId: saveRequest.manifest.id,
-        workspaceId: saveRequest.workspaceId,
+      Schema.encodeUnknownSync(SaveDeniedResponse)({
+        decision: "denied",
+        reason: "save_run_context_mismatch",
       })
     );
+  }
+
+  const savePolicy = evaluateSavePolicy({
+    scopeKey: scopeKeyForTarget(target),
+    trustClass: target.trustClass,
   });
+
+  if (!savePolicy.allowed) {
+    const createdAt = yield* currentIsoTimestamp;
+
+    yield* metadata.appendAuditEvent({
+      createdAt,
+      decision: "denied",
+      eventType: "save",
+      namespace: target.namespace,
+      reason: savePolicy.reason,
+      refName: target.refName,
+      runId: saveRequest.runId,
+      snapshotId: saveRequest.manifest.id,
+      trustClass: target.trustClass,
+      workspaceId: saveRequest.workspaceId,
+    });
+
+    return Response.json(
+      Schema.encodeUnknownSync(SaveDeniedResponse)({
+        decision: "denied",
+        reason: savePolicy.reason,
+      })
+    );
+  }
+
+  const createdAt = yield* currentIsoTimestamp;
+  const snapshotHeader = yield* snapshotHeaderFromManifest(
+    saveRequest.manifest,
+    {
+      createdAt,
+      parentSnapshotId: saveRequest.baseSnapshotId,
+      runId: saveRequest.runId,
+      trustClass: target.trustClass,
+      workspaceId: saveRequest.workspaceId,
+    }
+  ).pipe(
+    Effect.mapError(
+      (error) =>
+        new InvalidProtocolPayload({
+          message: error.message,
+        })
+    )
+  );
+
+  yield* metadata.putSnapshotHeader(snapshotHeader);
+  yield* metadata.setRef(target, saveRequest.manifest.id, target.trustClass);
+  yield* metadata.appendAuditEvent({
+    ...target,
+    createdAt,
+    decision: "committed",
+    eventType: "save",
+    reason: null,
+    runId: saveRequest.runId,
+    snapshotId: saveRequest.manifest.id,
+    trustClass: target.trustClass,
+    workspaceId: saveRequest.workspaceId,
+  });
+
+  return Response.json(
+    Schema.encodeUnknownSync(SaveCommittedResponse)({
+      decision: "committed",
+      latest: true,
+      snapshotId: saveRequest.manifest.id,
+      workspaceId: saveRequest.workspaceId,
+    })
+  );
+});
 
 const methodNotAllowed = (path: string, method: string, allowed: string) =>
   Response.json(

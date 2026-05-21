@@ -1,5 +1,7 @@
 import {
+  ChunkKey,
   ManifestKey,
+  PackKey,
   RestoreAllowedResponse,
   RestoreDeniedResponse,
   RunId,
@@ -57,6 +59,14 @@ const seededManifestDigest =
   "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const seededManifestKey =
   "manifests/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json";
+const seededPackDigest =
+  "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const seededPackKey =
+  "packs/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.scipack";
+const seededChunkDigest =
+  "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const seededChunkKey =
+  "chunks/sha256/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const saveObjects = [
   {
     digest: manifestDigest,
@@ -100,6 +110,27 @@ const seededSnapshot = {
   createdAt: "2026-05-16T00:00:00.000Z",
   manifestDigest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
   manifestKey: Schema.decodeSync(ManifestKey)(seededManifestKey),
+  manifestSize: 128,
+  objects: [
+    {
+      digest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
+      key: Schema.decodeSync(ManifestKey)(seededManifestKey),
+      kind: "manifest",
+      size: 128,
+    },
+    {
+      digest: Schema.decodeSync(Sha256Digest)(seededPackDigest),
+      key: Schema.decodeSync(PackKey)(seededPackKey),
+      kind: "pack",
+      size: 2048,
+    },
+    {
+      digest: Schema.decodeSync(Sha256Digest)(seededChunkDigest),
+      key: Schema.decodeSync(ChunkKey)(seededChunkKey),
+      kind: "chunk",
+      size: 4096,
+    },
+  ],
   parentSnapshotId: null,
   runId: Schema.decodeSync(RunId)("123456788"),
   snapshotId: seededSnapshotId,
@@ -224,23 +255,11 @@ describe("worker API", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
       decision: "allowed",
-      downloadPlan: [
-        {
-          method: "GET",
-          object: {
-            digest: seededManifestDigest,
-            key: seededManifestKey,
-            kind: "manifest",
-            size: 0,
-          },
-          route: `/v1/objects/${seededManifestKey}`,
-          transport: "worker-route",
-        },
-      ],
+      downloadPlan: [],
       manifest: {
         digest: seededManifestDigest,
         key: seededManifestKey,
-        size: 0,
+        size: 128,
         snapshotId: "snap_123",
       },
       save: { allowed: true, target: seededRefName },
