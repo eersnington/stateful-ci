@@ -218,7 +218,17 @@ export const SnapshotFileEntry = Schema.Struct({
   sha256: Sha256Digest,
   size: NonNegativeInteger,
   type: Schema.Literal("file"),
-});
+}).check(
+  Schema.makeFilter((entry) =>
+    entry.content.kind !== "pack" || entry.sha256 === entry.content.entryDigest
+      ? undefined
+      : {
+          issue:
+            "packed file sha256 must match the referenced pack entry digest",
+          path: ["sha256"],
+        }
+  )
+);
 export type SnapshotFileEntry = Schema.Schema.Type<typeof SnapshotFileEntry>;
 
 export const SnapshotSymlinkEntry = Schema.Struct({

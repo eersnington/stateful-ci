@@ -64,6 +64,19 @@ describe("SCIPACK container", () => {
     expect([...entry.bytes]).toStrictEqual([...hello]);
   });
 
+  test("rejects pack inputs whose digest does not match the bytes", async () => {
+    const input = textBytes("payload");
+
+    expectPackError(
+      await Effect.runPromise(
+        Effect.flip(
+          encodePack([{ bytes: input, digest: digestWithPrefix("ff", 1) }])
+        )
+      ),
+      "encode_input_digest_mismatch"
+    );
+  });
+
   test("rejects malformed headers and malformed indexes", async () => {
     const input = textBytes("payload");
     const encoded = await Effect.runPromise(

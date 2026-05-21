@@ -53,6 +53,24 @@ describe("snapshot pack and chunk planning", () => {
     ).toBeTruthy();
   });
 
+  test("small-file packing skips inputs larger than the target pack size", () => {
+    const oversized = {
+      digest: digestWithPrefix("aa", 1),
+      size: targetPackInputBytes + 1,
+    };
+    const valid = {
+      digest: digestWithPrefix("aa", 2),
+      size: smallFileThresholdBytes,
+    };
+
+    const plans = planSmallFilePacks([oversized, valid]);
+
+    expect(plans).toHaveLength(1);
+    expect(plans[0]?.entries.map((entry) => entry.digest)).toStrictEqual([
+      valid.digest,
+    ]);
+  });
+
   test("large-file chunk range planning uses deterministic fixed 4 MiB ranges", () => {
     const first = planLargeFileChunkRanges(largeChunkSizeBytes * 2 + 7);
     const second = planLargeFileChunkRanges(largeChunkSizeBytes * 2 + 7);

@@ -39,6 +39,7 @@ export interface DecodedPack {
 export const PackFormatErrorReason = Schema.Literals([
   "compression_failed",
   "digest_mismatch",
+  "encode_input_digest_mismatch",
   "entry_digest_mismatch",
   "entry_size_mismatch",
   "invalid_header",
@@ -158,21 +159,31 @@ export const encodePack = Effect.fn("encodePack")(function* encodePackEffect(
     [...new Map(inputs.map((input) => [input.digest, input])).values()]
       .toSorted((left, right) => left.digest.localeCompare(right.digest))
       .map((input) =>
-        gzipBytes(input.bytes).pipe(
-          Effect.map((compressed) => ({ compressed, input }))
-        )
+        Effect.gen(function* validateAndCompressPackInputEffect() {
+          const entryDigest = sha256Bytes(input.bytes);
+
+          if (entryDigest !== input.digest) {
+            return yield* packError(
+              "encode_input_digest_mismatch",
+              "Pack input bytes did not match the declared SHA-256 digest."
+            );
+          }
+
+          const compressed = yield* gzipBytes(input.bytes);
+          return { compressed, entryDigest, input };
+        })
       )
   );
   const entries: PackIndexEntry[] = [];
   const payloads: Uint8Array[] = [];
   let compressedOffset = 0;
 
-  for (const { compressed, input } of compressedEntries) {
+  for (const { compressed, entryDigest, input } of compressedEntries) {
     entries.push({
       compressedLength: compressed.byteLength,
       compressedOffset,
       compression: "gzip",
-      entryDigest: input.digest,
+      entryDigest,
       uncompressedSize: input.bytes.byteLength,
     });
     payloads.push(compressed);

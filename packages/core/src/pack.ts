@@ -44,6 +44,10 @@ export const planSmallFilePacks = (
   for (const input of [...deduped.values()].toSorted((left, right) =>
     left.digest.localeCompare(right.digest)
   )) {
+    if (input.size > targetPackInputBytes) {
+      continue;
+    }
+
     const bucket = sha256HexFromDigest(input.digest).slice(0, 2);
     const previous = plans.at(-1);
 
