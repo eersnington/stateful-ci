@@ -1,8 +1,8 @@
+import { describe, expect, it } from "@effect/vitest";
 import { RestoreRequest } from "@stateful-ci/core";
 import { Schema } from "effect";
-import { describe, expect, test } from "vitest";
 
-import { classifyRunTrust } from "./run-classification";
+import { classifyRunTrust } from "../src/run-classification";
 
 const restoreRequest = Schema.decodeSync(RestoreRequest)({
   client: {
@@ -36,11 +36,11 @@ const restoreRequest = Schema.decodeSync(RestoreRequest)({
 });
 
 describe("run classification", () => {
-  test("classifies push to refs/heads/main as trusted", () => {
+  it("classifies push to refs/heads/main as trusted", () => {
     expect(classifyRunTrust(restoreRequest)).toBe("trusted");
   });
 
-  test("classifies same-repo branch pushes as internal", () => {
+  it("classifies same-repo branch pushes as internal", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -49,7 +49,7 @@ describe("run classification", () => {
     ).toBe("internal");
   });
 
-  test("does not assume every repository uses main as the only trusted branch", () => {
+  it("does not assume every repository uses main as the only trusted branch", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -58,7 +58,7 @@ describe("run classification", () => {
     ).toBe("trusted");
   });
 
-  test("classifies same-repo pull requests as internal", () => {
+  it("classifies same-repo pull requests as internal", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -74,7 +74,7 @@ describe("run classification", () => {
     ).toBe("internal");
   });
 
-  test("classifies fork pull requests as external", () => {
+  it("classifies fork pull requests as external", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -90,7 +90,7 @@ describe("run classification", () => {
     ).toBe("external");
   });
 
-  test("classifies pull_request_target as unknown because it is unsafe for state production", () => {
+  it("classifies pull_request_target as unknown because it is unsafe for state production", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -106,7 +106,7 @@ describe("run classification", () => {
     ).toBe("unknown");
   });
 
-  test("classifies release events on tag refs as privileged", () => {
+  it("classifies release events on tag refs as privileged", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -116,7 +116,7 @@ describe("run classification", () => {
     ).toBe("privileged");
   });
 
-  test("classifies tag refs without release events as unknown", () => {
+  it("classifies tag refs without release events as unknown", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -125,7 +125,7 @@ describe("run classification", () => {
     ).toBe("unknown");
   });
 
-  test("classifies release events without tag refs as unknown", () => {
+  it("classifies release events without tag refs as unknown", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -134,7 +134,7 @@ describe("run classification", () => {
     ).toBe("unknown");
   });
 
-  test("classifies pull requests with tag refs as unknown", () => {
+  it("classifies pull requests with tag refs as unknown", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,
@@ -150,7 +150,7 @@ describe("run classification", () => {
     ).toBe("unknown");
   });
 
-  test("classifies incomplete pull request metadata as unknown", () => {
+  it("classifies incomplete pull request metadata as unknown", () => {
     expect(
       classifyRunTrust({
         ...restoreRequest,

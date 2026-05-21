@@ -1,7 +1,7 @@
+import { describe, expect, it } from "@effect/vitest";
 import type { TrustClass } from "@stateful-ci/core";
-import { describe, expect, test } from "vitest";
 
-import { evaluateRestorePolicy, evaluateSavePolicy } from "./policy";
+import { evaluateRestorePolicy, evaluateSavePolicy } from "../src/policy";
 
 const scope = (trustClass: TrustClass, scopeKey: string = trustClass) => ({
   scopeKey,
@@ -9,7 +9,7 @@ const scope = (trustClass: TrustClass, scopeKey: string = trustClass) => ({
 });
 
 describe("trust policy", () => {
-  test("allows trusted snapshots to seed every classified run", () => {
+  it("allows trusted snapshots to seed every classified run", () => {
     expect(
       ["trusted", "internal", "external", "privileged"].map((trustClass) =>
         evaluateRestorePolicy({
@@ -25,7 +25,7 @@ describe("trust policy", () => {
     ]);
   });
 
-  test("allows external and internal snapshots only in the same scope", () => {
+  it("allows external and internal snapshots only in the same scope", () => {
     expect(
       evaluateRestorePolicy({
         consumer: scope("external", "pr:12"),
@@ -46,7 +46,7 @@ describe("trust policy", () => {
     ).toStrictEqual({ allowed: true });
   });
 
-  test("denies untrusted state flowing upward", () => {
+  it("denies untrusted state flowing upward", () => {
     expect(
       evaluateRestorePolicy({
         consumer: scope("trusted", "trusted:main"),
@@ -61,7 +61,7 @@ describe("trust policy", () => {
     ).toStrictEqual({ allowed: false, reason: "restore_policy_denied" });
   });
 
-  test("denies unknown restore contexts", () => {
+  it("denies unknown restore contexts", () => {
     expect(
       evaluateRestorePolicy({
         consumer: scope("trusted"),
@@ -70,7 +70,7 @@ describe("trust policy", () => {
     ).toStrictEqual({ allowed: false, reason: "unknown_context_denied" });
   });
 
-  test("allows trusted and internal saves but disables external and privileged saves", () => {
+  it("allows trusted and internal saves but disables external and privileged saves", () => {
     expect(evaluateSavePolicy(scope("trusted"))).toStrictEqual({
       allowed: true,
       target: scope("trusted"),

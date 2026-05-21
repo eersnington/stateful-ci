@@ -19,6 +19,7 @@ Long term maintainability is a core priority. If you add new functionality, firs
 - Test actual implementation, do not duplicate logic into tests
 - Avoid done callbacks in async tests - use async/await instead
 - Keep test suites reasonably flat - avoid excessive `describe` nesting
+- Use `bun run test` to run tests. Do not use `bun test` which invokes Bun's test runner directly.
 
 ## General Principles
 

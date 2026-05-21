@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, it } from "@effect/vitest";
 
 import {
   largeChunkSizeBytes,
@@ -11,7 +11,7 @@ import {
   sha256DigestFromHex,
   smallFileThresholdBytes,
   targetPackInputBytes,
-} from "./index";
+} from "../src/index";
 
 const digestWithPrefix = (prefix: string, suffix: number) =>
   sha256DigestFromHex(
@@ -19,13 +19,13 @@ const digestWithPrefix = (prefix: string, suffix: number) =>
   );
 
 describe("snapshot pack and chunk planning", () => {
-  test("exposes the SCIPACK layout constants without runtime byte APIs", () => {
+  it("exposes the SCIPACK layout constants without runtime byte APIs", () => {
     expect(packMagic).toBe("SCIPACK\0");
     expect(packFormatVersion).toBe(1);
     expect(packHeaderLength).toBe(16);
   });
 
-  test("small-file packing dedupes, buckets, sorts, and stays bounded", () => {
+  it("small-file packing dedupes, buckets, sorts, and stays bounded", () => {
     const inputs = Array.from({ length: 140 }, (_, index) => ({
       digest: digestWithPrefix("aa", index + 1),
       size: smallFileThresholdBytes,
@@ -53,7 +53,7 @@ describe("snapshot pack and chunk planning", () => {
     ).toBeTruthy();
   });
 
-  test("small-file packing rejects inputs larger than the target pack size", () => {
+  it("small-file packing rejects inputs larger than the target pack size", () => {
     const oversized = {
       digest: digestWithPrefix("aa", 1),
       size: targetPackInputBytes + 1,
@@ -68,7 +68,7 @@ describe("snapshot pack and chunk planning", () => {
     );
   });
 
-  test("large-file chunk range planning uses deterministic fixed 4 MiB ranges", () => {
+  it("large-file chunk range planning uses deterministic fixed 4 MiB ranges", () => {
     const first = planLargeFileChunkRanges(largeChunkSizeBytes * 2 + 7);
     const second = planLargeFileChunkRanges(largeChunkSizeBytes * 2 + 7);
 
