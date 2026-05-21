@@ -36,18 +36,38 @@ export {
 } from "./github";
 export {
   ChunkKey,
+  chunkKeyFromDigest,
   HeadGeneration,
   IdempotencyKey,
   ManifestKey,
+  manifestKeyFromDigest,
   PackKey,
+  packKeyFromDigest,
   RunId,
   Sha256Digest,
   sha256DigestFromHex,
+  sha256HexFromDigest,
   sha256DigestFromObjectKey,
   SnapshotObjectKey,
   SnapshotId,
   WorkspaceId,
 } from "./ids";
+export {
+  largeChunkSizeBytes,
+  maxPackInputBytes,
+  packFormatVersion,
+  packHeaderLength,
+  packMagic,
+  planLargeFileChunkRanges,
+  planSmallFilePacks,
+  smallFileThresholdBytes,
+  targetPackInputBytes,
+} from "./pack";
+export type {
+  LargeFileChunkRange,
+  SmallFilePackInput,
+  SmallFilePackPlan,
+} from "./pack";
 export {
   CommitSaveCommittedResponse,
   CommitSaveConflictResponse,
@@ -80,16 +100,31 @@ export {
   WorkerRouteTransferPlanEntry,
 } from "./protocol";
 export {
+  ChunkedFileContent,
+  ChunkFileContentEntry,
+  CompressionAlgorithm,
   ChunkObjectInventoryEntry,
   ManifestDescriptor,
   ManifestObjectInventoryEntry,
+  PackFileContent,
+  PackIndex,
+  PackIndexEntry,
   PackObjectInventoryEntry,
   SafetySummary,
   SaveManifest,
+  SafeManifestPath,
+  SnapshotDirectoryEntry,
+  SnapshotFileContent,
+  SnapshotFileEntry,
+  SnapshotManifest,
+  SnapshotManifestEntry,
+  SnapshotManifestProvenance,
+  SnapshotManifestStats,
   SnapshotObjectInventory,
   SnapshotObjectInventoryEntry,
   SnapshotObjectKind,
   SnapshotRef,
+  SnapshotSymlinkEntry,
 } from "./snapshot";
 export { DenialReason, TrustClass } from "./trust";
 export { WorkspaceRef } from "./workspace";
