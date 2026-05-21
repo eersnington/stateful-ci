@@ -219,15 +219,26 @@ export const SnapshotFileEntry = Schema.Struct({
   size: NonNegativeInteger,
   type: Schema.Literal("file"),
 }).check(
-  Schema.makeFilter((entry) =>
-    entry.content.kind !== "pack" || entry.sha256 === entry.content.entryDigest
+  Schema.makeFilter((entry) => {
+    if (entry.content.kind !== "pack") {
+      return;
+    }
+
+    if (entry.sha256 !== entry.content.entryDigest) {
+      return {
+        issue: "packed file sha256 must match the referenced pack entry digest",
+        path: ["sha256"],
+      };
+    }
+
+    return entry.size === entry.content.uncompressedSize
       ? undefined
       : {
           issue:
-            "packed file sha256 must match the referenced pack entry digest",
-          path: ["sha256"],
-        }
-  )
+            "packed file size must match the referenced pack entry uncompressed size",
+          path: ["size"],
+        };
+  })
 );
 export type SnapshotFileEntry = Schema.Schema.Type<typeof SnapshotFileEntry>;
 

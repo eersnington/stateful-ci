@@ -46,6 +46,7 @@ export const PackFormatErrorReason = Schema.Literals([
   "invalid_index",
   "malformed_payload",
   "missing_entry",
+  "unsupported_flags",
   "unsupported_version",
 ]);
 export type PackFormatErrorReason = Schema.Schema.Type<
@@ -243,6 +244,13 @@ export const decodePack = Effect.fn("decodePack")(function* decodePackEffect(
     return yield* packError(
       "unsupported_version",
       "Pack container version is not supported."
+    );
+  }
+
+  if (headerView.getUint16(10) !== 0) {
+    return yield* packError(
+      "unsupported_flags",
+      "Pack header flags are not supported by this decoder."
     );
   }
 

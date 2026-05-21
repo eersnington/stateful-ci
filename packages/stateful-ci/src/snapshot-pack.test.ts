@@ -101,6 +101,24 @@ describe("SCIPACK container", () => {
     );
   });
 
+  test("rejects pack headers with unsupported flags", async () => {
+    const input = textBytes("payload");
+    const encoded = await Effect.runPromise(
+      encodePack([{ bytes: input, digest: sha256Bytes(input) }])
+    );
+    const unsupportedFlags = new Uint8Array(encoded.bytes);
+    new DataView(
+      unsupportedFlags.buffer,
+      unsupportedFlags.byteOffset,
+      unsupportedFlags.byteLength
+    ).setUint16(10, 1);
+
+    expectPackError(
+      await Effect.runPromise(Effect.flip(decodePack(unsupportedFlags))),
+      "unsupported_flags"
+    );
+  });
+
   test("rejects tampered pack bytes before workspace materialization", async () => {
     const input = textBytes("payload");
     const encoded = await Effect.runPromise(
