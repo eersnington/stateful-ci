@@ -53,7 +53,7 @@ describe("snapshot pack and chunk planning", () => {
     ).toBeTruthy();
   });
 
-  test("small-file packing skips inputs larger than the target pack size", () => {
+  test("small-file packing rejects inputs larger than the target pack size", () => {
     const oversized = {
       digest: digestWithPrefix("aa", 1),
       size: targetPackInputBytes + 1,
@@ -63,12 +63,9 @@ describe("snapshot pack and chunk planning", () => {
       size: smallFileThresholdBytes,
     };
 
-    const plans = planSmallFilePacks([oversized, valid]);
-
-    expect(plans).toHaveLength(1);
-    expect(plans[0]?.entries.map((entry) => entry.digest)).toStrictEqual([
-      valid.digest,
-    ]);
+    expect(() => planSmallFilePacks([oversized, valid])).toThrow(
+      `Small-file pack input exceeds target size: ${targetPackInputBytes + 1} > ${targetPackInputBytes}`
+    );
   });
 
   test("large-file chunk range planning uses deterministic fixed 4 MiB ranges", () => {

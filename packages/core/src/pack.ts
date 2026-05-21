@@ -29,6 +29,14 @@ export interface LargeFileChunkRange {
 export const planSmallFilePacks = (
   inputs: readonly SmallFilePackInput[]
 ): readonly SmallFilePackPlan[] => {
+  for (const input of inputs) {
+    if (input.size > targetPackInputBytes) {
+      throw new Error(
+        `Small-file pack input exceeds target size: ${input.size} > ${targetPackInputBytes}. Snapshot planning was aborted because this file must be handled by the large-file chunk path.`
+      );
+    }
+  }
+
   const deduped = new Map<Sha256Digest, SmallFilePackInput>();
 
   for (const input of inputs) {
@@ -44,10 +52,6 @@ export const planSmallFilePacks = (
   for (const input of [...deduped.values()].toSorted((left, right) =>
     left.digest.localeCompare(right.digest)
   )) {
-    if (input.size > targetPackInputBytes) {
-      continue;
-    }
-
     const bucket = sha256HexFromDigest(input.digest).slice(0, 2);
     const previous = plans.at(-1);
 
