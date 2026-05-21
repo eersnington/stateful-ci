@@ -129,6 +129,13 @@ export type SnapshotObjectInventory = Schema.Schema.Type<
   typeof SnapshotObjectInventory
 >;
 
+export const SnapshotManifestObjectInventory = Schema.Array(
+  Schema.Union([PackObjectInventoryEntry, ChunkObjectInventoryEntry])
+);
+export type SnapshotManifestObjectInventory = Schema.Schema.Type<
+  typeof SnapshotManifestObjectInventory
+>;
+
 export const SafetySummary = Schema.Struct({
   skippedByBuiltInDenylist: NonNegativeInteger,
   skippedByUserExclude: NonNegativeInteger,
@@ -286,22 +293,13 @@ export const SnapshotManifest = Schema.Struct({
   entries: Schema.Array(SnapshotManifestEntry),
   formatVersion: Schema.Literal(1),
   managedRoots: Schema.NonEmptyArray(SafeManifestPath),
-  objects: SnapshotObjectInventory,
+  objects: SnapshotManifestObjectInventory,
   provenance: SnapshotManifestProvenance,
   safety: SafetySummary,
   snapshotId: SnapshotId,
   stats: SnapshotManifestStats,
   workspace: WorkspaceRef,
-}).check(
-  Schema.makeFilter((manifest) =>
-    manifest.objects.some((object) => object.kind === "manifest")
-      ? undefined
-      : {
-          issue: "snapshot manifest inventory must include the manifest object",
-          path: ["objects"],
-        }
-  )
-);
+});
 export type SnapshotManifest = Schema.Schema.Type<typeof SnapshotManifest>;
 
 export const ManifestDescriptor = Schema.Struct({

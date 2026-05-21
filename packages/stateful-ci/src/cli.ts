@@ -1,29 +1,40 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { lstat, readdir } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
-import type { StatefulCiConfigType } from "@stateful-ci/core";
+import type {
+  ObjectTransferPlanEntry,
+  StatefulCiConfigType,
+} from "@stateful-ci/core";
 import {
   clientVersion,
   configFileName,
   defaultConfig,
-  excludedPathsForConfig,
-  isBuiltInDeniedWorkspacePath,
-  isUserExcludedWorkspacePath,
+  GitContext,
+  GitHubContext,
   protocolVersion,
   RestoreRequest,
   RestoreResponse,
+  RunId,
   routes,
   SaveRequest,
   SaveResponse,
+  SnapshotId,
   StatefulCiConfig,
+  WorkspaceRef,
+  WorkspaceId,
   workspacePathsForConfig,
 } from "@stateful-ci/core";
 import type { PlatformError } from "effect";
 import { Console, Effect, Exit, FileSystem, Path, Schema } from "effect";
 import { Command } from "effect/unstable/cli";
+
+import {
+  createWorkspaceSnapshot,
+  restoreWorkspaceSnapshot,
+  storeVerifiedSnapshotObject,
+} from "./snapshot-engine";
 
 interface ConfigAlreadyExists {
   readonly _tag: "ConfigAlreadyExists";
@@ -53,19 +64,24 @@ interface ApiConfig {
   readonly url: string;
 }
 
-interface ScannedWorkspace {
-  readonly fileCount: number;
-  readonly missingPaths: readonly string[];
-  readonly skippedByBuiltInDenylist: number;
-  readonly skippedUnsupportedType: number;
-  readonly skippedByUserExclude: number;
-  readonly totalBytes: number;
-}
-
 interface PreparedSaveRequest {
   readonly request: SaveRequest;
-  readonly scanned: ScannedWorkspace;
 }
+
+interface SnapshotRequestContext {
+  readonly git: RestoreRequest["git"];
+  readonly github: RestoreRequest["github"];
+  readonly workspace: RestoreRequest["workspace"];
+}
+
+const restoreSessionFile = ".stateful-ci/restore-session.json";
+
+const RestoreSession = Schema.Struct({
+  baseSnapshotId: Schema.NullOr(SnapshotId),
+  runId: RunId,
+  workspaceId: WorkspaceId,
+});
+type RestoreSession = Schema.Schema.Type<typeof RestoreSession>;
 
 const configText = `${Schema.encodeUnknownSync(
   Schema.fromJsonString(StatefulCiConfig)
@@ -200,8 +216,108 @@ const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
       : decoded.value;
   });
 
+const snapshotRequestContextFromEnv = Effect.fn(
+  "snapshotRequestContextFromEnv"
+)(function* snapshotRequestContextFromEnvEffect(env: RuntimeEnv) {
+  const context = {
+    git: {
+      baseRef: optionalEnv(env, "GITHUB_BASE_REF"),
+      headRef: optionalEnv(env, "GITHUB_HEAD_REF"),
+      headRepo: optionalEnv(env, "GITHUB_HEAD_REPOSITORY"),
+      ref: yield* requiredEnv(env, "GITHUB_REF"),
+      sha: yield* requiredEnv(env, "GITHUB_SHA"),
+    },
+    github: {
+      actor: yield* requiredEnv(env, "GITHUB_ACTOR"),
+      event: yield* requiredEnv(env, "GITHUB_EVENT_NAME"),
+      runId: yield* requiredEnv(env, "GITHUB_RUN_ID"),
+    },
+    workspace: {
+      job: yield* requiredEnv(env, "GITHUB_JOB"),
+      repo: yield* requiredEnv(env, "GITHUB_REPOSITORY"),
+      workflow: yield* requiredEnv(env, "GITHUB_WORKFLOW"),
+    },
+  };
+  const decoded = Schema.decodeUnknownExit(
+    Schema.Struct({
+      git: GitContext,
+      github: GitHubContext,
+      workspace: WorkspaceRef,
+    })
+  )(context);
+
+  return Exit.isFailure(decoded)
+    ? yield* Effect.fail(
+        cliFailure(
+          "GitHub environment variables did not produce a valid save snapshot context. Check the Actions runtime context. Workspace was not mutated."
+        )
+      )
+    : (decoded.value satisfies SnapshotRequestContext);
+});
+
 const protocolUrl = (api: ApiConfig, route: string) =>
   new URL(route, api.url.endsWith("/") ? api.url : `${api.url}/`).href;
+
+const restoreSessionPath = (directory: string) =>
+  `${directory}/${restoreSessionFile}`;
+
+const writeRestoreSession = Effect.fn("writeRestoreSession")(
+  function* writeRestoreSessionEffect(
+    directory: string,
+    session: RestoreSession
+  ) {
+    const fs = yield* FileSystem.FileSystem;
+    const pathService = yield* Path.Path;
+    const path = restoreSessionPath(directory);
+
+    yield* fs
+      .makeDirectory(pathService.dirname(path), { recursive: true })
+      .pipe(
+        Effect.mapError(() =>
+          cliFailure(
+            "Could not create .stateful-ci to remember backend restore authorization. Save will not run without a backend-issued workspace. Workspace was not mutated."
+          )
+        )
+      );
+    yield* fs
+      .writeFileString(
+        path,
+        `${Schema.encodeUnknownSync(Schema.fromJsonString(RestoreSession))(session)}\n`
+      )
+      .pipe(
+        Effect.mapError(() =>
+          cliFailure(
+            "Could not persist backend restore authorization. Save will not run without a backend-issued workspace. Workspace was not mutated."
+          )
+        )
+      );
+  }
+);
+
+const readRestoreSession = (directory: string) =>
+  Effect.gen(function* readRestoreSessionEffect() {
+    const path = restoreSessionPath(directory);
+    const source = yield* (yield* FileSystem.FileSystem)
+      .readFileString(path)
+      .pipe(
+        Effect.mapError(() =>
+          cliFailure(
+            `Could not read ${restoreSessionFile}. Run stateful-ci restore before stateful-ci save so the backend can issue a workspace target.`
+          )
+        )
+      );
+    const decoded = Schema.decodeUnknownExit(
+      Schema.fromJsonString(RestoreSession)
+    )(source);
+
+    return Exit.isFailure(decoded)
+      ? yield* Effect.fail(
+          cliFailure(
+            `${restoreSessionFile} is invalid. Run stateful-ci restore again before saving.`
+          )
+        )
+      : decoded.value;
+  });
 
 const postProtocol = (api: ApiConfig, route: string, body: string) =>
   Effect.gen(function* postProtocolEffect() {
@@ -236,6 +352,68 @@ const postProtocol = (api: ApiConfig, route: string, body: string) =>
     });
   });
 
+const downloadPlannedObject = Effect.fn("downloadPlannedObject")(
+  function* downloadPlannedObjectEffect(
+    api: ApiConfig,
+    plan: ObjectTransferPlanEntry,
+    workspaceRoot: string
+  ) {
+    if (plan.method !== "GET") {
+      return yield* Effect.fail(
+        cliFailure(
+          `Restore download plan for ${plan.object.key} used ${plan.method}, but restore only supports GET object plans.`
+        )
+      );
+    }
+
+    const url =
+      plan.transport === "worker-route"
+        ? protocolUrl(api, plan.route)
+        : plan.url;
+    const headers = new Headers(plan.headers ?? {});
+
+    if (plan.transport === "worker-route") {
+      headers.set("authorization", `Bearer ${api.token}`);
+    }
+
+    const response = yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          `Could not download backend-authorized snapshot object ${plan.object.key}. Restore did not mutate the workspace.`
+        ),
+      try: () => fetch(url, { headers, method: "GET" }),
+    });
+
+    if (!response.ok) {
+      return yield* Effect.fail(
+        cliFailure(
+          `Backend object download for ${plan.object.key} returned HTTP ${response.status}. Restore did not mutate the workspace.`
+        )
+      );
+    }
+
+    const bytes = yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          `Could not read snapshot object ${plan.object.key} from the backend response. Restore did not mutate the workspace.`
+        ),
+      try: async () => new Uint8Array(await response.arrayBuffer()),
+    });
+
+    yield* storeVerifiedSnapshotObject({
+      bytes,
+      digest: plan.object.digest,
+      key: plan.object.key,
+      size: plan.object.size,
+      workspaceRoot,
+    }).pipe(
+      Effect.mapError((error) =>
+        cliFailure(`${error.message} Restore did not mutate the workspace.`)
+      )
+    );
+  }
+);
+
 const decodeProtocolResponse = <A>(
   schema: Schema.Decoder<A>,
   source: string
@@ -253,178 +431,42 @@ const decodeProtocolResponse = <A>(
     : Effect.succeed(decoded.value);
 };
 
-const scanPath = async (
-  root: string,
-  relativePath: string,
-  excludes: readonly string[]
-): Promise<ScannedWorkspace> => {
-  if (isBuiltInDeniedWorkspacePath(relativePath)) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 1,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  if (isUserExcludedWorkspacePath(relativePath, excludes)) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 1,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  const path = `${root}/${relativePath}`;
-  const info = await lstat(path).catch(() => null);
-
-  if (info === null) {
-    return {
-      fileCount: 0,
-      missingPaths: [relativePath],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: 0,
-    };
-  }
-
-  if (info.isFile()) {
-    return {
-      fileCount: 1,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 0,
-      totalBytes: info.size,
-    };
-  }
-
-  if (!info.isDirectory()) {
-    return {
-      fileCount: 0,
-      missingPaths: [],
-      skippedByBuiltInDenylist: 0,
-      skippedByUserExclude: 0,
-      skippedUnsupportedType: 1,
-      totalBytes: 0,
-    };
-  }
-
-  const entries = await readdir(path);
-  const scannedEntries = await Promise.all(
-    entries.map((entry) => scanPath(root, `${relativePath}/${entry}`, excludes))
-  );
-  const total = {
-    fileCount: 0,
-    missingPaths: [] as string[],
-    skippedByBuiltInDenylist: 0,
-    skippedByUserExclude: 0,
-    skippedUnsupportedType: 0,
-    totalBytes: 0,
-  };
-
-  for (const scanned of scannedEntries) {
-    total.fileCount += scanned.fileCount;
-    total.missingPaths.push(...scanned.missingPaths);
-    total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
-    total.skippedUnsupportedType += scanned.skippedUnsupportedType;
-    total.skippedByUserExclude += scanned.skippedByUserExclude;
-    total.totalBytes += scanned.totalBytes;
-  }
-
-  return total;
-};
-
-const scanWorkspace = (directory: string, config: StatefulCiConfigType) =>
-  Effect.tryPromise({
-    catch: () =>
-      cliFailure(
-        "Could not scan configured workspace paths. Check file permissions and retry."
-      ),
-    try: async () => {
-      const excludes = excludedPathsForConfig(config);
-      const scannedPaths = await Promise.all(
-        workspacePathsForConfig(config).map((path) =>
-          scanPath(directory, path, excludes)
-        )
-      );
-      const total = {
-        fileCount: 0,
-        missingPaths: [] as string[],
-        skippedByBuiltInDenylist: 0,
-        skippedByUserExclude: 0,
-        skippedUnsupportedType: 0,
-        totalBytes: 0,
-      };
-
-      for (const scanned of scannedPaths) {
-        total.fileCount += scanned.fileCount;
-        total.missingPaths.push(...scanned.missingPaths);
-        total.skippedByBuiltInDenylist += scanned.skippedByBuiltInDenylist;
-        total.skippedUnsupportedType += scanned.skippedUnsupportedType;
-        total.skippedByUserExclude += scanned.skippedByUserExclude;
-        total.totalBytes += scanned.totalBytes;
-      }
-
-      return total;
-    },
-  });
-
 const saveRequestFromRestore = (
-  restoreRequest: RestoreRequest,
-  loaded: LoadedConfig
+  context: SnapshotRequestContext,
+  loaded: LoadedConfig,
+  session: RestoreSession
 ) =>
   Effect.gen(function* saveRequestFromRestoreEffect() {
-    const scanned = yield* scanWorkspace(process.cwd(), loaded.config);
-    const hash = sha256(
-      [
-        loaded.hash,
-        restoreRequest.workspace.repo,
-        restoreRequest.workspace.workflow,
-        restoreRequest.workspace.job,
-        String(scanned.fileCount),
-        String(scanned.totalBytes),
-        String(scanned.skippedByBuiltInDenylist),
-        String(scanned.skippedUnsupportedType),
-        String(scanned.skippedByUserExclude),
-        scanned.missingPaths.join("\0"),
-      ].join("\n")
+    if (session.runId !== context.github.runId) {
+      return yield* Effect.fail(
+        cliFailure(
+          `The saved backend restore authorization belongs to run ${session.runId}, but this save is running as ${context.github.runId}. Run stateful-ci restore again in this job before saving.`
+        )
+      );
+    }
+
+    const snapshot = yield* createWorkspaceSnapshot({
+      config: loaded.config,
+      provenance: {
+        git: context.git,
+        github: context.github,
+        runId: context.github.runId,
+      },
+      workspace: context.workspace,
+      workspaceRoot: process.cwd(),
+    }).pipe(
+      Effect.mapError((error) =>
+        cliFailure(
+          `${error.message} Stateful CI did not send a save request because the local snapshot is incomplete.`
+        )
+      )
     );
-    const snapshotId = `snap_${hash.slice("sha256:".length, "sha256:".length + 24)}`;
-    const manifestKey = `manifests/sha256/${hash.slice("sha256:".length)}.json`;
-    const objects = [
-      {
-        digest: hash,
-        key: manifestKey,
-        kind: "manifest",
-        size: 0,
-      },
-    ];
     const request = {
-      baseSnapshotId: null,
-      manifest: {
-        chunkCount: 0,
-        fileCount: scanned.fileCount,
-        hash,
-        id: snapshotId,
-        key: manifestKey,
-        objects,
-        safety: {
-          skippedByBuiltInDenylist: scanned.skippedByBuiltInDenylist,
-          skippedByUserExclude: scanned.skippedByUserExclude,
-          skippedUnsupportedType: scanned.skippedUnsupportedType,
-        },
-        totalBytes: scanned.totalBytes,
-      },
+      baseSnapshotId: session.baseSnapshotId,
+      manifest: snapshot.saveManifest,
       protocolVersion,
-      runId: restoreRequest.github.runId,
-      workspaceId: `ws_${sha256([restoreRequest.workspace.repo, restoreRequest.workspace.workflow, restoreRequest.workspace.job].join("\n")).slice("sha256:".length, "sha256:".length + 24)}`,
+      runId: context.github.runId,
+      workspaceId: session.workspaceId,
     };
     const decoded = Schema.decodeUnknownExit(SaveRequest)(request);
 
@@ -434,7 +476,7 @@ const saveRequestFromRestore = (
             "The scanned workspace did not produce a valid save request."
           )
         )
-      : ({ request: decoded.value, scanned } satisfies PreparedSaveRequest);
+      : ({ request: decoded.value } satisfies PreparedSaveRequest);
   });
 
 const printRestoreResponse = (response: RestoreResponse) =>
@@ -443,7 +485,7 @@ const printRestoreResponse = (response: RestoreResponse) =>
         `Restore denied: ${response.reason} (trust class: ${response.trustClass}). Save allowed: ${response.save.allowed ? "yes" : "no"}.`
       )
     : Console.log(
-        `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}). Snapshot data restore is not implemented yet.`
+        `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}).`
       );
 
 const printSaveResponse = (response: SaveResponse) =>
@@ -453,15 +495,8 @@ const printSaveResponse = (response: SaveResponse) =>
         `Save committed: snapshot ${response.snapshotId} for workspace ${response.workspaceId}. Latest: ${response.latest ? "yes" : "no"}.`
       );
 
-const printScanSummary = (scanned: ScannedWorkspace) =>
-  scanned.missingPaths.length === 0
-    ? Effect.void
-    : Console.log(
-        `Configured workspace paths not found and skipped: ${scanned.missingPaths.join(", ")}.`
-      );
-
-export const restoreProgram = (env: RuntimeEnv) =>
-  Effect.gen(function* restoreProgramEffect() {
+const restoreProgramEffect = Effect.fn("restoreProgram")(
+  function* restoreProgramEffect(env: RuntimeEnv) {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
     const request = yield* restoreRequestFromEnv(env, loaded);
@@ -475,16 +510,55 @@ export const restoreProgram = (env: RuntimeEnv) =>
       responseText
     );
 
+    if (response.decision === "allowed") {
+      if (response.downloadPlan.length === 0) {
+        return yield* Effect.fail(
+          cliFailure(
+            `The backend authorized restore for snapshot ${response.snapshot.id}, but did not provide object downloads. Restore did not mutate the workspace. Configure the object data plane or retry with a backend that supports restore downloads.`
+          )
+        );
+      }
+
+      for (const plan of response.downloadPlan) {
+        yield* downloadPlannedObject(api, plan, process.cwd());
+      }
+
+      yield* writeRestoreSession(process.cwd(), {
+        baseSnapshotId: response.snapshot.id,
+        runId: Schema.decodeSync(RunId)(request.github.runId),
+        workspaceId: response.workspaceId,
+      });
+
+      yield* restoreWorkspaceSnapshot({
+        manifest: response.manifest,
+        workspaceRoot: process.cwd(),
+      }).pipe(
+        Effect.mapError((error) =>
+          cliFailure(`${error.message} Restore did not mutate the workspace.`)
+        )
+      );
+    } else if (response.save.allowed && response.workspaceId !== undefined) {
+      yield* writeRestoreSession(process.cwd(), {
+        baseSnapshotId: null,
+        runId: Schema.decodeSync(RunId)(request.github.runId),
+        workspaceId: response.workspaceId,
+      });
+    }
+
     yield* printRestoreResponse(response);
-  }).pipe(Effect.catchTag("CliFailure", failCliFailure));
+  }
+);
+
+export const restoreProgram = (env: RuntimeEnv) =>
+  restoreProgramEffect(env).pipe(Effect.catchTag("CliFailure", failCliFailure));
 
 export const saveProgram = (env: RuntimeEnv) =>
   Effect.gen(function* saveProgramEffect() {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const restoreRequest = yield* restoreRequestFromEnv(env, loaded);
-    const prepared = yield* saveRequestFromRestore(restoreRequest, loaded);
-    yield* printScanSummary(prepared.scanned);
+    const context = yield* snapshotRequestContextFromEnv(env);
+    const session = yield* readRestoreSession(process.cwd());
+    const prepared = yield* saveRequestFromRestore(context, loaded, session);
     const responseText = yield* postProtocol(
       api,
       routes.save.path,
