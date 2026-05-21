@@ -23,8 +23,17 @@ export const SafeManifestPath = Schema.String.check(
 )
   .check(
     Schema.makeFilter((path: string) =>
-      path.includes("\0")
-        ? { issue: "manifest paths must not contain null bytes", path: [] }
+      path.includes("\0") ||
+      path === "." ||
+      path.startsWith("./") ||
+      path.endsWith("/.") ||
+      path.includes("//") ||
+      path !== path.normalize("NFC")
+        ? {
+            issue:
+              "manifest paths must be normalized relative paths without null bytes, dot aliases, or duplicate separators",
+            path: [],
+          }
         : undefined
     )
   )
@@ -33,8 +42,15 @@ export type SafeManifestPath = Schema.Schema.Type<typeof SafeManifestPath>;
 
 const SymlinkTarget = Schema.String.check(Schema.isMinLength(1)).check(
   Schema.makeFilter((target: string) =>
-    target.includes("\0")
-      ? { issue: "symlink targets must not contain null bytes", path: [] }
+    target.includes("\0") ||
+    target.includes("\\") ||
+    target.startsWith("/") ||
+    /^[A-Za-z]:/u.test(target)
+      ? {
+          issue:
+            "symlink targets must be relative paths without null bytes, backslashes, absolute paths, or drive prefixes",
+          path: [],
+        }
       : undefined
   )
 );
@@ -291,5 +307,22 @@ export const SaveManifest = Schema.Struct({
   objects: SnapshotObjectInventory,
   safety: SafetySummary,
   totalBytes: NonNegativeInteger,
-});
+}).check(
+  Schema.makeFilter((manifest) => {
+    const matchingManifestObjects = manifest.objects.filter(
+      (object) =>
+        object.kind === "manifest" &&
+        object.digest === manifest.hash &&
+        object.key === manifest.key
+    );
+
+    return matchingManifestObjects.length === 1
+      ? undefined
+      : {
+          issue:
+            "save manifest must include exactly one matching manifest object in its inventory",
+          path: ["objects"],
+        };
+  })
+);
 export type SaveManifest = Schema.Schema.Type<typeof SaveManifest>;

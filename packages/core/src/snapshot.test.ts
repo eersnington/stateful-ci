@@ -178,16 +178,41 @@ describe("snapshot object graph schemas", () => {
   });
 
   test("manifest rejects unsafe paths and mismatched content keys", () => {
-    expect(
-      Result.isFailure(
-        decodeSnapshotManifestEntry({
-          mode: 493,
-          mtime: 1,
-          path: "../outside",
-          type: "directory",
-        })
-      )
-    ).toBeTruthy();
+    for (const unsafePath of [
+      ".",
+      "./cache",
+      "cache/.",
+      "cache//entry",
+      "../outside",
+    ]) {
+      expect(
+        Result.isFailure(
+          decodeSnapshotManifestEntry({
+            mode: 493,
+            mtime: 1,
+            path: unsafePath,
+            type: "directory",
+          })
+        )
+      ).toBeTruthy();
+    }
+
+    for (const target of [
+      "/tmp/cache",
+      "C:/cache",
+      "..\\cache",
+      "bad\0target",
+    ]) {
+      expect(
+        Result.isFailure(
+          decodeSnapshotManifestEntry({
+            path: "node_modules/.bin/tool",
+            target,
+            type: "symlink",
+          })
+        )
+      ).toBeTruthy();
+    }
 
     expect(
       Result.isFailure(
