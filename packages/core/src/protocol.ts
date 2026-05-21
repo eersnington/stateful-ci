@@ -10,9 +10,7 @@ import {
 import {
   HeadGeneration,
   IdempotencyKey,
-  ManifestKey,
   RunId,
-  Sha256Digest,
   SnapshotId,
   WorkspaceId,
 } from "./ids";
@@ -104,6 +102,30 @@ export const SaveRequest = Schema.Struct({
 });
 export type SaveRequest = Schema.Schema.Type<typeof SaveRequest>;
 
+const inventoryContainsManifest = <
+  A extends {
+    readonly manifest: ManifestDescriptor;
+    readonly objects: readonly SnapshotObjectInventoryEntry[];
+  },
+>() =>
+  Schema.makeFilter((request: A) => {
+    const matchingManifestObjects = request.objects.filter(
+      (object) =>
+        object.kind === "manifest" &&
+        object.digest === request.manifest.digest &&
+        object.key === request.manifest.key &&
+        object.size === request.manifest.size
+    );
+
+    return matchingManifestObjects.length === 1
+      ? undefined
+      : {
+          issue:
+            "manifest descriptor must match exactly one manifest object in the object inventory",
+          path: ["manifest"],
+        };
+  });
+
 export const RestoreSavePlan = Schema.Union([
   Schema.Struct({ allowed: Schema.Literal(false) }),
   Schema.Struct({
@@ -175,7 +197,7 @@ export const PrepareSaveRequest = Schema.Struct({
   objects: SnapshotObjectInventory,
   protocolVersion: Schema.Literal(protocolVersion),
   workspace: WorkspaceRef,
-});
+}).check(inventoryContainsManifest());
 export type PrepareSaveRequest = Schema.Schema.Type<typeof PrepareSaveRequest>;
 
 export const PrepareSaveDeniedResponse = Schema.Struct({
@@ -213,14 +235,13 @@ export const CommitSaveRequest = Schema.Struct({
   baseSnapshotId: Schema.NullOr(SnapshotId),
   expectedHeadGeneration: HeadGeneration,
   idempotencyKey: IdempotencyKey,
-  manifestDigest: Sha256Digest,
-  manifestKey: ManifestKey,
+  manifest: ManifestDescriptor,
   objects: SnapshotObjectInventory,
   protocolVersion: Schema.Literal(protocolVersion),
   runId: RunId,
   target: CommitTarget,
   workspaceId: WorkspaceId,
-});
+}).check(inventoryContainsManifest());
 export type CommitSaveRequest = Schema.Schema.Type<typeof CommitSaveRequest>;
 
 export const CommitSaveCommittedResponse = Schema.Struct({

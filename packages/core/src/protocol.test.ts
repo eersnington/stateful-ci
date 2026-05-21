@@ -115,8 +115,7 @@ const commitSaveRequest = {
   baseSnapshotId: "snap_123",
   expectedHeadGeneration: 7,
   idempotencyKey: "run-123456789-save",
-  manifestDigest,
-  manifestKey,
+  manifest,
   objects,
   protocolVersion: 1,
   runId: "123456789",
@@ -406,6 +405,28 @@ describe("protocol schemas", () => {
         decodePrepareSaveRequest({
           ...prepareSaveRequest,
           objects: [],
+        })
+      )
+    ).toBeTruthy();
+  });
+
+  test("PrepareSaveRequest binds manifest descriptor to object inventory", () => {
+    expect(
+      Result.isFailure(
+        decodePrepareSaveRequest({
+          ...prepareSaveRequest,
+          manifest: { ...manifest, size: 999 },
+        })
+      )
+    ).toBeTruthy();
+  });
+
+  test("CommitSaveRequest binds manifest descriptor to object inventory", () => {
+    expect(
+      Result.isFailure(
+        decodeCommitSaveRequest({
+          ...commitSaveRequest,
+          objects: objects.filter((object) => object.kind !== "manifest"),
         })
       )
     ).toBeTruthy();
