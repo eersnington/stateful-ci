@@ -60,6 +60,7 @@ export {
   ObjectTransferMethod,
   ObjectTransferPlan,
   ObjectTransferPlanEntry,
+  ObjectTransferPlanNonEmpty,
   PrepareSaveAllowedResponse,
   PrepareSaveDeniedResponse,
   PrepareSaveRequest,

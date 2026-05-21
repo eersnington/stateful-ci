@@ -90,8 +90,15 @@ export type ObjectTransferPlanEntry = Schema.Schema.Type<
   typeof ObjectTransferPlanEntry
 >;
 
-export const ObjectTransferPlan = Schema.NonEmptyArray(ObjectTransferPlanEntry);
+export const ObjectTransferPlan = Schema.Array(ObjectTransferPlanEntry);
 export type ObjectTransferPlan = Schema.Schema.Type<typeof ObjectTransferPlan>;
+
+export const ObjectTransferPlanNonEmpty = Schema.NonEmptyArray(
+  ObjectTransferPlanEntry
+);
+export type ObjectTransferPlanNonEmpty = Schema.Schema.Type<
+  typeof ObjectTransferPlanNonEmpty
+>;
 
 export const SaveRequest = Schema.Struct({
   baseSnapshotId: Schema.NullOr(SnapshotId),
@@ -137,7 +144,7 @@ export type RestoreSavePlan = Schema.Schema.Type<typeof RestoreSavePlan>;
 
 export const RestoreAllowedResponse = Schema.Struct({
   decision: Schema.Literal("allowed"),
-  downloadPlan: ObjectTransferPlan,
+  downloadPlan: ObjectTransferPlanNonEmpty,
   manifest: ManifestDescriptor,
   save: RestoreSavePlan,
   snapshot: SnapshotRef,

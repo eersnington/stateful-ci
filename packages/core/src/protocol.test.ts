@@ -263,6 +263,23 @@ describe("protocol schemas", () => {
     });
   });
 
+  test("PrepareSaveResponse accepts empty missing-object upload plans", () => {
+    expect(
+      Schema.decodeUnknownSync(PrepareSaveResponse)({
+        baseSnapshotId: "snap_123",
+        commitTarget: commitSaveRequest.target,
+        decision: "allowed",
+        expectedHeadGeneration: 7,
+        missingObjects: [],
+        trustClass: "trusted",
+        workspaceId: "ws_123",
+      })
+    ).toMatchObject({
+      decision: "allowed",
+      missingObjects: [],
+    });
+  });
+
   test("RestoreAllowedResponse rejects empty object download plans", () => {
     expect(
       Result.isFailure(
