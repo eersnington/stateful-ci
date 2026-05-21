@@ -131,6 +131,31 @@ describe("snapshot object graph schemas", () => {
     }
   });
 
+  test("packed manifest files require sha256 to match the pack entry digest", () => {
+    expect(
+      Result.isFailure(
+        decodeSnapshotManifestEntry({
+          content: {
+            compressedLength: 41,
+            compressedOffset: 0,
+            compression: "gzip",
+            entryDigest,
+            kind: "pack",
+            packDigest,
+            packKey,
+            uncompressedSize: 12,
+          },
+          mode: 420,
+          mtime: 1_779_230_001,
+          path: ".turbo/cache/index.db",
+          sha256: chunkDigest,
+          size: 12,
+          type: "file",
+        })
+      )
+    ).toBeTruthy();
+  });
+
   test("manifest schema stores file tree and complete object inventory", () => {
     const manifest = {
       createdAt: "2026-05-20T00:00:00.000Z",
