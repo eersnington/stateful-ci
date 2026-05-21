@@ -2,7 +2,6 @@ import {
   ChunkKey,
   ManifestKey,
   PackKey,
-  RestoreAllowedResponse,
   RestoreDeniedResponse,
   RunId,
   Sha256Digest,
@@ -239,7 +238,7 @@ describe("worker API", () => {
     });
   });
 
-  test("POST /v1/restore allows compatible seeded latest snapshot", async () => {
+  test("POST /v1/restore denies compatible snapshots until object data plane is configured", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
       snapshots: [seededSnapshot],
@@ -254,20 +253,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
-      decision: "allowed",
-      downloadPlan: [],
-      manifest: {
-        digest: seededManifestDigest,
-        key: seededManifestKey,
-        size: 128,
-        snapshotId: "snap_123",
-      },
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: true, target: seededRefName },
-      snapshot: {
-        id: "snap_123",
-        manifestKey: seededManifestKey,
-        parent: null,
-      },
       trustClass: "trusted",
       workspaceId: seededWorkspaceId,
     });
@@ -286,9 +274,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: true, target: "internal/refs-pull-12-merge/latest" },
-      snapshot: { id: "snap_123" },
       trustClass: "internal",
     });
   });
@@ -306,9 +294,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: false },
-      snapshot: { id: "snap_123" },
       trustClass: "external",
     });
   });
@@ -326,9 +314,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: false },
-      snapshot: { id: "snap_123" },
       trustClass: "privileged",
     });
   });
@@ -554,9 +542,13 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
 
     const response = await handleFetch(
       jsonRequest("/v1/save", {
@@ -603,9 +595,14 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
+
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
@@ -706,8 +703,8 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
-      snapshot: { id: masterSnapshotId },
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       trustClass: "internal",
     });
   });
@@ -736,8 +733,8 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
-      snapshot: { id: releaseSnapshotId },
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       trustClass: "internal",
     });
   });
@@ -752,9 +749,14 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
+
     const response = await worker.fetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
@@ -781,9 +783,14 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
+
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
@@ -818,13 +825,16 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
-      await restoreResponse.json()
-    );
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "backend_policy_not_configured",
+      save: { allowed: false },
+      trustClass: "external",
+    });
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
-        workspaceId: restoreBody.workspaceId,
+        workspaceId: seededWorkspaceId,
       }),
       env,
       { metadata }
@@ -847,13 +857,16 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
-      await restoreResponse.json()
-    );
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "backend_policy_not_configured",
+      save: { allowed: false },
+      trustClass: "privileged",
+    });
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
-        workspaceId: restoreBody.workspaceId,
+        workspaceId: seededWorkspaceId,
       }),
       env,
       { metadata }
@@ -887,7 +900,11 @@ describe("worker API", () => {
         reason,
       }))
     ).toStrictEqual([
-      { decision: "allowed", eventType: "restore", reason: null },
+      {
+        decision: "denied",
+        eventType: "restore",
+        reason: "backend_policy_not_configured",
+      },
       {
         decision: "denied",
         eventType: "save",

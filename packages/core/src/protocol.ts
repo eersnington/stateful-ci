@@ -90,7 +90,7 @@ export type ObjectTransferPlanEntry = Schema.Schema.Type<
   typeof ObjectTransferPlanEntry
 >;
 
-export const ObjectTransferPlan = Schema.Array(ObjectTransferPlanEntry);
+export const ObjectTransferPlan = Schema.NonEmptyArray(ObjectTransferPlanEntry);
 export type ObjectTransferPlan = Schema.Schema.Type<typeof ObjectTransferPlan>;
 
 export const SaveRequest = Schema.Struct({

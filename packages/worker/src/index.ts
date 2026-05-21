@@ -6,7 +6,6 @@ import {
   InvalidProtocolPayload,
   MethodNotAllowed,
   RequestBodyTooLarge,
-  RestoreAllowedResponse,
   RestoreDeniedResponse,
   RestoreRequest,
   RouteNotFound,
@@ -18,11 +17,11 @@ import {
   Unauthorized,
   WorkspaceId,
 } from "@stateful-ci/core";
-import { Clock, Effect, Exit, Schema } from "effect";
+import { Effect, Exit, Schema } from "effect";
 
 import {
   createInMemoryMetadataBackend,
-  manifestDescriptorFromSnapshotHeader,
+  currentIsoTimestamp,
   MetadataBackend,
   snapshotHeaderFromManifest,
 } from "./metadata";
@@ -248,10 +247,6 @@ const workspaceIdForTarget = (target: RefTarget) =>
 const runIdFromRestore = (request: RestoreRequest) =>
   Schema.decodeSync(RunId)(request.github.runId);
 
-const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
-  Effect.map((millis) => new Date(millis).toISOString())
-);
-
 const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   request: Request,
   env: WorkerEnv | undefined
@@ -388,9 +383,9 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   yield* metadata.appendAuditEvent({
     ...target,
     createdAt,
-    decision: "allowed",
+    decision: "denied",
     eventType: "restore",
-    reason: null,
+    reason: "backend_policy_not_configured",
     runId,
     snapshotId: restored.snapshot.snapshotId,
     trustClass,
@@ -398,20 +393,14 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   });
 
   return Response.json(
-    Schema.encodeUnknownSync(RestoreAllowedResponse)({
-      decision: "allowed",
-      downloadPlan: [],
-      manifest: manifestDescriptorFromSnapshotHeader(restored.snapshot),
+    Schema.encodeUnknownSync(RestoreDeniedResponse)({
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: savePolicy.allowed
         ? { allowed: true, target: target.refName }
         : { allowed: false },
-      snapshot: {
-        id: restored.snapshot.snapshotId,
-        manifestKey: restored.snapshot.manifestKey,
-        parent: restored.snapshot.parentSnapshotId,
-      },
       trustClass,
-      workspaceId,
+      ...(savePolicy.allowed ? { workspaceId } : {}),
     })
   );
 });

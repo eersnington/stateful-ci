@@ -9,6 +9,7 @@ import {
   PackKey,
   PrepareSaveRequest,
   PrepareSaveResponse,
+  RestoreAllowedResponse,
   RestoreRequest,
   SaveRequest,
   Sha256Digest,
@@ -149,6 +150,9 @@ const saveRequest = {
 };
 
 const decodeRestoreRequest = Schema.decodeUnknownResult(RestoreRequest);
+const decodeRestoreAllowedResponse = Schema.decodeUnknownResult(
+  RestoreAllowedResponse
+);
 const decodeSaveRequest = Schema.decodeUnknownResult(SaveRequest);
 const decodePrepareSaveRequest = Schema.decodeUnknownResult(PrepareSaveRequest);
 const decodeCommitSaveRequest = Schema.decodeUnknownResult(CommitSaveRequest);
@@ -257,6 +261,26 @@ describe("protocol schemas", () => {
       decision: "allowed",
       missingObjects: [{ object: objects[1] }],
     });
+  });
+
+  test("RestoreAllowedResponse rejects empty object download plans", () => {
+    expect(
+      Result.isFailure(
+        decodeRestoreAllowedResponse({
+          decision: "allowed",
+          downloadPlan: [],
+          manifest,
+          save: { allowed: true, target: commitSaveRequest.target.refName },
+          snapshot: {
+            id: "snap_123",
+            manifestKey,
+            parent: null,
+          },
+          trustClass: "trusted",
+          workspaceId: "ws_123",
+        })
+      )
+    ).toBeTruthy();
   });
 
   test("CommitSaveResponse covers committed, idempotent, conflict, and denied", () => {

@@ -139,7 +139,7 @@ export const snapshotHeaderFromManifest = (
   });
 };
 
-const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
+export const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
   Effect.map((millis) => new Date(millis).toISOString())
 );
 
