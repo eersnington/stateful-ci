@@ -116,6 +116,11 @@ export class SnapshotEngineError extends Schema.TaggedErrorClass<SnapshotEngineE
   }
 ) {}
 
+interface MissingWorkspacePathError {
+  readonly _tag: "MissingWorkspacePathError";
+  readonly path: string;
+}
+
 interface ScanState {
   readonly directories: SnapshotDirectoryEntry[];
   readonly files: ScannedFile[];
@@ -158,6 +163,13 @@ const engineError = (
   message: string,
   filePath?: string
 ) => new SnapshotEngineError({ message, path: filePath, reason });
+
+const missingWorkspacePathError = (
+  filePath: string
+): MissingWorkspacePathError => ({
+  _tag: "MissingWorkspacePathError",
+  path: filePath,
+});
 
 const nodeFsErrorCode = (error: unknown) => {
   if (typeof error !== "object" || error === null || !("code" in error)) {
@@ -448,19 +460,20 @@ const scanPath = (
 
     const absolutePath = path.join(workspaceRoot, manifestPath);
     const info = yield* Effect.tryPromise({
-      catch: (error) => error,
+      catch: (error) =>
+        isMissingPathError(error)
+          ? missingWorkspacePathError(manifestPath)
+          : engineError(
+              "io_failed",
+              `Could not inspect workspace path ${manifestPath}. Check permissions and retry.`,
+              manifestPath
+            ),
       try: () => lstat(absolutePath),
     }).pipe(
       Effect.catch((error) =>
-        isMissingPathError(error)
+        error._tag === "MissingWorkspacePathError"
           ? Effect.succeed(null)
-          : Effect.fail(
-              engineError(
-                "io_failed",
-                `Could not inspect workspace path ${manifestPath}. Check permissions and retry.`,
-                manifestPath
-              )
-            )
+          : Effect.fail(error)
       )
     );
 
