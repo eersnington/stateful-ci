@@ -15,7 +15,6 @@ import { join } from "node:path";
 import { NodeServices } from "@effect/platform-node";
 import {
   configFileName,
-  RestoreAllowedResponse,
   RestoreDeniedResponse,
   SaveDeniedResponse,
 } from "@stateful-ci/core";
@@ -240,9 +239,7 @@ describe("stateful-ci restore", () => {
       (_request, response) => {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
-          Schema.encodeUnknownSync(
-            Schema.fromJsonString(RestoreAllowedResponse)
-          )({
+          JSON.stringify({
             decision: "allowed",
             downloadPlan: [],
             manifest: {
@@ -275,7 +272,7 @@ describe("stateful-ci restore", () => {
           )
         ).rejects.toMatchObject({
           _tag: "CliFailure",
-          message: expect.stringContaining("did not provide object downloads"),
+          message: expect.stringContaining("does not match protocol v1"),
         });
       }
     );
@@ -336,6 +333,7 @@ describe("stateful-ci save", () => {
             ...githubEnv,
             STATEFUL_CI_API_TOKEN: "test-token",
             STATEFUL_CI_API_URL: url,
+            STATEFUL_CI_OIDC_TOKEN: undefined,
           }).pipe(Effect.provide(NodeServices.layer))
         )
     );

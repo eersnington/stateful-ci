@@ -11,6 +11,8 @@ import {
   clientVersion,
   configFileName,
   defaultConfig,
+  GitContext,
+  GitHubContext,
   protocolVersion,
   RestoreRequest,
   RestoreResponse,
@@ -20,6 +22,7 @@ import {
   SaveResponse,
   SnapshotId,
   StatefulCiConfig,
+  WorkspaceRef,
   WorkspaceId,
   workspacePathsForConfig,
 } from "@stateful-ci/core";
@@ -63,6 +66,12 @@ interface ApiConfig {
 
 interface PreparedSaveRequest {
   readonly request: SaveRequest;
+}
+
+interface SnapshotRequestContext {
+  readonly git: RestoreRequest["git"];
+  readonly github: RestoreRequest["github"];
+  readonly workspace: RestoreRequest["workspace"];
 }
 
 const restoreSessionFile = ".stateful-ci/restore-session.json";
@@ -206,6 +215,45 @@ const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
         )
       : decoded.value;
   });
+
+const snapshotRequestContextFromEnv = Effect.fn(
+  "snapshotRequestContextFromEnv"
+)(function* snapshotRequestContextFromEnvEffect(env: RuntimeEnv) {
+  const context = {
+    git: {
+      baseRef: optionalEnv(env, "GITHUB_BASE_REF"),
+      headRef: optionalEnv(env, "GITHUB_HEAD_REF"),
+      headRepo: optionalEnv(env, "GITHUB_HEAD_REPOSITORY"),
+      ref: yield* requiredEnv(env, "GITHUB_REF"),
+      sha: yield* requiredEnv(env, "GITHUB_SHA"),
+    },
+    github: {
+      actor: yield* requiredEnv(env, "GITHUB_ACTOR"),
+      event: yield* requiredEnv(env, "GITHUB_EVENT_NAME"),
+      runId: yield* requiredEnv(env, "GITHUB_RUN_ID"),
+    },
+    workspace: {
+      job: yield* requiredEnv(env, "GITHUB_JOB"),
+      repo: yield* requiredEnv(env, "GITHUB_REPOSITORY"),
+      workflow: yield* requiredEnv(env, "GITHUB_WORKFLOW"),
+    },
+  };
+  const decoded = Schema.decodeUnknownExit(
+    Schema.Struct({
+      git: GitContext,
+      github: GitHubContext,
+      workspace: WorkspaceRef,
+    })
+  )(context);
+
+  return Exit.isFailure(decoded)
+    ? yield* Effect.fail(
+        cliFailure(
+          "GitHub environment variables did not produce a valid save snapshot context. Check the Actions runtime context. Workspace was not mutated."
+        )
+      )
+    : (decoded.value satisfies SnapshotRequestContext);
+});
 
 const protocolUrl = (api: ApiConfig, route: string) =>
   new URL(route, api.url.endsWith("/") ? api.url : `${api.url}/`).href;
@@ -384,15 +432,15 @@ const decodeProtocolResponse = <A>(
 };
 
 const saveRequestFromRestore = (
-  restoreRequest: RestoreRequest,
+  context: SnapshotRequestContext,
   loaded: LoadedConfig,
   session: RestoreSession
 ) =>
   Effect.gen(function* saveRequestFromRestoreEffect() {
-    if (session.runId !== restoreRequest.github.runId) {
+    if (session.runId !== context.github.runId) {
       return yield* Effect.fail(
         cliFailure(
-          `The saved backend restore authorization belongs to run ${session.runId}, but this save is running as ${restoreRequest.github.runId}. Run stateful-ci restore again in this job before saving.`
+          `The saved backend restore authorization belongs to run ${session.runId}, but this save is running as ${context.github.runId}. Run stateful-ci restore again in this job before saving.`
         )
       );
     }
@@ -400,11 +448,11 @@ const saveRequestFromRestore = (
     const snapshot = yield* createWorkspaceSnapshot({
       config: loaded.config,
       provenance: {
-        git: restoreRequest.git,
-        github: restoreRequest.github,
-        runId: restoreRequest.github.runId,
+        git: context.git,
+        github: context.github,
+        runId: context.github.runId,
       },
-      workspace: restoreRequest.workspace,
+      workspace: context.workspace,
       workspaceRoot: process.cwd(),
     }).pipe(
       Effect.mapError((error) =>
@@ -417,7 +465,7 @@ const saveRequestFromRestore = (
       baseSnapshotId: session.baseSnapshotId,
       manifest: snapshot.saveManifest,
       protocolVersion,
-      runId: restoreRequest.github.runId,
+      runId: context.github.runId,
       workspaceId: session.workspaceId,
     };
     const decoded = Schema.decodeUnknownExit(SaveRequest)(request);
@@ -508,13 +556,9 @@ export const saveProgram = (env: RuntimeEnv) =>
   Effect.gen(function* saveProgramEffect() {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const restoreRequest = yield* restoreRequestFromEnv(env, loaded);
+    const context = yield* snapshotRequestContextFromEnv(env);
     const session = yield* readRestoreSession(process.cwd());
-    const prepared = yield* saveRequestFromRestore(
-      restoreRequest,
-      loaded,
-      session
-    );
+    const prepared = yield* saveRequestFromRestore(context, loaded, session);
     const responseText = yield* postProtocol(
       api,
       routes.save.path,
