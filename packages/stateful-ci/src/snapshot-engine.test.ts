@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -12,7 +13,13 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { largeChunkSizeBytes, StatefulCiConfig } from "@stateful-ci/core";
+import {
+  largeChunkSizeBytes,
+  manifestKeyFromDigest,
+  Sha256Digest,
+  SnapshotManifest,
+  StatefulCiConfig,
+} from "@stateful-ci/core";
 import { Effect, Schema } from "effect";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
@@ -56,6 +63,30 @@ const createSnapshot = (workspaceRoot: string) =>
 
 const objectPath = (workspaceRoot: string, key: string) =>
   path.join(workspaceRoot, ".stateful-ci/store", key);
+
+const writeManifestObject = async (
+  workspaceRoot: string,
+  manifest: SnapshotManifest
+) => {
+  const source = Schema.encodeUnknownSync(
+    Schema.fromJsonString(SnapshotManifest)
+  )(manifest);
+  const manifestDigest = `sha256:${createHash("sha256").update(source).digest("hex")}`;
+  const digest = Schema.decodeSync(Sha256Digest)(manifestDigest);
+  const key = manifestKeyFromDigest(digest);
+
+  await mkdir(path.dirname(objectPath(workspaceRoot, key)), {
+    recursive: true,
+  });
+  await writeFile(objectPath(workspaceRoot, key), source);
+
+  return {
+    digest,
+    key,
+    size: Buffer.byteLength(source),
+    snapshotId: manifest.snapshotId,
+  };
+};
 
 const expectEngineError = (
   error: { readonly reason: string },
@@ -195,6 +226,81 @@ describe("local snapshot engine", () => {
     await expect(
       readFile(path.join(tempDir, ".turbo/cache/current.txt"), "utf-8")
     ).resolves.toBe("still here");
+  });
+
+  test("restore rejects entries below symlink paths", async () => {
+    const snapshot = await createSnapshot(tempDir);
+    const unsafeManifest = {
+      ...snapshot.manifest,
+      entries: [
+        ...snapshot.manifest.entries,
+        {
+          content: snapshot.manifest.entries.find(
+            (entry) => entry.type === "file"
+          )?.content,
+          mode: 420,
+          mtime: 1,
+          path: ".turbo/result-link/escaped.txt",
+          sha256: snapshot.manifest.entries.find(
+            (entry) => entry.type === "file"
+          )?.sha256,
+          size: 13,
+          type: "file" as const,
+        },
+      ],
+    };
+    const manifest = Schema.decodeUnknownSync(SnapshotManifest)(unsafeManifest);
+    const descriptor = await writeManifestObject(tempDir, manifest);
+
+    await expect(
+      Effect.runPromise(
+        Effect.flip(
+          restoreWorkspaceSnapshot({
+            manifest: descriptor,
+            workspaceRoot: tempDir,
+          })
+        )
+      )
+    ).resolves.toMatchObject({ reason: "invalid_symlink" });
+  });
+
+  test("restore rejects chunk references missing from object inventory", async () => {
+    const snapshot = await createSnapshot(tempDir);
+    const manifest = Schema.decodeUnknownSync(SnapshotManifest)({
+      ...snapshot.manifest,
+      objects: snapshot.manifest.objects.filter(
+        (object) => object.kind !== "chunk"
+      ),
+    });
+    const descriptor = await writeManifestObject(tempDir, manifest);
+
+    await expect(
+      Effect.runPromise(
+        Effect.flip(
+          restoreWorkspaceSnapshot({
+            manifest: descriptor,
+            workspaceRoot: tempDir,
+          })
+        )
+      )
+    ).resolves.toMatchObject({ reason: "invalid_manifest" });
+  });
+
+  test("restore creates empty configured roots that were absent at save time", async () => {
+    await rm(path.join(tempDir, "target"), { force: true, recursive: true });
+    const snapshot = await createSnapshot(tempDir);
+
+    await rm(path.join(tempDir, ".turbo"), { recursive: true });
+
+    await Effect.runPromise(
+      restoreWorkspaceSnapshot({
+        manifest: snapshot.manifestDescriptor,
+        workspaceRoot: tempDir,
+      })
+    );
+
+    const target = await lstat(path.join(tempDir, "target"));
+    expect(target.isDirectory()).toBeTruthy();
   });
 
   test("unsafe roots and symlink escapes are rejected", async () => {

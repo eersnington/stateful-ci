@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import {
   chmod,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   readlink,
@@ -26,6 +28,7 @@ import {
   protocolVersion,
   SafeManifestPath,
   SaveManifest,
+  Sha256Digest,
   sha256HexFromDigest,
   ChunkedFileContent,
   SnapshotObjectInventory,
@@ -41,10 +44,10 @@ import type {
   ManifestObjectInventoryEntry,
   PackFileContent,
   PackObjectInventoryEntry,
-  Sha256Digest,
   SnapshotDirectoryEntry,
   SnapshotFileEntry,
   SnapshotManifestEntry,
+  SnapshotObjectInventoryEntry,
   SnapshotSymlinkEntry,
   StatefulCiConfigType,
   WorkspaceRef,
@@ -125,14 +128,27 @@ interface ScanState {
   readonly symlinks: SnapshotSymlinkEntry[];
 }
 
-interface ScannedFile {
+interface SmallScannedFile {
   readonly bytes: Uint8Array;
   readonly digest: Sha256Digest;
+  readonly kind: "small";
   readonly mode: number;
   readonly mtime: number;
   readonly path: SafeManifestPath;
   readonly size: number;
 }
+
+interface LargeScannedFile {
+  readonly absolutePath: string;
+  readonly digest: Sha256Digest;
+  readonly kind: "large";
+  readonly mode: number;
+  readonly mtime: number;
+  readonly path: SafeManifestPath;
+  readonly size: number;
+}
+
+type ScannedFile = SmallScannedFile | LargeScannedFile;
 
 const storeRoot = ".stateful-ci/store";
 const tempRoot = ".stateful-ci/tmp";
@@ -142,6 +158,20 @@ const engineError = (
   message: string,
   filePath?: string
 ) => new SnapshotEngineError({ message, path: filePath, reason });
+
+const nodeFsErrorCode = (error: unknown) => {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return null;
+  }
+
+  return typeof error.code === "string" ? error.code : null;
+};
+
+const isMissingPathError = (error: unknown) => {
+  const code = nodeFsErrorCode(error);
+
+  return code === "ENOENT" || code === "ENOTDIR";
+};
 
 const toBytes = (source: string) =>
   new Uint8Array(Buffer.from(source, "utf-8"));
@@ -160,6 +190,47 @@ const concatBytes = (parts: readonly Uint8Array[]) => {
 };
 
 const sha256Text = (source: string) => sha256Bytes(toBytes(source));
+
+const sha256File = (absolutePath: string) =>
+  Effect.scoped(
+    Effect.gen(function* sha256FileEffect() {
+      const handle = yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          catch: () =>
+            engineError(
+              "io_failed",
+              `Could not open file ${absolutePath} for hashing. Check permissions and retry.`,
+              absolutePath
+            ),
+          try: () => open(absolutePath, "r"),
+        }),
+        (fileHandle) =>
+          Effect.promise(() => fileHandle.close()).pipe(Effect.orDie)
+      );
+      const hash = createHash("sha256");
+      const buffer = Buffer.allocUnsafe(largeChunkSizeBytes);
+
+      for (;;) {
+        const { bytesRead } = yield* Effect.tryPromise({
+          catch: () =>
+            engineError(
+              "io_failed",
+              `Could not hash file ${absolutePath}. Check permissions and retry.`,
+              absolutePath
+            ),
+          try: () => handle.read(buffer, 0, buffer.byteLength, null),
+        });
+
+        if (bytesRead === 0) {
+          return Schema.decodeSync(Sha256Digest)(
+            `sha256:${hash.digest("hex")}`
+          );
+        }
+
+        hash.update(buffer.subarray(0, bytesRead));
+      }
+    })
+  );
 
 const normalizeRelativePath = (candidate: string) => {
   if (
@@ -377,14 +448,21 @@ const scanPath = (
 
     const absolutePath = path.join(workspaceRoot, manifestPath);
     const info = yield* Effect.tryPromise({
-      catch: () =>
-        engineError(
-          "io_failed",
-          `Could not inspect workspace path ${manifestPath}. Check permissions and retry.`,
-          manifestPath
-        ),
+      catch: (error) => error,
       try: () => lstat(absolutePath),
-    }).pipe(Effect.catch(() => Effect.succeed(null)));
+    }).pipe(
+      Effect.catch((error) =>
+        isMissingPathError(error)
+          ? Effect.succeed(null)
+          : Effect.fail(
+              engineError(
+                "io_failed",
+                `Could not inspect workspace path ${manifestPath}. Check permissions and retry.`,
+                manifestPath
+              )
+            )
+      )
+    );
 
     if (info === null) {
       return;
@@ -462,6 +540,19 @@ const scanPath = (
       return;
     }
 
+    if (info.size > smallFileThresholdBytes) {
+      state.files.push({
+        absolutePath,
+        digest: yield* sha256File(absolutePath),
+        kind: "large",
+        mode: info.mode % 0o1000,
+        mtime: Math.floor(info.mtimeMs),
+        path: manifestPath,
+        size: info.size,
+      });
+      return;
+    }
+
     const bytes = yield* Effect.tryPromise({
       catch: () =>
         engineError(
@@ -475,6 +566,7 @@ const scanPath = (
     state.files.push({
       bytes,
       digest: sha256Bytes(bytes),
+      kind: "small",
       mode: info.mode % 0o1000,
       mtime: Math.floor(info.mtimeMs),
       path: manifestPath,
@@ -485,11 +577,9 @@ const scanPath = (
 const createPackObjects = Effect.fn("createPackObjects")(
   function* createPackObjectsEffect(
     workspaceRoot: string,
-    files: readonly ScannedFile[]
+    files: readonly SmallScannedFile[]
   ) {
-    const smallFiles = files.filter(
-      (file) => file.size <= smallFileThresholdBytes
-    );
+    const smallFiles = files;
     const byDigest = new Map(smallFiles.map((file) => [file.digest, file]));
     const packObjects: PackObjectInventoryEntry[] = [];
     const packContentByDigest = new Map<Sha256Digest, PackFileContent>();
@@ -532,29 +622,79 @@ const createPackObjects = Effect.fn("createPackObjects")(
 );
 
 const createChunkContent = Effect.fn("createChunkContent")(
-  function* createChunkContentEffect(workspaceRoot: string, file: ScannedFile) {
+  function* createChunkContentEffect(
+    workspaceRoot: string,
+    file: LargeScannedFile
+  ) {
     const chunks: ChunkFileContentEntry[] = [];
     const objects: ChunkObjectInventoryEntry[] = [];
 
-    for (
-      let offset = 0, ordinal = 0;
-      offset < file.bytes.byteLength;
-      offset += largeChunkSizeBytes, ordinal += 1
-    ) {
-      const bytes = file.bytes.slice(offset, offset + largeChunkSizeBytes);
-      const digest = sha256Bytes(bytes);
-      const key = chunkKeyFromDigest(digest);
-      const object = {
-        digest,
-        key,
-        kind: "chunk",
-        size: bytes.byteLength,
-      } satisfies ChunkObjectInventoryEntry;
+    yield* Effect.scoped(
+      Effect.gen(function* readLargeFileChunksEffect() {
+        const handle = yield* Effect.acquireRelease(
+          Effect.tryPromise({
+            catch: () =>
+              engineError(
+                "io_failed",
+                `Could not open large file ${file.path} for chunking.`,
+                file.path
+              ),
+            try: () => open(file.absolutePath, "r"),
+          }),
+          (fileHandle) =>
+            Effect.promise(() => fileHandle.close()).pipe(Effect.orDie)
+        );
+        const fileHash = createHash("sha256");
+        const buffer = Buffer.allocUnsafe(largeChunkSizeBytes);
+        let ordinal = 0;
+        let totalSize = 0;
 
-      yield* writeImmutableObject(workspaceRoot, key, bytes);
-      chunks.push({ digest, key, ordinal, size: bytes.byteLength });
-      objects.push(object);
-    }
+        for (;;) {
+          const { bytesRead } = yield* Effect.tryPromise({
+            catch: () =>
+              engineError(
+                "io_failed",
+                `Could not read large file ${file.path} while writing chunks.`,
+                file.path
+              ),
+            try: () => handle.read(buffer, 0, buffer.byteLength, null),
+          });
+
+          if (bytesRead === 0) {
+            const digest = Schema.decodeSync(Sha256Digest)(
+              `sha256:${fileHash.digest("hex")}`
+            );
+
+            if (digest !== file.digest || totalSize !== file.size) {
+              return yield* engineError(
+                "io_failed",
+                `Large file ${file.path} changed while the snapshot was being created. Save was aborted before publishing an inconsistent manifest. Retry after the workspace is stable.`,
+                file.path
+              );
+            }
+
+            return;
+          }
+
+          const bytes = new Uint8Array(buffer.subarray(0, bytesRead));
+          const digest = sha256Bytes(bytes);
+          const key = chunkKeyFromDigest(digest);
+          const object = {
+            digest,
+            key,
+            kind: "chunk",
+            size: bytes.byteLength,
+          } satisfies ChunkObjectInventoryEntry;
+
+          fileHash.update(bytes);
+          totalSize += bytes.byteLength;
+          yield* writeImmutableObject(workspaceRoot, key, bytes);
+          chunks.push({ digest, key, ordinal, size: bytes.byteLength });
+          objects.push(object);
+          ordinal += 1;
+        }
+      })
+    );
 
     return { chunks, objects };
   }
@@ -582,7 +722,7 @@ export const createWorkspaceSnapshot = Effect.fn("createWorkspaceSnapshot")(
 
     const { packContentByDigest, packObjects } = yield* createPackObjects(
       input.workspaceRoot,
-      state.files
+      state.files.filter((file) => file.kind === "small")
     );
     const chunkObjectsByKey = new Map<string, ChunkObjectInventoryEntry>();
     const fileEntries: SnapshotFileEntry[] = [];
@@ -590,7 +730,7 @@ export const createWorkspaceSnapshot = Effect.fn("createWorkspaceSnapshot")(
     for (const file of state.files.toSorted((left, right) =>
       left.path.localeCompare(right.path)
     )) {
-      if (file.size <= smallFileThresholdBytes) {
+      if (file.kind === "small") {
         const content = packContentByDigest.get(file.digest);
 
         if (content === undefined) {
@@ -726,77 +866,209 @@ export const createWorkspaceSnapshot = Effect.fn("createWorkspaceSnapshot")(
   }
 );
 
-const validateManifestForRestore = (manifest: SnapshotManifest) => {
-  const paths = new Set<string>();
+const validateManifestEntryPath = (
+  manifest: SnapshotManifest,
+  entry: SnapshotManifestEntry,
+  paths: Set<string>,
+  entryTypesByPath: Map<string, SnapshotManifestEntry["type"]>
+) => {
+  const safePath = normalizeRelativePath(entry.path);
 
-  for (const root of manifest.managedRoots) {
-    if (normalizeRelativePath(root) === null) {
+  if (safePath === null) {
+    return Effect.fail(
+      engineError("invalid_path", `Manifest entry ${entry.path} is unsafe.`)
+    );
+  }
+
+  if (!manifest.managedRoots.some((root) => rootContainsPath(root, safePath))) {
+    return Effect.fail(
+      engineError(
+        "invalid_path",
+        `Manifest entry ${entry.path} is outside all managed roots.`
+      )
+    );
+  }
+
+  if (paths.has(safePath)) {
+    return Effect.fail(
+      engineError(
+        "duplicate_path",
+        `Manifest path ${safePath} appears more than once.`
+      )
+    );
+  }
+
+  paths.add(safePath);
+  entryTypesByPath.set(safePath, entry.type);
+  return Effect.succeed(safePath);
+};
+
+const validateManifestSymlinkTarget = (
+  manifest: SnapshotManifest,
+  entry: SnapshotSymlinkEntry,
+  safePath: string
+) => {
+  const root = manifest.managedRoots.find((candidate) =>
+    rootContainsPath(candidate, safePath)
+  );
+  const resolvedTarget = path.posix.normalize(
+    path.posix.join(path.posix.dirname(safePath), entry.target)
+  );
+
+  return root === undefined ||
+    entry.target.length === 0 ||
+    entry.target.includes("\\") ||
+    path.isAbsolute(entry.target) ||
+    /^[A-Za-z]:/u.test(entry.target) ||
+    resolvedTarget === ".." ||
+    resolvedTarget.startsWith("../") ||
+    !rootContainsPath(root, resolvedTarget)
+    ? Effect.fail(
+        engineError(
+          "invalid_symlink",
+          `Manifest symlink ${safePath} points outside its managed root.`
+        )
+      )
+    : Effect.void;
+};
+
+const validateNoSymlinkParents = (
+  entry: SnapshotManifestEntry,
+  safePath: string,
+  entryTypesByPath: ReadonlyMap<string, SnapshotManifestEntry["type"]>
+) => {
+  let ancestor = "";
+
+  for (const part of safePath.split("/").slice(0, -1)) {
+    ancestor = ancestor.length === 0 ? part : `${ancestor}/${part}`;
+
+    if (entryTypesByPath.get(ancestor) === "symlink") {
       return Effect.fail(
-        engineError("invalid_root", `Manifest managed root ${root} is unsafe.`)
+        engineError(
+          "invalid_symlink",
+          `Manifest path ${safePath} restores through symlink parent ${ancestor}.`,
+          safePath
+        )
       );
     }
   }
 
-  for (const entry of manifest.entries) {
-    const safePath = normalizeRelativePath(entry.path);
+  if (
+    entry.type === "symlink" &&
+    [...entryTypesByPath.keys()].some((candidate) =>
+      candidate.startsWith(`${safePath}/`)
+    )
+  ) {
+    return Effect.fail(
+      engineError(
+        "invalid_symlink",
+        `Manifest symlink ${safePath} has descendant entries.`,
+        safePath
+      )
+    );
+  }
 
-    if (safePath === null) {
-      return Effect.fail(
-        engineError("invalid_path", `Manifest entry ${entry.path} is unsafe.`)
-      );
-    }
+  return Effect.void;
+};
+
+const validateFileObjectReferences = (
+  entry: SnapshotFileEntry,
+  safePath: string,
+  objectsByKey: ReadonlyMap<string, SnapshotObjectInventoryEntry>
+) => {
+  if (entry.content.kind === "pack") {
+    const object = objectsByKey.get(entry.content.packKey);
+
+    return object === undefined ||
+      object.kind !== "pack" ||
+      object.digest !== entry.content.packDigest
+      ? Effect.fail(
+          engineError(
+            "invalid_manifest",
+            `Manifest file ${safePath} references pack ${entry.content.packKey} outside the object inventory.`,
+            safePath
+          )
+        )
+      : Effect.void;
+  }
+
+  for (const chunk of entry.content.chunks) {
+    const object = objectsByKey.get(chunk.key);
 
     if (
-      !manifest.managedRoots.some((root) => rootContainsPath(root, safePath))
+      object === undefined ||
+      object.kind !== "chunk" ||
+      object.digest !== chunk.digest ||
+      object.size !== chunk.size
     ) {
       return Effect.fail(
         engineError(
-          "invalid_path",
-          `Manifest entry ${entry.path} is outside all managed roots.`
+          "invalid_manifest",
+          `Manifest file ${safePath} references chunk ${chunk.key} outside the object inventory.`,
+          safePath
         )
       );
-    }
-
-    if (paths.has(safePath)) {
-      return Effect.fail(
-        engineError(
-          "duplicate_path",
-          `Manifest path ${safePath} appears more than once.`
-        )
-      );
-    }
-    paths.add(safePath);
-
-    if (entry.type === "symlink") {
-      const root = manifest.managedRoots.find((candidate) =>
-        rootContainsPath(candidate, safePath)
-      );
-      const resolvedTarget = path.posix.normalize(
-        path.posix.join(path.posix.dirname(safePath), entry.target)
-      );
-
-      if (
-        root === undefined ||
-        entry.target.length === 0 ||
-        entry.target.includes("\\") ||
-        path.isAbsolute(entry.target) ||
-        /^[A-Za-z]:/u.test(entry.target) ||
-        resolvedTarget === ".." ||
-        resolvedTarget.startsWith("../") ||
-        !rootContainsPath(root, resolvedTarget)
-      ) {
-        return Effect.fail(
-          engineError(
-            "invalid_symlink",
-            `Manifest symlink ${safePath} points outside its managed root.`
-          )
-        );
-      }
     }
   }
 
   return Effect.void;
 };
+
+const validateManifestForRestore = Effect.fn("validateManifestForRestore")(
+  function* validateManifestForRestoreEffect(manifest: SnapshotManifest) {
+    const paths = new Set<string>();
+    const entryTypesByPath = new Map<string, SnapshotManifestEntry["type"]>();
+    const safePathsByEntry = new Map<SnapshotManifestEntry, string>();
+    const objectsByKey = new Map<string, SnapshotObjectInventoryEntry>();
+
+    for (const object of manifest.objects) {
+      objectsByKey.set(object.key, object);
+    }
+
+    for (const root of manifest.managedRoots) {
+      if (normalizeRelativePath(root) === null) {
+        return yield* engineError(
+          "invalid_root",
+          `Manifest managed root ${root} is unsafe.`
+        );
+      }
+    }
+
+    for (const entry of manifest.entries) {
+      const safePath = yield* validateManifestEntryPath(
+        manifest,
+        entry,
+        paths,
+        entryTypesByPath
+      );
+
+      safePathsByEntry.set(entry, safePath);
+
+      if (entry.type === "symlink") {
+        yield* validateManifestSymlinkTarget(manifest, entry, safePath);
+      }
+    }
+
+    for (const entry of manifest.entries) {
+      const safePath = safePathsByEntry.get(entry);
+
+      if (safePath === undefined) {
+        return yield* engineError(
+          "invalid_path",
+          `Manifest entry ${entry.path} is unsafe.`
+        );
+      }
+
+      yield* validateNoSymlinkParents(entry, safePath, entryTypesByPath);
+
+      if (entry.type === "file") {
+        yield* validateFileObjectReferences(entry, safePath, objectsByKey);
+      }
+    }
+
+    return objectsByKey;
+  }
+);
 
 const materializeEntry = Effect.fn("materializeEntry")(
   function* materializeEntryEffect(
@@ -804,6 +1076,7 @@ const materializeEntry = Effect.fn("materializeEntry")(
     stagingRoot: string,
     manifest: SnapshotManifest,
     entry: SnapshotManifestEntry,
+    objectsByKey: ReadonlyMap<string, SnapshotObjectInventoryEntry>,
     packBytesByKey: ReadonlyMap<string, Uint8Array>
   ) {
     const target = path.join(stagingRoot, entry.path);
@@ -881,11 +1154,21 @@ const materializeEntry = Effect.fn("materializeEntry")(
       for (const chunk of entry.content.chunks.toSorted(
         (left, right) => left.ordinal - right.ordinal
       )) {
+        const object = objectsByKey.get(chunk.key);
+
+        if (object === undefined || object.kind !== "chunk") {
+          return yield* engineError(
+            "invalid_manifest",
+            `Chunk ${chunk.key} is missing from the manifest object inventory.`,
+            entry.path
+          );
+        }
+
         const chunkBytes = yield* readLocalObject(workspaceRoot, chunk.key);
         yield* verifyObjectBytes(
           chunk.key,
-          chunk.digest,
-          chunk.size,
+          object.digest,
+          object.size,
           chunkBytes
         );
         chunks.push(chunkBytes);
@@ -955,6 +1238,28 @@ const exactReplaceManagedRoots = (
         path.join(workspaceRoot, tempRoot, "restore-backup-")
       );
       const movedRoots: { live: string; backup: string }[] = [];
+      const assertRealDirectoryAncestors = async (absolutePath: string) => {
+        const relative = path.relative(workspaceRoot, absolutePath);
+        const parts = relative
+          .split(path.sep)
+          .filter((part) => part.length > 0);
+        let current = workspaceRoot;
+
+        for (const part of parts) {
+          current = path.join(current, part);
+          const info = await lstat(current).catch(() => null);
+
+          if (info === null) {
+            return;
+          }
+
+          if (!info.isDirectory() || info.isSymbolicLink()) {
+            throw new Error(
+              `Restore parent ${current} is not a real directory.`
+            );
+          }
+        }
+      };
 
       try {
         for (const root of roots) {
@@ -963,6 +1268,11 @@ const exactReplaceManagedRoots = (
           const backup = path.join(backupRoot, root);
           const liveInfo = await lstat(live).catch(() => null);
 
+          await assertRealDirectoryAncestors(path.dirname(live));
+          await assertRealDirectoryAncestors(path.dirname(backup));
+          if (liveInfo !== null && liveInfo.isSymbolicLink()) {
+            throw new Error(`Managed root ${live} is a symlink.`);
+          }
           await mkdir(path.dirname(live), { recursive: true });
           await mkdir(path.dirname(backup), { recursive: true });
 
@@ -1019,7 +1329,7 @@ export const restoreWorkspaceSnapshot = Effect.fn("restoreWorkspaceSnapshot")(
       )
     );
 
-    yield* validateManifestForRestore(manifest);
+    const objectsByKey = yield* validateManifestForRestore(manifest);
 
     const packBytesByKey = new Map<string, Uint8Array>();
 
@@ -1055,19 +1365,24 @@ export const restoreWorkspaceSnapshot = Effect.fn("restoreWorkspaceSnapshot")(
         ),
       try: async () => {
         for (const root of manifest.managedRoots) {
-          await mkdir(path.dirname(path.join(stagingRoot, root)), {
-            recursive: true,
-          });
+          await mkdir(path.join(stagingRoot, root), { recursive: true });
         }
       },
     });
 
-    for (const entry of manifest.entries) {
+    for (const entry of manifest.entries.toSorted((left, right) => {
+      const order = { directory: 0, file: 1, symlink: 2 } as const;
+      return (
+        order[left.type] - order[right.type] ||
+        left.path.localeCompare(right.path)
+      );
+    })) {
       yield* materializeEntry(
         input.workspaceRoot,
         stagingRoot,
         manifest,
         entry,
+        objectsByKey,
         packBytesByKey
       );
     }
