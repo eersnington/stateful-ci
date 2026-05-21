@@ -35,6 +35,7 @@ const githubEnv = {
   GITHUB_RUN_ID: "123456789",
   GITHUB_SHA: "abc123",
   GITHUB_WORKFLOW: "ci.yml",
+  STATEFUL_CI_OIDC_TOKEN: "oidc.jwt.token",
 };
 
 const withProtocolServer = async <A>(

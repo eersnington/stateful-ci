@@ -1,14 +1,18 @@
 import type {
   DenialReason,
+  ManifestDescriptor,
   ManifestKey,
   RunId,
   SaveManifest,
   Sha256Digest,
   SnapshotId,
+  SnapshotObjectInventory,
   TrustClass,
   WorkspaceId,
 } from "@stateful-ci/core";
-import { Context, Effect } from "effect";
+import { Clock, Context, Effect } from "effect";
+
+import { SnapshotHeaderFromManifestFailed } from "./metadata-errors";
 
 export interface RefTarget {
   readonly namespace: string;
@@ -27,6 +31,8 @@ export interface SnapshotHeader {
   readonly createdAt: string;
   readonly manifestDigest: Sha256Digest;
   readonly manifestKey: ManifestKey;
+  readonly manifestSize: number;
+  readonly objects: SnapshotObjectInventory;
   readonly parentSnapshotId: SnapshotId | null;
   readonly runId: RunId;
   readonly snapshotId: SnapshotId;
@@ -100,17 +106,50 @@ export const snapshotHeaderFromManifest = (
     readonly trustClass: TrustClass;
     readonly workspaceId: WorkspaceId;
   }
-): SnapshotHeader => ({
-  chunkCount: manifest.chunkCount,
-  createdAt: options.createdAt,
-  manifestDigest: manifest.hash,
-  manifestKey: manifest.key,
-  parentSnapshotId: options.parentSnapshotId,
-  runId: options.runId,
-  snapshotId: manifest.id,
-  totalBytes: manifest.totalBytes,
-  trustClass: options.trustClass,
-  workspaceId: options.workspaceId,
+): Effect.Effect<SnapshotHeader, SnapshotHeaderFromManifestFailed> => {
+  const manifestObject = manifest.objects.find(
+    (object) =>
+      object.kind === "manifest" &&
+      object.digest === manifest.hash &&
+      object.key === manifest.key
+  );
+
+  if (manifestObject === undefined) {
+    return Effect.fail(
+      new SnapshotHeaderFromManifestFailed({
+        message:
+          "Save manifest inventory did not include its manifest object. The snapshot header was not persisted.",
+      })
+    );
+  }
+
+  return Effect.succeed({
+    chunkCount: manifest.chunkCount,
+    createdAt: options.createdAt,
+    manifestDigest: manifest.hash,
+    manifestKey: manifest.key,
+    manifestSize: manifestObject.size,
+    objects: manifest.objects,
+    parentSnapshotId: options.parentSnapshotId,
+    runId: options.runId,
+    snapshotId: manifest.id,
+    totalBytes: manifest.totalBytes,
+    trustClass: options.trustClass,
+    workspaceId: options.workspaceId,
+  });
+};
+
+export const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
+  Effect.map((millis) => new Date(millis).toISOString())
+);
+
+export const manifestDescriptorFromSnapshotHeader = (
+  snapshot: SnapshotHeader
+): ManifestDescriptor => ({
+  digest: snapshot.manifestDigest,
+  key: snapshot.manifestKey,
+  size: snapshot.manifestSize,
+  snapshotId: snapshot.snapshotId,
 });
 
 export const createInMemoryMetadataBackend = (
@@ -152,14 +191,15 @@ export const createInMemoryMetadataBackend = (
         workspaceTargets.set(target.workspaceId, target);
       }),
     setRef: (target, snapshotId, trustClass) =>
-      Effect.sync(() => {
+      Effect.gen(function* setRefEffect() {
+        const updatedAt = yield* currentIsoTimestamp;
         const key = refKey(target);
         const previous = refs.get(key);
         const next = {
           ...target,
           snapshotId,
           trustClass,
-          updatedAt: new Date().toISOString(),
+          updatedAt,
           version: previous === undefined ? 1 : previous.version + 1,
         } satisfies RefRow;
 

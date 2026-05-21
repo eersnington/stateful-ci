@@ -1,6 +1,7 @@
 import {
+  ChunkKey,
   ManifestKey,
-  RestoreAllowedResponse,
+  PackKey,
   RestoreDeniedResponse,
   RunId,
   Sha256Digest,
@@ -20,7 +21,8 @@ const env = {
 
 const restoreRequest = {
   client: {
-    configHash: "sha256:config",
+    configHash:
+      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     version: "0.1.0",
   },
   git: {
@@ -35,6 +37,12 @@ const restoreRequest = {
     event: "push",
     runId: "123456789",
   },
+  identity: {
+    provider: "github-actions",
+    token: "oidc.jwt.token",
+  },
+  managedRoots: [".turbo"],
+  protocolVersion: 1,
   workspace: {
     job: "test",
     repo: "eersnington/stateful-ci",
@@ -42,14 +50,40 @@ const restoreRequest = {
   },
 };
 
+const manifestDigest =
+  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const manifestKey =
+  "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+const seededManifestDigest =
+  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const seededManifestKey =
+  "manifests/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json";
+const seededPackDigest =
+  "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const seededPackKey =
+  "packs/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.scipack";
+const seededChunkDigest =
+  "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const seededChunkKey =
+  "chunks/sha256/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const saveObjects = [
+  {
+    digest: manifestDigest,
+    key: manifestKey,
+    kind: "manifest",
+    size: 512,
+  },
+] as const;
+
 const saveRequest = {
   baseSnapshotId: "snap_123",
   manifest: {
     chunkCount: 1,
     fileCount: 21_903,
-    hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    hash: manifestDigest,
     id: "snap_124",
-    key: "manifests/snap_124.json",
+    key: manifestKey,
+    objects: saveObjects,
     safety: {
       skippedByBuiltInDenylist: 3,
       skippedByUserExclude: 12,
@@ -57,12 +91,13 @@ const saveRequest = {
     },
     totalBytes: 481_203_912,
   },
+  protocolVersion: 1,
   runId: "123456789",
   workspaceId: "ws_123",
 };
 
 const seededNamespace =
-  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:config";
+  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
 const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${seededNamespace}:${seededRefName}`
@@ -72,10 +107,29 @@ const seededSnapshotId = Schema.decodeSync(SnapshotId)("snap_123");
 const seededSnapshot = {
   chunkCount: 1,
   createdAt: "2026-05-16T00:00:00.000Z",
-  manifestDigest: Schema.decodeSync(Sha256Digest)(
-    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  ),
-  manifestKey: Schema.decodeSync(ManifestKey)("manifests/snap_123.json"),
+  manifestDigest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
+  manifestKey: Schema.decodeSync(ManifestKey)(seededManifestKey),
+  manifestSize: 128,
+  objects: [
+    {
+      digest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
+      key: Schema.decodeSync(ManifestKey)(seededManifestKey),
+      kind: "manifest",
+      size: 128,
+    },
+    {
+      digest: Schema.decodeSync(Sha256Digest)(seededPackDigest),
+      key: Schema.decodeSync(PackKey)(seededPackKey),
+      kind: "pack",
+      size: 2048,
+    },
+    {
+      digest: Schema.decodeSync(Sha256Digest)(seededChunkDigest),
+      key: Schema.decodeSync(ChunkKey)(seededChunkKey),
+      kind: "chunk",
+      size: 4096,
+    },
+  ],
   parentSnapshotId: null,
   runId: Schema.decodeSync(RunId)("123456788"),
   snapshotId: seededSnapshotId,
@@ -184,7 +238,7 @@ describe("worker API", () => {
     });
   });
 
-  test("POST /v1/restore allows compatible seeded latest snapshot", async () => {
+  test("POST /v1/restore denies compatible snapshots until object data plane is configured", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
       snapshots: [seededSnapshot],
@@ -199,13 +253,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: true, target: seededRefName },
-      snapshot: {
-        id: "snap_123",
-        manifestKey: "manifests/snap_123.json",
-        parent: null,
-      },
       trustClass: "trusted",
       workspaceId: seededWorkspaceId,
     });
@@ -224,9 +274,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: true, target: "internal/refs-pull-12-merge/latest" },
-      snapshot: { id: "snap_123" },
       trustClass: "internal",
     });
   });
@@ -244,9 +294,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: false },
-      snapshot: { id: "snap_123" },
       trustClass: "external",
     });
   });
@@ -264,9 +314,9 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       save: { allowed: false },
-      snapshot: { id: "snap_123" },
       trustClass: "privileged",
     });
   });
@@ -423,7 +473,8 @@ describe("worker API", () => {
         ...restoreRequest,
         client: {
           ...restoreRequest.client,
-          configHash: "sha256:different-config",
+          configHash:
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         },
       }),
       env,
@@ -437,7 +488,7 @@ describe("worker API", () => {
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
       workspaceId: workspaceIdFor(
-        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:different-config",
+        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         seededRefName
       ),
     });
@@ -491,9 +542,13 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
 
     const response = await handleFetch(
       jsonRequest("/v1/save", {
@@ -517,7 +572,7 @@ describe("worker API", () => {
         metadata.getSnapshotHeader(Schema.decodeSync(SnapshotId)("snap_124"))
       )
     ).resolves.toMatchObject({
-      manifestKey: "manifests/snap_124.json",
+      manifestKey,
       parentSnapshotId: "snap_123",
       snapshotId: "snap_124",
       workspaceId: seededWorkspaceId,
@@ -540,9 +595,14 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
+
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
@@ -643,8 +703,8 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
-      snapshot: { id: masterSnapshotId },
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       trustClass: "internal",
     });
   });
@@ -673,8 +733,8 @@ describe("worker API", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      decision: "allowed",
-      snapshot: { id: releaseSnapshotId },
+      decision: "denied",
+      reason: "backend_policy_not_configured",
       trustClass: "internal",
     });
   });
@@ -689,9 +749,14 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
+
     const response = await worker.fetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
@@ -718,9 +783,14 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
       await restoreResponse.json()
     );
+
+    if (restoreBody.workspaceId === undefined) {
+      throw new Error("Restore response did not include a save workspace.");
+    }
+
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
@@ -755,13 +825,16 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
-      await restoreResponse.json()
-    );
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "backend_policy_not_configured",
+      save: { allowed: false },
+      trustClass: "external",
+    });
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
-        workspaceId: restoreBody.workspaceId,
+        workspaceId: seededWorkspaceId,
       }),
       env,
       { metadata }
@@ -784,13 +857,16 @@ describe("worker API", () => {
       env,
       { metadata }
     );
-    const restoreBody = Schema.decodeUnknownSync(RestoreAllowedResponse)(
-      await restoreResponse.json()
-    );
+    await expect(restoreResponse.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "backend_policy_not_configured",
+      save: { allowed: false },
+      trustClass: "privileged",
+    });
     const response = await handleFetch(
       jsonRequest("/v1/save", {
         ...saveRequest,
-        workspaceId: restoreBody.workspaceId,
+        workspaceId: seededWorkspaceId,
       }),
       env,
       { metadata }
@@ -824,7 +900,11 @@ describe("worker API", () => {
         reason,
       }))
     ).toStrictEqual([
-      { decision: "allowed", eventType: "restore", reason: null },
+      {
+        decision: "denied",
+        eventType: "restore",
+        reason: "backend_policy_not_configured",
+      },
       {
         decision: "denied",
         eventType: "save",
