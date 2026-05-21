@@ -1,5 +1,5 @@
+import { describe, expect, it } from "@effect/vitest";
 import { Result, Schema } from "effect";
-import { describe, expect, test } from "vitest";
 
 import {
   ChunkKey,
@@ -9,7 +9,7 @@ import {
   SnapshotManifest,
   SnapshotManifestEntry,
   SnapshotObjectInventoryEntry,
-} from "./index";
+} from "../src/index";
 
 const manifestDigest =
   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -44,7 +44,7 @@ const decodeInventoryEntry = Schema.decodeUnknownResult(
 );
 
 describe("snapshot object graph schemas", () => {
-  test("object keys accept only canonical grammar", () => {
+  it("object keys accept only canonical grammar", () => {
     expect(Schema.decodeUnknownSync(ManifestKey)(manifestKey)).toBe(
       manifestKey
     );
@@ -68,7 +68,7 @@ describe("snapshot object graph schemas", () => {
     }
   });
 
-  test("object inventory validates kind, key, size, and digest identity", () => {
+  it("object inventory validates kind, key, size, and digest identity", () => {
     for (const object of objects) {
       expect(
         Schema.decodeUnknownSync(SnapshotObjectInventoryEntry)(object)
@@ -82,7 +82,7 @@ describe("snapshot object graph schemas", () => {
     ).toBeTruthy();
   });
 
-  test("manifest entries support directories, packed files, chunked files, and symlinks", () => {
+  it("manifest entries support directories, packed files, chunked files, and symlinks", () => {
     const entries = [
       { mode: 493, mtime: 1_779_230_000, path: ".turbo", type: "directory" },
       {
@@ -131,7 +131,7 @@ describe("snapshot object graph schemas", () => {
     }
   });
 
-  test("packed manifest files require sha256 to match the pack entry digest", () => {
+  it("packed manifest files require sha256 to match the pack entry digest", () => {
     expect(
       Result.isFailure(
         decodeSnapshotManifestEntry({
@@ -156,7 +156,7 @@ describe("snapshot object graph schemas", () => {
     ).toBeTruthy();
   });
 
-  test("packed manifest files require size to match the pack entry uncompressed size", () => {
+  it("packed manifest files require size to match the pack entry uncompressed size", () => {
     expect(
       Result.isFailure(
         decodeSnapshotManifestEntry({
@@ -181,7 +181,7 @@ describe("snapshot object graph schemas", () => {
     ).toBeTruthy();
   });
 
-  test("manifest schema stores file tree and immutable payload inventory", () => {
+  it("manifest schema stores file tree and immutable payload inventory", () => {
     const manifest = {
       createdAt: "2026-05-20T00:00:00.000Z",
       entries: [
@@ -227,7 +227,7 @@ describe("snapshot object graph schemas", () => {
     );
   });
 
-  test("manifest rejects unsafe paths and mismatched content keys", () => {
+  it("manifest rejects unsafe paths and mismatched content keys", () => {
     for (const unsafePath of [
       ".",
       "./cache",
@@ -307,7 +307,7 @@ describe("snapshot object graph schemas", () => {
     ).toBeTruthy();
   });
 
-  test("Sha256Digest rejects non-canonical digest text", () => {
+  it("Sha256Digest rejects non-canonical digest text", () => {
     expect(Schema.decodeUnknownSync(Sha256Digest)(manifestDigest)).toBe(
       manifestDigest
     );

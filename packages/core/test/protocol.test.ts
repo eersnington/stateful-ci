@@ -1,5 +1,5 @@
+import { describe, expect, it } from "@effect/vitest";
 import { Result, Schema } from "effect";
-import { describe, expect, test } from "vitest";
 
 import {
   CommitSaveRequest,
@@ -15,7 +15,7 @@ import {
   Sha256Digest,
   SnapshotObjectInventoryEntry,
   TrustClass,
-} from "./index";
+} from "../src/index";
 
 const configHash =
   "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -165,13 +165,13 @@ const decodeInventoryEntry = Schema.decodeUnknownResult(
 );
 
 describe("protocol schemas", () => {
-  test("RestoreRequest decodes the PRD restore payload shape", () => {
+  it("RestoreRequest decodes the PRD restore payload shape", () => {
     expect(
       Schema.decodeUnknownSync(RestoreRequest)(restoreRequest)
     ).toStrictEqual(restoreRequest);
   });
 
-  test("RestoreRequest rejects missing protocol version", () => {
+  it("RestoreRequest rejects missing protocol version", () => {
     expect(
       Result.isFailure(
         decodeRestoreRequest({
@@ -182,7 +182,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("RestoreRequest rejects malformed config hashes", () => {
+  it("RestoreRequest rejects malformed config hashes", () => {
     expect(
       Result.isFailure(
         decodeRestoreRequest({
@@ -193,7 +193,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("RestoreRequest rejects missing OIDC identity", () => {
+  it("RestoreRequest rejects missing OIDC identity", () => {
     expect(
       Result.isFailure(
         decodeRestoreRequest({
@@ -204,7 +204,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("RestoreRequest does not decode client-provided trust class as authority", () => {
+  it("RestoreRequest does not decode client-provided trust class as authority", () => {
     expect(
       Schema.decodeUnknownSync(RestoreRequest)({
         ...restoreRequest,
@@ -213,19 +213,19 @@ describe("protocol schemas", () => {
     ).toStrictEqual(restoreRequest);
   });
 
-  test("SaveRequest decodes manifest metadata and complete object inventory", () => {
+  it("SaveRequest decodes manifest metadata and complete object inventory", () => {
     expect(Schema.decodeUnknownSync(SaveRequest)(saveRequest)).toStrictEqual(
       saveRequest
     );
   });
 
-  test("PrepareSaveRequest decodes explicit prepare-save payloads", () => {
+  it("PrepareSaveRequest decodes explicit prepare-save payloads", () => {
     expect(
       Schema.decodeUnknownSync(PrepareSaveRequest)(prepareSaveRequest)
     ).toStrictEqual(prepareSaveRequest);
   });
 
-  test("CommitSaveRequest requires backend-issued workspace and head generation", () => {
+  it("CommitSaveRequest requires backend-issued workspace and head generation", () => {
     expect(
       Schema.decodeUnknownSync(CommitSaveRequest)(commitSaveRequest)
     ).toStrictEqual(commitSaveRequest);
@@ -239,7 +239,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("PrepareSaveResponse carries missing-object upload plans", () => {
+  it("PrepareSaveResponse carries missing-object upload plans", () => {
     expect(
       Schema.decodeUnknownSync(PrepareSaveResponse)({
         baseSnapshotId: "snap_123",
@@ -263,7 +263,7 @@ describe("protocol schemas", () => {
     });
   });
 
-  test("PrepareSaveResponse accepts empty missing-object upload plans", () => {
+  it("PrepareSaveResponse accepts empty missing-object upload plans", () => {
     expect(
       Schema.decodeUnknownSync(PrepareSaveResponse)({
         baseSnapshotId: "snap_123",
@@ -280,7 +280,7 @@ describe("protocol schemas", () => {
     });
   });
 
-  test("RestoreAllowedResponse rejects empty object download plans", () => {
+  it("RestoreAllowedResponse rejects empty object download plans", () => {
     expect(
       Result.isFailure(
         decodeRestoreAllowedResponse({
@@ -300,7 +300,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("CommitSaveResponse covers committed, idempotent, conflict, and denied", () => {
+  it("CommitSaveResponse covers committed, idempotent, conflict, and denied", () => {
     expect(
       Schema.decodeUnknownSync(CommitSaveResponse)({
         decision: "committed",
@@ -332,7 +332,7 @@ describe("protocol schemas", () => {
     ).toBe("denied");
   });
 
-  test("object inventory accepts canonical manifest, pack, and chunk entries", () => {
+  it("object inventory accepts canonical manifest, pack, and chunk entries", () => {
     for (const object of objects) {
       expect(
         Schema.decodeUnknownSync(SnapshotObjectInventoryEntry)(object)
@@ -340,7 +340,7 @@ describe("protocol schemas", () => {
     }
   });
 
-  test("object inventory rejects wrong kind/key pairs", () => {
+  it("object inventory rejects wrong kind/key pairs", () => {
     expect(
       Result.isFailure(
         decodeInventoryEntry({
@@ -353,7 +353,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("object inventory rejects key/digest mismatches", () => {
+  it("object inventory rejects key/digest mismatches", () => {
     expect(
       Result.isFailure(
         decodeInventoryEntry({
@@ -364,7 +364,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("canonical keys reject unsafe or malformed grammar", () => {
+  it("canonical keys reject unsafe or malformed grammar", () => {
     for (const key of [
       "manifests/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json",
       "manifests/snap_124.json",
@@ -378,7 +378,7 @@ describe("protocol schemas", () => {
     }
   });
 
-  test("transfer plans support worker routes and signed URLs", () => {
+  it("transfer plans support worker routes and signed URLs", () => {
     expect(
       Schema.decodeUnknownSync(ObjectTransferPlanEntry)({
         headers: { "x-stateful-ci-object": "pack" },
@@ -399,7 +399,7 @@ describe("protocol schemas", () => {
     ).toBe("signed-url");
   });
 
-  test("SaveRequest rejects malformed manifest digests", () => {
+  it("SaveRequest rejects malformed manifest digests", () => {
     expect(
       Result.isFailure(
         decodeSaveRequest({
@@ -413,7 +413,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("Sha256Digest rejects non-canonical uppercase hex", () => {
+  it("Sha256Digest rejects non-canonical uppercase hex", () => {
     expect(
       Result.isFailure(
         decodeSha256Digest(
@@ -423,13 +423,13 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("TrustClass rejects unknown trust classes", () => {
+  it("TrustClass rejects unknown trust classes", () => {
     expect(
       Result.isFailure(decodeTrustClass("release-candidate"))
     ).toBeTruthy();
   });
 
-  test("PackKey accepts only canonical pack keys", () => {
+  it("PackKey accepts only canonical pack keys", () => {
     expect(Schema.decodeUnknownSync(PackKey)(packKey)).toBe(packKey);
     expect(
       Result.isFailure(
@@ -440,7 +440,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("PrepareSaveRequest rejects empty object inventory", () => {
+  it("PrepareSaveRequest rejects empty object inventory", () => {
     expect(
       Result.isFailure(
         decodePrepareSaveRequest({
@@ -451,7 +451,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("PrepareSaveRequest binds manifest descriptor to object inventory", () => {
+  it("PrepareSaveRequest binds manifest descriptor to object inventory", () => {
     expect(
       Result.isFailure(
         decodePrepareSaveRequest({
@@ -462,7 +462,7 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  test("CommitSaveRequest binds manifest descriptor to object inventory", () => {
+  it("CommitSaveRequest binds manifest descriptor to object inventory", () => {
     expect(
       Result.isFailure(
         decodeCommitSaveRequest({
