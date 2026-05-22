@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
@@ -11,18 +12,18 @@ import {
   clientVersion,
   configFileName,
   defaultConfig,
-  GitContext,
-  GitHubContext,
+  CommitSaveRequest,
+  CommitSaveResponse,
+  IdempotencyKey,
+  PrepareSaveRequest,
+  PrepareSaveResponse,
   protocolVersion,
   RestoreRequest,
   RestoreResponse,
   RunId,
   routes,
-  SaveRequest,
-  SaveResponse,
   SnapshotId,
   StatefulCiConfig,
-  WorkspaceRef,
   WorkspaceId,
   workspacePathsForConfig,
 } from "@stateful-ci/core";
@@ -32,6 +33,7 @@ import { Command } from "effect/unstable/cli";
 
 import {
   createWorkspaceSnapshot,
+  readLocalSnapshotObject,
   restoreWorkspaceSnapshot,
   storeVerifiedSnapshotObject,
 } from "./snapshot-engine";
@@ -64,14 +66,8 @@ interface ApiConfig {
   readonly url: string;
 }
 
-interface PreparedSaveRequest {
-  readonly request: SaveRequest;
-}
-
-interface SnapshotRequestContext {
-  readonly git: RestoreRequest["git"];
-  readonly github: RestoreRequest["github"];
-  readonly workspace: RestoreRequest["workspace"];
+interface PreparedLocalSave {
+  readonly prepareRequest: PrepareSaveRequest;
 }
 
 const restoreSessionFile = ".stateful-ci/restore-session.json";
@@ -216,45 +212,6 @@ const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
       : decoded.value;
   });
 
-const snapshotRequestContextFromEnv = Effect.fn(
-  "snapshotRequestContextFromEnv"
-)(function* snapshotRequestContextFromEnvEffect(env: RuntimeEnv) {
-  const context = {
-    git: {
-      baseRef: optionalEnv(env, "GITHUB_BASE_REF"),
-      headRef: optionalEnv(env, "GITHUB_HEAD_REF"),
-      headRepo: optionalEnv(env, "GITHUB_HEAD_REPOSITORY"),
-      ref: yield* requiredEnv(env, "GITHUB_REF"),
-      sha: yield* requiredEnv(env, "GITHUB_SHA"),
-    },
-    github: {
-      actor: yield* requiredEnv(env, "GITHUB_ACTOR"),
-      event: yield* requiredEnv(env, "GITHUB_EVENT_NAME"),
-      runId: yield* requiredEnv(env, "GITHUB_RUN_ID"),
-    },
-    workspace: {
-      job: yield* requiredEnv(env, "GITHUB_JOB"),
-      repo: yield* requiredEnv(env, "GITHUB_REPOSITORY"),
-      workflow: yield* requiredEnv(env, "GITHUB_WORKFLOW"),
-    },
-  };
-  const decoded = Schema.decodeUnknownExit(
-    Schema.Struct({
-      git: GitContext,
-      github: GitHubContext,
-      workspace: WorkspaceRef,
-    })
-  )(context);
-
-  return Exit.isFailure(decoded)
-    ? yield* Effect.fail(
-        cliFailure(
-          "GitHub environment variables did not produce a valid save snapshot context. Check the Actions runtime context. Workspace was not mutated."
-        )
-      )
-    : (decoded.value satisfies SnapshotRequestContext);
-});
-
 const protocolUrl = (api: ApiConfig, route: string) =>
   new URL(route, api.url.endsWith("/") ? api.url : `${api.url}/`).href;
 
@@ -275,7 +232,7 @@ const writeRestoreSession = Effect.fn("writeRestoreSession")(
       .pipe(
         Effect.mapError(() =>
           cliFailure(
-            "Could not create .stateful-ci to remember backend restore authorization. Save will not run without a backend-issued workspace. Workspace was not mutated."
+            "Could not create .stateful-ci to remember backend restore authorization. Save will not run without a backend-issued workspace."
           )
         )
       );
@@ -287,10 +244,24 @@ const writeRestoreSession = Effect.fn("writeRestoreSession")(
       .pipe(
         Effect.mapError(() =>
           cliFailure(
-            "Could not persist backend restore authorization. Save will not run without a backend-issued workspace. Workspace was not mutated."
+            "Could not persist backend restore authorization. Save will not run without a backend-issued workspace."
           )
         )
       );
+  }
+);
+
+const clearRestoreSession = Effect.fn("clearRestoreSession")(
+  function* clearRestoreSessionEffect(directory: string) {
+    const path = restoreSessionPath(directory);
+
+    yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          `Could not clear stale ${restoreSessionFile}. Remove it manually before retrying restore so stale save authorization cannot be reused.`
+        ),
+      try: () => rm(path, { force: true }),
+    });
   }
 );
 
@@ -414,6 +385,56 @@ const downloadPlannedObject = Effect.fn("downloadPlannedObject")(
   }
 );
 
+const uploadPlannedObject = Effect.fn("uploadPlannedObject")(
+  function* uploadPlannedObjectEffect(
+    api: ApiConfig,
+    plan: ObjectTransferPlanEntry,
+    workspaceRoot: string
+  ) {
+    if (plan.method !== "PUT") {
+      return yield* Effect.fail(
+        cliFailure(
+          `Save upload plan for ${plan.object.key} used ${plan.method}, but save only supports PUT object plans.`
+        )
+      );
+    }
+
+    const bytes = yield* readLocalSnapshotObject({
+      key: plan.object.key,
+      workspaceRoot,
+    }).pipe(
+      Effect.mapError((error) =>
+        cliFailure(`${error.message} Save did not upload or commit objects.`)
+      )
+    );
+    const url =
+      plan.transport === "worker-route"
+        ? protocolUrl(api, plan.route)
+        : plan.url;
+    const headers = new Headers(plan.headers ?? {});
+
+    if (plan.transport === "worker-route") {
+      headers.set("authorization", `Bearer ${api.token}`);
+    }
+
+    const response = yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          `Could not upload backend-requested snapshot object ${plan.object.key}. Save did not commit metadata.`
+        ),
+      try: () => fetch(url, { body: bytes, headers, method: "PUT" }),
+    });
+
+    if (!response.ok) {
+      return yield* Effect.fail(
+        cliFailure(
+          `Backend object upload for ${plan.object.key} returned HTTP ${response.status}. Save did not commit metadata.`
+        )
+      );
+    }
+  }
+);
+
 const decodeProtocolResponse = <A>(
   schema: Schema.Decoder<A>,
   source: string
@@ -431,12 +452,12 @@ const decodeProtocolResponse = <A>(
     : Effect.succeed(decoded.value);
 };
 
-const saveRequestFromRestore = (
-  context: SnapshotRequestContext,
+const prepareSaveRequestFromRestore = (
+  context: RestoreRequest,
   loaded: LoadedConfig,
   session: RestoreSession
 ) =>
-  Effect.gen(function* saveRequestFromRestoreEffect() {
+  Effect.gen(function* prepareSaveRequestFromRestoreEffect() {
     if (session.runId !== context.github.runId) {
       return yield* Effect.fail(
         cliFailure(
@@ -462,21 +483,27 @@ const saveRequestFromRestore = (
       )
     );
     const request = {
-      baseSnapshotId: session.baseSnapshotId,
-      manifest: snapshot.saveManifest,
+      client: context.client,
+      git: context.git,
+      github: context.github,
+      idempotencyKey: Schema.decodeSync(IdempotencyKey)(
+        `run-${context.github.runId}-save`
+      ),
+      identity: context.identity,
+      manifest: snapshot.manifestDescriptor,
+      objects: snapshot.objects,
       protocolVersion,
-      runId: context.github.runId,
-      workspaceId: session.workspaceId,
+      workspace: context.workspace,
     };
-    const decoded = Schema.decodeUnknownExit(SaveRequest)(request);
+    const decoded = Schema.decodeUnknownExit(PrepareSaveRequest)(request);
 
     return Exit.isFailure(decoded)
       ? yield* Effect.fail(
           cliFailure(
-            "The scanned workspace did not produce a valid save request."
+            "The scanned workspace did not produce a valid prepare-save request."
           )
         )
-      : ({ request: decoded.value } satisfies PreparedSaveRequest);
+      : ({ prepareRequest: decoded.value } satisfies PreparedLocalSave);
   });
 
 const printRestoreResponse = (response: RestoreResponse) =>
@@ -488,18 +515,47 @@ const printRestoreResponse = (response: RestoreResponse) =>
         `Restore allowed: snapshot ${response.snapshot.id} (${response.trustClass}).`
       );
 
-const printSaveResponse = (response: SaveResponse) =>
-  response.decision === "denied"
-    ? Console.log(`Save denied: ${response.reason}.`)
-    : Console.log(
-        `Save committed: snapshot ${response.snapshotId} for workspace ${response.workspaceId}. Latest: ${response.latest ? "yes" : "no"}.`
+const printSaveResponse = (
+  response: CommitSaveResponse | PrepareSaveResponse
+) => {
+  switch (response.decision) {
+    case "denied": {
+      return Console.log(`Save denied: ${response.reason}.`);
+    }
+    case "conflict": {
+      return Console.log(
+        `Save conflicted: expected head changed to generation ${response.actualHeadGeneration}.`
       );
+    }
+    case "idempotent": {
+      return Console.log(
+        `Save already committed: snapshot ${response.snapshotId} for workspace ${response.workspaceId}. Head generation: ${response.headGeneration}.`
+      );
+    }
+    case "allowed": {
+      return Console.log(
+        `Save prepared: ${response.missingObjects.length} object(s) need upload.`
+      );
+    }
+    case "committed": {
+      return Console.log(
+        `Save committed: snapshot ${response.snapshotId} for workspace ${response.workspaceId}. Head generation: ${response.headGeneration}.`
+      );
+    }
+    default: {
+      return Console.log("Save response did not match a known decision.");
+    }
+  }
+};
 
 const restoreProgramEffect = Effect.fn("restoreProgram")(
   function* restoreProgramEffect(env: RuntimeEnv) {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
     const request = yield* restoreRequestFromEnv(env, loaded);
+
+    yield* clearRestoreSession(process.cwd());
+
     const responseText = yield* postProtocol(
       api,
       routes.restore.path,
@@ -523,12 +579,6 @@ const restoreProgramEffect = Effect.fn("restoreProgram")(
         yield* downloadPlannedObject(api, plan, process.cwd());
       }
 
-      yield* writeRestoreSession(process.cwd(), {
-        baseSnapshotId: response.snapshot.id,
-        runId: Schema.decodeSync(RunId)(request.github.runId),
-        workspaceId: response.workspaceId,
-      });
-
       yield* restoreWorkspaceSnapshot({
         manifest: response.manifest,
         workspaceRoot: process.cwd(),
@@ -537,6 +587,12 @@ const restoreProgramEffect = Effect.fn("restoreProgram")(
           cliFailure(`${error.message} Restore did not mutate the workspace.`)
         )
       );
+
+      yield* writeRestoreSession(process.cwd(), {
+        baseSnapshotId: response.snapshot.id,
+        runId: Schema.decodeSync(RunId)(request.github.runId),
+        workspaceId: response.workspaceId,
+      });
     } else if (response.save.allowed && response.workspaceId !== undefined) {
       yield* writeRestoreSession(process.cwd(), {
         baseSnapshotId: null,
@@ -556,17 +612,67 @@ export const saveProgram = (env: RuntimeEnv) =>
   Effect.gen(function* saveProgramEffect() {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const context = yield* snapshotRequestContextFromEnv(env);
+    const context = yield* restoreRequestFromEnv(env, loaded);
     const session = yield* readRestoreSession(process.cwd());
-    const prepared = yield* saveRequestFromRestore(context, loaded, session);
-    const responseText = yield* postProtocol(
+    const prepared = yield* prepareSaveRequestFromRestore(
+      context,
+      loaded,
+      session
+    );
+    const prepareResponseText = yield* postProtocol(
       api,
-      routes.save.path,
-      Schema.encodeUnknownSync(Schema.fromJsonString(SaveRequest))(
-        prepared.request
+      routes.prepareSave.path,
+      Schema.encodeUnknownSync(Schema.fromJsonString(PrepareSaveRequest))(
+        prepared.prepareRequest
       )
     );
-    const response = yield* decodeProtocolResponse(SaveResponse, responseText);
+    const prepareResponse = yield* decodeProtocolResponse(
+      PrepareSaveResponse,
+      prepareResponseText
+    );
+
+    if (prepareResponse.decision === "denied") {
+      yield* printSaveResponse(prepareResponse);
+      return;
+    }
+
+    for (const plan of prepareResponse.missingObjects) {
+      yield* uploadPlannedObject(api, plan, process.cwd());
+    }
+
+    const commitRequest = {
+      baseSnapshotId: prepareResponse.baseSnapshotId,
+      expectedHeadGeneration: prepareResponse.expectedHeadGeneration,
+      idempotencyKey: prepared.prepareRequest.idempotencyKey,
+      manifest: prepared.prepareRequest.manifest,
+      objects: prepared.prepareRequest.objects,
+      protocolVersion,
+      runId: context.github.runId,
+      target: prepareResponse.commitTarget,
+      workspaceId: prepareResponse.workspaceId,
+    };
+    const decodedCommitRequest =
+      Schema.decodeUnknownExit(CommitSaveRequest)(commitRequest);
+
+    if (Exit.isFailure(decodedCommitRequest)) {
+      return yield* Effect.fail(
+        cliFailure(
+          "The scanned workspace and backend prepare response did not produce a valid commit-save request."
+        )
+      );
+    }
+
+    const commitResponseText = yield* postProtocol(
+      api,
+      routes.commitSave.path,
+      Schema.encodeUnknownSync(Schema.fromJsonString(CommitSaveRequest))(
+        decodedCommitRequest.value
+      )
+    );
+    const response = yield* decodeProtocolResponse(
+      CommitSaveResponse,
+      commitResponseText
+    );
 
     yield* printSaveResponse(response);
   }).pipe(Effect.catchTag("CliFailure", failCliFailure));

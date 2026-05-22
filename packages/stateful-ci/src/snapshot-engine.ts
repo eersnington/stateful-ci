@@ -374,6 +374,15 @@ const readLocalObject = (workspaceRoot: string, key: string) =>
       new Uint8Array(await readFile(localObjectPath(workspaceRoot, key))),
   });
 
+export const readLocalSnapshotObject = Effect.fn("readLocalSnapshotObject")(
+  function* readLocalSnapshotObjectEffect(input: {
+    readonly key: string;
+    readonly workspaceRoot: string;
+  }) {
+    return yield* readLocalObject(input.workspaceRoot, input.key);
+  }
+);
+
 const verifyObjectBytes = (
   key: string,
   expectedDigest: Sha256Digest,

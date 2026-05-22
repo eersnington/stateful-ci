@@ -25,6 +25,7 @@ import { DenialReason, TrustClass } from "./trust";
 import { WorkspaceRef } from "./workspace";
 
 export const protocolVersion = 1 as const;
+export const objectRoutePrefix = "/v1/objects/" as const;
 
 export const HealthResponse = Schema.Struct({
   protocolVersion: Schema.Literal(protocolVersion),
@@ -67,7 +68,17 @@ export const WorkerRouteTransferPlanEntry = Schema.Struct({
   ...TransferPlanBase,
   route: Schema.String.check(Schema.isMinLength(1)),
   transport: Schema.Literal("worker-route"),
-});
+}).check(
+  Schema.makeFilter((entry) =>
+    entry.route === `${objectRoutePrefix}${entry.object.key}`
+      ? undefined
+      : {
+          issue:
+            "worker-route transfer plans must target the canonical object route for their object",
+          path: ["route"],
+        }
+  )
+);
 export type WorkerRouteTransferPlanEntry = Schema.Schema.Type<
   typeof WorkerRouteTransferPlanEntry
 >;
@@ -299,6 +310,7 @@ export type CommitSaveResponse = Schema.Schema.Type<typeof CommitSaveResponse>;
 export const routes = {
   commitSave: { method: "POST", path: "/v1/save/commit" },
   health: { method: "GET", path: "/health" },
+  objects: { pathPrefix: objectRoutePrefix },
   prepareSave: { method: "POST", path: "/v1/save/prepare" },
   restore: { method: "POST", path: "/v1/restore" },
   save: { method: "POST", path: "/v1/save" },
