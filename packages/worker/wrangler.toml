@@ -1,0 +1,24 @@
+name = "stateful-ci-worker"
+main = "src/index.ts"
+compatibility_date = "2026-05-22"
+
+[vars]
+STATEFUL_CI_API_TOKEN = "test-token"
+
+[[d1_databases]]
+binding = "STATEFUL_CI_METADATA"
+database_name = "stateful-ci-metadata-test"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "STATEFUL_CI_OBJECTS"
+bucket_name = "stateful-ci-objects-test"
+
+[[durable_objects.bindings]]
+name = "STATEFUL_CI_COORDINATORS"
+class_name = "WorkspaceSnapshotCoordinatorDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkspaceSnapshotCoordinatorDurableObject"]

@@ -9,7 +9,9 @@
   "scripts": {
     "build": "tsc --noEmit",
     "dev": "wrangler dev src/index.ts",
-    "test": "vitest run",
+    "test": "bun run test:node && bun run test:cloudflare",
+    "test:cloudflare": "vitest run --config vitest.cloudflare.config.ts",
+    "test:node": "vitest run --exclude '**/*.cloudflare.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -17,6 +19,7 @@
     "effect": "catalog:"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "latest",
     "@cloudflare/workers-types": "latest",
     "@effect/vitest": "catalog:",
     "wrangler": "latest"

@@ -6,6 +6,7 @@ import type {
   ManifestDescriptor,
   RunId,
   SnapshotId,
+  SnapshotObjectInventory,
   SnapshotObjectInventoryEntry,
   TrustClass,
   WorkspaceId,
@@ -92,7 +93,7 @@ export interface CommitSaveInput {
   readonly expectedHeadGeneration: HeadGeneration;
   readonly idempotencyKey: IdempotencyKey;
   readonly manifest: ManifestDescriptor;
-  readonly objects: readonly SnapshotObjectInventoryEntry[];
+  readonly objects: SnapshotObjectInventory;
   readonly producer: ProducerContext;
   readonly target: RefTarget;
   readonly workspaceId: WorkspaceId;
@@ -496,6 +497,16 @@ export const createMetadataSnapshotCoordinator =
             }
           }
 
+          const existingSnapshot = yield* metadata.getSnapshotHeader(
+            input.manifest.snapshotId
+          );
+          if (existingSnapshot !== null) {
+            return Schema.decodeSync(CommitSaveDeniedResponse)({
+              decision: "denied",
+              reason: "invalid_protocol_payload",
+            });
+          }
+
           const createdAt = yield* currentIsoTimestamp;
           const producer = producerFromTarget(target, input.producer);
           const header = snapshotHeaderForCommit(
@@ -503,6 +514,46 @@ export const createMetadataSnapshotCoordinator =
             target.trustClass,
             createdAt
           );
+
+          const committed = Schema.decodeSync(CommitSaveCommittedResponse)({
+            decision: "committed",
+            headGeneration: Schema.decodeSync(HeadGenerationSchema)(
+              input.expectedHeadGeneration + 1
+            ),
+            snapshotId: input.manifest.snapshotId,
+            workspaceId: input.workspaceId,
+          });
+
+          const idempotencyClaimed = yield* metadata.rememberIdempotentCommit({
+            createdAt,
+            headGeneration: committed.headGeneration,
+            idempotencyKey: input.idempotencyKey,
+            latest: true,
+            manifestDigest: input.manifest.digest,
+            result: committed,
+            runId: input.producer.runId,
+            snapshotId: input.manifest.snapshotId,
+            workspaceId: input.workspaceId,
+          });
+
+          if (!idempotencyClaimed) {
+            const reserved = yield* metadata.getIdempotentCommit(
+              input.idempotencyKey
+            );
+            if (reserved !== null && idempotencyMatches(reserved, input)) {
+              return Schema.decodeSync(CommitSaveIdempotentResponse)({
+                decision: "idempotent",
+                headGeneration: reserved.headGeneration,
+                snapshotId: reserved.snapshotId,
+                workspaceId: reserved.workspaceId,
+              });
+            }
+
+            return Schema.decodeSync(CommitSaveDeniedResponse)({
+              decision: "denied",
+              reason: "idempotency_conflict",
+            });
+          }
 
           yield* metadata.putSnapshotHeader(header);
           yield* metadata.putSnapshotObjects(
@@ -534,24 +585,6 @@ export const createMetadataSnapshotCoordinator =
             });
           }
 
-          const committed = Schema.decodeSync(CommitSaveCommittedResponse)({
-            decision: "committed",
-            headGeneration: advanced.generation,
-            snapshotId: input.manifest.snapshotId,
-            workspaceId: input.workspaceId,
-          });
-
-          yield* metadata.rememberIdempotentCommit({
-            createdAt,
-            headGeneration: advanced.generation,
-            idempotencyKey: input.idempotencyKey,
-            latest: true,
-            manifestDigest: input.manifest.digest,
-            result: committed,
-            runId: input.producer.runId,
-            snapshotId: input.manifest.snapshotId,
-            workspaceId: input.workspaceId,
-          });
           yield* metadata.appendAuditEvent({
             ...target,
             createdAt,

@@ -1,5 +1,18 @@
-import type { CommitSaveResponse } from "@stateful-ci/core";
-import { Effect } from "effect";
+import {
+  CommitSaveResponse as CommitSaveResponseSchema,
+  DenialReason,
+  HeadGeneration,
+  IdempotencyKey,
+  ManifestKey,
+  ManifestDescriptor,
+  RunId,
+  Sha256Digest,
+  SnapshotId,
+  SnapshotObjectInventory,
+  TrustClass,
+  WorkspaceId,
+} from "@stateful-ci/core";
+import { Effect, Schema } from "effect";
 
 import { createD1MetadataBackend, MetadataBackend } from "./metadata";
 import { MetadataBackendError } from "./metadata-backend-error";
@@ -7,37 +20,114 @@ import {
   createMetadataSnapshotCoordinator,
   SnapshotCoordinator,
 } from "./snapshot-coordinator";
-import type {
-  AuthorizeRestoreInput,
-  CommitSaveInput,
-  PrepareSaveCoordinatorResult,
-  PrepareSaveInput,
-  RestoreCoordinatorResult,
-} from "./snapshot-coordinator";
 
 interface DurableObjectEnv {
   readonly STATEFUL_CI_METADATA: D1Database;
 }
 
-type CoordinatorRequest =
-  | {
-      readonly action: "authorizeRestore";
-      readonly input: AuthorizeRestoreInput;
-    }
-  | { readonly action: "commitSave"; readonly input: CommitSaveInput }
-  | { readonly action: "prepareSave"; readonly input: PrepareSaveInput }
-  | {
-      readonly action: "recordRestoreAllowed";
-      readonly input: Parameters<
-        SnapshotCoordinator["Service"]["recordRestoreAllowed"]
-      >[0];
-    }
-  | {
-      readonly action: "recordRestoreObjectDenial";
-      readonly input: Parameters<
-        SnapshotCoordinator["Service"]["recordRestoreObjectDenial"]
-      >[0];
-    };
+const RefTargetSchema = Schema.Struct({
+  namespace: Schema.String.check(Schema.isMinLength(1)),
+  refName: Schema.String.check(Schema.isMinLength(1)),
+});
+
+const ProducerContextSchema = Schema.Struct({
+  actor: Schema.String,
+  event: Schema.String,
+  job: Schema.String,
+  ref: Schema.String,
+  repository: Schema.String,
+  runId: RunId,
+  sha: Schema.String,
+  workflow: Schema.String,
+});
+
+const AuthorizeRestoreInputSchema = Schema.Struct({
+  candidates: Schema.Array(RefTargetSchema),
+  runId: RunId,
+  target: RefTargetSchema,
+  trustClass: TrustClass,
+  workspaceId: WorkspaceId,
+});
+
+const PrepareSaveInputSchema = Schema.Struct({
+  expiresAt: Schema.String.check(Schema.isMinLength(1)),
+  producer: ProducerContextSchema,
+  runId: RunId,
+  target: RefTargetSchema,
+  trustClass: TrustClass,
+  workspaceId: WorkspaceId,
+});
+
+const CommitSaveInputSchema = Schema.Struct({
+  baseSnapshotId: Schema.NullOr(SnapshotId),
+  expectedHeadGeneration: HeadGeneration,
+  idempotencyKey: IdempotencyKey,
+  manifest: ManifestDescriptor,
+  objects: SnapshotObjectInventory,
+  producer: ProducerContextSchema,
+  target: RefTargetSchema,
+  workspaceId: WorkspaceId,
+});
+
+const RestoreAuditInputSchema = Schema.Struct({
+  runId: RunId,
+  snapshotId: SnapshotId,
+  target: RefTargetSchema,
+  trustClass: TrustClass,
+  workspaceId: WorkspaceId,
+});
+
+const RestoreObjectDenialInputSchema = Schema.Struct({
+  reason: DenialReason,
+  runId: RunId,
+  snapshotId: SnapshotId,
+  target: RefTargetSchema,
+  trustClass: TrustClass,
+  workspaceId: WorkspaceId,
+});
+
+const CoordinatorRequestSchema = Schema.Union([
+  Schema.Struct({
+    action: Schema.Literal("authorizeRestore"),
+    input: AuthorizeRestoreInputSchema,
+  }),
+  Schema.Struct({
+    action: Schema.Literal("commitSave"),
+    input: CommitSaveInputSchema,
+  }),
+  Schema.Struct({
+    action: Schema.Literal("prepareSave"),
+    input: PrepareSaveInputSchema,
+  }),
+  Schema.Struct({
+    action: Schema.Literal("recordRestoreAllowed"),
+    input: RestoreAuditInputSchema,
+  }),
+  Schema.Struct({
+    action: Schema.Literal("recordRestoreObjectDenial"),
+    input: RestoreObjectDenialInputSchema,
+  }),
+]);
+
+type CoordinatorRequest = Schema.Schema.Type<typeof CoordinatorRequestSchema>;
+
+interface CoordinatorRequestError {
+  readonly _tag: "CoordinatorRequestError";
+  readonly cause: unknown;
+  readonly message: string;
+  readonly operation: string;
+}
+
+const coordinatorRequestError = (
+  operation: string,
+  cause: unknown
+): CoordinatorRequestError => ({
+  _tag: "CoordinatorRequestError",
+  cause,
+  message:
+    "Invalid coordinator request payload. The Durable Object did not run snapshot coordination; check the internal RPC caller and schema version before retrying.",
+  operation,
+});
 
 const coordinatorError = (operation: string, cause: unknown) =>
   new MetadataBackendError({
@@ -46,38 +136,106 @@ const coordinatorError = (operation: string, cause: unknown) =>
     operation,
   });
 
-const isCoordinatorRequest = (value: unknown): value is CoordinatorRequest =>
-  typeof value === "object" &&
-  value !== null &&
-  "action" in value &&
-  "input" in value &&
-  (value.action === "authorizeRestore" ||
-    value.action === "commitSave" ||
-    value.action === "prepareSave" ||
-    value.action === "recordRestoreAllowed" ||
-    value.action === "recordRestoreObjectDenial");
-
 const readCoordinatorRequest = (request: Request) =>
   Effect.tryPromise({
-    catch: (cause) => coordinatorError("readCoordinatorRequest", cause),
-    try: async () => {
-      const body = await request.json();
+    catch: (cause) => coordinatorRequestError("readCoordinatorRequest", cause),
+    try: () => request.json(),
+  }).pipe(
+    Effect.flatMap((body) =>
+      Effect.try({
+        catch: (cause) =>
+          coordinatorRequestError("decodeCoordinatorRequest", cause),
+        try: () => Schema.decodeUnknownSync(CoordinatorRequestSchema)(body),
+      })
+    )
+  );
 
-      if (!isCoordinatorRequest(body)) {
-        throw new Error("Invalid coordinator request payload.");
-      }
+const decodeCoordinatorBody =
+  <S extends Schema.Decoder<unknown>>(schema: S) =>
+  (body: unknown) =>
+    Schema.decodeUnknownSync(schema)(body);
 
-      return body;
-    },
-  });
+const VoidResponseSchema = Schema.Struct({ ok: Schema.Literal(true) });
+
+const RestoreCoordinatorResultSchema = Schema.Union([
+  Schema.Struct({
+    decision: Schema.Literal("allowed"),
+    manifest: ManifestDescriptor,
+    objects: SnapshotObjectInventory,
+    saveTarget: Schema.NullOr(RefTargetSchema),
+    snapshot: Schema.Struct({
+      createdAt: Schema.String,
+      manifestDigest: Sha256Digest,
+      manifestKey: ManifestKey,
+      manifestSize: Schema.Number,
+      namespace: Schema.String,
+      parentSnapshotId: Schema.NullOr(SnapshotId),
+      producerActor: Schema.String,
+      producerEvent: Schema.String,
+      producerJob: Schema.String,
+      producerRef: Schema.String,
+      producerRepository: Schema.String,
+      producerRunId: RunId,
+      producerSha: Schema.String,
+      producerWorkflow: Schema.String,
+      safetyJson: Schema.String,
+      snapshotId: SnapshotId,
+      statsJson: Schema.String,
+      trustClass: TrustClass,
+      workspaceId: WorkspaceId,
+    }),
+  }),
+  Schema.Struct({
+    decision: Schema.Literal("denied"),
+    reason: RestoreObjectDenialInputSchema.fields.reason,
+    saveTarget: Schema.NullOr(RefTargetSchema),
+    snapshotId: Schema.NullOr(SnapshotId),
+  }),
+]);
+
+const PrepareSaveCoordinatorResultSchema = Schema.Union([
+  Schema.Struct({
+    baseSnapshotId: Schema.NullOr(SnapshotId),
+    decision: Schema.Literal("allowed"),
+    expectedHeadGeneration: HeadGeneration,
+  }),
+  Schema.Struct({
+    decision: Schema.Literal("denied"),
+    reason: RestoreObjectDenialInputSchema.fields.reason,
+  }),
+]);
 
 const jsonResponse = (value: unknown) => Response.json(value);
 
 export class WorkspaceSnapshotCoordinatorDurableObject {
   readonly #env: DurableObjectEnv;
+  #queue = Promise.resolve();
 
   constructor(_state: DurableObjectState, env: DurableObjectEnv) {
     this.#env = env;
+  }
+
+  async #serialized<A>(operation: () => Promise<A>): Promise<A> {
+    const previous = this.#queue;
+
+    const result = (async () => {
+      try {
+        await previous;
+      } catch {
+        // Keep later requests moving even if an earlier serialized action failed.
+      }
+
+      return await operation();
+    })();
+    this.#queue = (async () => {
+      try {
+        await result;
+      } catch {
+        // Keep the queue settled so future operations can continue.
+      }
+    })();
+
+    return await result;
   }
 
   fetch(request: Request): Promise<Response> {
@@ -96,40 +254,47 @@ export class WorkspaceSnapshotCoordinatorDurableObject {
     const metadata = createD1MetadataBackend(this.#env.STATEFUL_CI_METADATA);
     const coordinator = createMetadataSnapshotCoordinator();
 
-    return Effect.runPromise(
-      Effect.gen(function* coordinatorFetchEffect() {
-        const message = yield* readCoordinatorRequest(request);
+    return this.#serialized(() =>
+      Effect.runPromise(
+        Effect.gen(function* coordinatorFetchEffect() {
+          const message = yield* readCoordinatorRequest(request);
 
-        switch (message.action) {
-          case "authorizeRestore": {
-            return jsonResponse(
-              yield* coordinator.authorizeRestore(message.input)
-            );
+          switch (message.action) {
+            case "authorizeRestore": {
+              return jsonResponse(
+                yield* coordinator.authorizeRestore(message.input)
+              );
+            }
+            case "commitSave": {
+              return jsonResponse(yield* coordinator.commitSave(message.input));
+            }
+            case "prepareSave": {
+              return jsonResponse(
+                yield* coordinator.prepareSave(message.input)
+              );
+            }
+            case "recordRestoreAllowed": {
+              yield* coordinator.recordRestoreAllowed(message.input);
+              return jsonResponse({ ok: true });
+            }
+            case "recordRestoreObjectDenial": {
+              yield* coordinator.recordRestoreObjectDenial(message.input);
+              return jsonResponse({ ok: true });
+            }
+            default: {
+              return jsonResponse({ message: "Unknown coordinator action." });
+            }
           }
-          case "commitSave": {
-            return jsonResponse(yield* coordinator.commitSave(message.input));
-          }
-          case "prepareSave": {
-            return jsonResponse(yield* coordinator.prepareSave(message.input));
-          }
-          case "recordRestoreAllowed": {
-            yield* coordinator.recordRestoreAllowed(message.input);
-            return jsonResponse({ ok: true });
-          }
-          case "recordRestoreObjectDenial": {
-            yield* coordinator.recordRestoreObjectDenial(message.input);
-            return jsonResponse({ ok: true });
-          }
-          default: {
-            return jsonResponse({ message: "Unknown coordinator action." });
-          }
-        }
-      }).pipe(
-        Effect.provideService(MetadataBackend, metadata),
-        Effect.match({
-          onFailure: (error) => Response.json(error, { status: 500 }),
-          onSuccess: (response) => response,
-        })
+        }).pipe(
+          Effect.provideService(MetadataBackend, metadata),
+          Effect.match({
+            onFailure: (error) =>
+              error._tag === "CoordinatorRequestError"
+                ? Response.json(error, { status: 400 })
+                : Response.json(error, { status: 500 }),
+            onSuccess: (response) => response,
+          })
+        )
       )
     );
   }
@@ -162,8 +327,6 @@ const callCoordinator = <A>(
     },
   });
 
-const decodeCoordinatorResponse = <A>(body: unknown) => body as A;
-
 export const createDurableObjectSnapshotCoordinator = (
   namespace: DurableObjectNamespace
 ): SnapshotCoordinator["Service"] =>
@@ -173,34 +336,38 @@ export const createDurableObjectSnapshotCoordinator = (
         namespace,
         input.target,
         { action: "authorizeRestore", input },
-        (body) => decodeCoordinatorResponse<RestoreCoordinatorResult>(body)
+        decodeCoordinatorBody(RestoreCoordinatorResultSchema)
       ),
     commitSave: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "commitSave", input },
-        (body) => decodeCoordinatorResponse<CommitSaveResponse>(body)
+        decodeCoordinatorBody(CommitSaveResponseSchema)
       ),
     prepareSave: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "prepareSave", input },
-        (body) => decodeCoordinatorResponse<PrepareSaveCoordinatorResult>(body)
+        decodeCoordinatorBody(PrepareSaveCoordinatorResultSchema)
       ),
     recordRestoreAllowed: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "recordRestoreAllowed", input },
-        () => void 0
+        (body) => {
+          decodeCoordinatorBody(VoidResponseSchema)(body);
+        }
       ),
     recordRestoreObjectDenial: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "recordRestoreObjectDenial", input },
-        () => void 0
+        (body) => {
+          decodeCoordinatorBody(VoidResponseSchema)(body);
+        }
       ),
   });

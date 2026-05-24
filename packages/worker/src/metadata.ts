@@ -10,6 +10,8 @@ import type {
   WorkspaceId,
 } from "@stateful-ci/core";
 import {
+  CommitSaveResponse as CommitSaveResponseSchema,
+  DenialReason as DenialReasonSchema,
   HeadGeneration,
   IdempotencyKey as IdempotencyKeySchema,
   ManifestKey,
@@ -75,6 +77,18 @@ export interface SnapshotObjectRow {
 
 export type AuditDecision = "allowed" | "committed" | "denied" | "idempotent";
 export type AuditEventType = "commit" | "prepare-save" | "restore";
+
+const AuditDecisionSchema = Schema.Literals([
+  "allowed",
+  "committed",
+  "denied",
+  "idempotent",
+]);
+const AuditEventTypeSchema = Schema.Literals([
+  "commit",
+  "prepare-save",
+  "restore",
+]);
 
 export interface AuditEvent extends RefTarget {
   readonly createdAt: string;
@@ -176,7 +190,7 @@ export class MetadataBackend extends Context.Service<
     ) => Effect.Effect<void, MetadataBackendError>;
     readonly rememberIdempotentCommit: (
       commit: IdempotentCommit
-    ) => Effect.Effect<void, MetadataBackendError>;
+    ) => Effect.Effect<boolean, MetadataBackendError>;
     readonly rememberWorkspaceTarget: (
       target: WorkspaceTarget
     ) => Effect.Effect<void, MetadataBackendError>;
@@ -315,11 +329,31 @@ export const createInMemoryMetadataBackend = (
         auditEvents.filter((event) => auditMatchesQuery(event, query))
       ),
     putSnapshotHeader: (header) =>
-      Effect.sync(() => {
+      Effect.gen(function* putSnapshotHeaderInMemoryEffect() {
+        if (snapshots.has(header.snapshotId)) {
+          return yield* Effect.fail(
+            new MetadataBackendError({
+              message:
+                "In-memory metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+              operation: "putSnapshotHeader",
+            })
+          );
+        }
+
         snapshots.set(header.snapshotId, header);
       }),
     putSnapshotObjects: (snapshotId, objects) =>
-      Effect.sync(() => {
+      Effect.gen(function* putSnapshotObjectsInMemoryEffect() {
+        if ((snapshotObjects.get(snapshotId)?.length ?? 0) > 0) {
+          return yield* Effect.fail(
+            new MetadataBackendError({
+              message:
+                "In-memory metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
+              operation: "putSnapshotObjects",
+            })
+          );
+        }
+
         snapshotObjects.set(
           snapshotId,
           snapshotRowsFromInventory(snapshotId, objects)
@@ -327,7 +361,12 @@ export const createInMemoryMetadataBackend = (
       }),
     rememberIdempotentCommit: (commit) =>
       Effect.sync(() => {
+        if (idempotentCommits.has(commit.idempotencyKey)) {
+          return false;
+        }
+
         idempotentCommits.set(commit.idempotencyKey, commit);
+        return true;
       }),
     rememberWorkspaceTarget: (target) =>
       Effect.sync(() => {
@@ -388,6 +427,16 @@ const nullableStringColumn = (row: Record<string, unknown>, column: string) => {
   return typeof value === "string" ? value : null;
 };
 
+const nullableDecodedColumn = <S extends Schema.Decoder<unknown>>(
+  schema: S,
+  row: Record<string, unknown>,
+  column: string
+) => {
+  const value = nullableStringColumn(row, column);
+
+  return value === null ? null : Schema.decodeUnknownSync(schema)(value);
+};
+
 const refFromRow = (row: Record<string, unknown>): RefRow => ({
   generation: Schema.decodeSync(HeadGeneration)(
     numberColumn(row, "generation")
@@ -402,12 +451,7 @@ const refFromRow = (row: Record<string, unknown>): RefRow => ({
   ),
   updatedAt: stringColumn(row, "updated_at"),
   updatedByActor: nullableStringColumn(row, "updated_by_actor"),
-  updatedByRunId:
-    nullableStringColumn(row, "updated_by_run_id") === null
-      ? null
-      : Schema.decodeUnknownSync(RunIdSchema)(
-          stringColumn(row, "updated_by_run_id")
-        ),
+  updatedByRunId: nullableDecodedColumn(RunIdSchema, row, "updated_by_run_id"),
 });
 
 const snapshotFromRow = (row: Record<string, unknown>): SnapshotHeader => ({
@@ -420,12 +464,11 @@ const snapshotFromRow = (row: Record<string, unknown>): SnapshotHeader => ({
   ),
   manifestSize: numberColumn(row, "manifest_size"),
   namespace: stringColumn(row, "namespace"),
-  parentSnapshotId:
-    nullableStringColumn(row, "parent_snapshot_id") === null
-      ? null
-      : Schema.decodeUnknownSync(SnapshotIdSchema)(
-          stringColumn(row, "parent_snapshot_id")
-        ),
+  parentSnapshotId: nullableDecodedColumn(
+    SnapshotIdSchema,
+    row,
+    "parent_snapshot_id"
+  ),
   producerActor: stringColumn(row, "producer_actor"),
   producerEvent: stringColumn(row, "producer_event"),
   producerJob: stringColumn(row, "producer_job"),
@@ -606,9 +649,9 @@ export const createD1MetadataBackend = (
           manifestDigest: Schema.decodeSync(Sha256Digest)(
             stringColumn(row, "manifest_digest")
           ),
-          result: JSON.parse(
-            stringColumn(row, "result_json")
-          ) as CommitSaveResponse,
+          result: Schema.decodeUnknownSync(CommitSaveResponseSchema)(
+            JSON.parse(stringColumn(row, "result_json")) as unknown
+          ),
           runId: Schema.decodeUnknownSync(RunIdSchema)(
             stringColumn(row, "run_id")
           ),
@@ -680,40 +723,37 @@ export const createD1MetadataBackend = (
             .map(
               (row): AuditEvent => ({
                 createdAt: stringColumn(row, "created_at"),
-                decision: stringColumn(row, "decision") as AuditDecision,
-                eventType: stringColumn(row, "event_type") as AuditEventType,
+                decision: Schema.decodeUnknownSync(AuditDecisionSchema)(
+                  stringColumn(row, "decision")
+                ),
+                eventType: Schema.decodeUnknownSync(AuditEventTypeSchema)(
+                  stringColumn(row, "event_type")
+                ),
                 id: stringColumn(row, "id"),
                 namespace: stringColumn(row, "namespace"),
                 payloadJson: nullableStringColumn(row, "payload_json"),
-                reason: nullableStringColumn(
+                reason: nullableDecodedColumn(
+                  DenialReasonSchema,
                   row,
                   "reason"
-                ) as DenialReason | null,
+                ),
                 refName: stringColumn(row, "ref_name"),
-                runId:
-                  nullableStringColumn(row, "run_id") === null
-                    ? null
-                    : Schema.decodeUnknownSync(RunIdSchema)(
-                        stringColumn(row, "run_id")
-                      ),
-                snapshotId:
-                  nullableStringColumn(row, "snapshot_id") === null
-                    ? null
-                    : Schema.decodeUnknownSync(SnapshotIdSchema)(
-                        stringColumn(row, "snapshot_id")
-                      ),
-                trustClass:
-                  nullableStringColumn(row, "trust_class") === null
-                    ? null
-                    : Schema.decodeUnknownSync(TrustClassSchema)(
-                        stringColumn(row, "trust_class")
-                      ),
-                workspaceId:
-                  nullableStringColumn(row, "workspace_id") === null
-                    ? null
-                    : Schema.decodeUnknownSync(WorkspaceIdSchema)(
-                        stringColumn(row, "workspace_id")
-                      ),
+                runId: nullableDecodedColumn(RunIdSchema, row, "run_id"),
+                snapshotId: nullableDecodedColumn(
+                  SnapshotIdSchema,
+                  row,
+                  "snapshot_id"
+                ),
+                trustClass: nullableDecodedColumn(
+                  TrustClassSchema,
+                  row,
+                  "trust_class"
+                ),
+                workspaceId: nullableDecodedColumn(
+                  WorkspaceIdSchema,
+                  row,
+                  "workspace_id"
+                ),
               })
             )
             .filter((event) => auditMatchesQuery(event, query));
@@ -723,7 +763,7 @@ export const createD1MetadataBackend = (
       runStatement(
         db
           .prepare(
-            "insert or ignore into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "insert into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           )
           .bind(
             header.snapshotId,
@@ -755,7 +795,7 @@ export const createD1MetadataBackend = (
           runStatement(
             db
               .prepare(
-                "insert or ignore into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
+                "insert into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
               )
               .bind(
                 snapshotId,
@@ -769,23 +809,26 @@ export const createD1MetadataBackend = (
         { discard: true }
       ),
     rememberIdempotentCommit: (commit) =>
-      runStatement(
-        db
-          .prepare(
-            "insert or ignore into idempotent_commits (idempotency_key, workspace_id, run_id, snapshot_id, manifest_digest, head_generation, latest, result_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          )
-          .bind(
-            commit.idempotencyKey,
-            commit.workspaceId,
-            commit.runId,
-            commit.snapshotId,
-            commit.manifestDigest,
-            commit.headGeneration,
-            commit.latest ? 1 : 0,
-            JSON.stringify(commit.result),
-            commit.createdAt
-          ),
-        "rememberIdempotentCommit"
+      Effect.map(
+        runStatement(
+          db
+            .prepare(
+              "insert or ignore into idempotent_commits (idempotency_key, workspace_id, run_id, snapshot_id, manifest_digest, head_generation, latest, result_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(
+              commit.idempotencyKey,
+              commit.workspaceId,
+              commit.runId,
+              commit.snapshotId,
+              commit.manifestDigest,
+              commit.headGeneration,
+              commit.latest ? 1 : 0,
+              JSON.stringify(commit.result),
+              commit.createdAt
+            ),
+          "rememberIdempotentCommit"
+        ),
+        (result) => changedRows(result) > 0
       ),
     rememberWorkspaceTarget: (target) =>
       runStatement(
