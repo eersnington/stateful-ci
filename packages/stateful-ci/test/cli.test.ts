@@ -5,10 +5,13 @@ import { NodeServices } from "@effect/platform-node";
 import { assert, describe, layer } from "@effect/vitest";
 import {
   configFileName,
+  RestoreAllowedResponse,
   RestoreDeniedResponse,
   RestoreRequest,
-  SaveDeniedResponse,
-  SaveRequest,
+  CommitSaveRequest,
+  CommitSaveResponse,
+  PrepareSaveRequest,
+  PrepareSaveResponse,
 } from "@stateful-ci/core";
 import { Effect, Exit, FileSystem, Layer, Path, Schema } from "effect";
 import { TestConsole } from "effect/testing";
@@ -38,6 +41,8 @@ interface Workspace {
 interface ProtocolRequest {
   readonly authorization: string | undefined;
   readonly body: unknown;
+  readonly bodyBytes: Uint8Array;
+  readonly headers: Record<string, string>;
   readonly method: string | undefined;
   readonly url: string | undefined;
 }
@@ -92,9 +97,30 @@ const withProtocolServer = <A, E, R>(
       const requests: ProtocolRequest[] = [];
       const server = createServer(async (request, response) => {
         try {
+          const bodyBytes =
+            request.method === "GET"
+              ? new Uint8Array()
+              : new Uint8Array(await new Response(request).arrayBuffer());
+          const contentType = request.headers["content-type"];
+          const body =
+            bodyBytes.byteLength === 0 ||
+            contentType === undefined ||
+            !contentType.includes("application/json")
+              ? null
+              : JSON.parse(new TextDecoder().decode(bodyBytes));
           const protocolRequest = {
             authorization: request.headers.authorization,
-            body: await new Response(request).json(),
+            body,
+            bodyBytes,
+            headers: Object.fromEntries(
+              Object.entries(request.headers).flatMap(([key, value]) => {
+                if (typeof value === "string") {
+                  return [[key, value]];
+                }
+
+                return Array.isArray(value) ? [[key, value.join(", ")]] : [];
+              })
+            ),
             method: request.method,
             url: request.url,
           } satisfies ProtocolRequest;
@@ -418,6 +444,278 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           )
         )
     );
+
+    it.effect("fails before mutation when a planned object is missing", () =>
+      withWorkspace(setupRestoreWorkspace, ({ fs, path, root }) =>
+        Effect.gen(function* restoreFailsBeforeMutationOnMissingObjectEffect() {
+          yield* fs.makeDirectory(path.join(root, ".turbo/cache"), {
+            recursive: true,
+          });
+          yield* fs.writeFileString(
+            path.join(root, ".turbo/cache/current.txt"),
+            "current"
+          );
+
+          const error = yield* Effect.flip(
+            withProtocolServer(
+              (request) =>
+                request.method === "GET"
+                  ? new Response(null, { status: 404 })
+                  : Response.json(
+                      Schema.encodeUnknownSync(RestoreAllowedResponse)({
+                        decision: "allowed",
+                        downloadPlan: [
+                          {
+                            method: "GET",
+                            object: {
+                              digest:
+                                "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                              key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                              kind: "manifest",
+                              size: 8,
+                            },
+                            route:
+                              "/v1/objects/manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                            transport: "worker-route",
+                          },
+                        ],
+                        manifest: {
+                          digest:
+                            "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                          key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          size: 8,
+                          snapshotId: "snap_123",
+                        },
+                        save: { allowed: false },
+                        snapshot: {
+                          id: "snap_123",
+                          manifestKey:
+                            "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          parent: null,
+                        },
+                        trustClass: "trusted",
+                        workspaceId: "ws_123",
+                      })
+                    ),
+              (url) =>
+                restoreProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: url,
+                })
+            )
+          );
+          const current = yield* fs.readFileString(
+            path.join(root, ".turbo/cache/current.txt")
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "returned HTTP 404");
+          assert.strictEqual(current, "current");
+        })
+      )
+    );
+
+    it.effect("fails before mutation when a downloaded object is corrupt", () =>
+      withWorkspace(setupRestoreWorkspace, ({ fs, path, root }) =>
+        Effect.gen(function* restoreFailsBeforeMutationOnCorruptObjectEffect() {
+          yield* fs.makeDirectory(path.join(root, ".turbo/cache"), {
+            recursive: true,
+          });
+          yield* fs.writeFileString(
+            path.join(root, ".turbo/cache/current.txt"),
+            "current"
+          );
+
+          const error = yield* Effect.flip(
+            withProtocolServer(
+              (request) =>
+                request.method === "GET"
+                  ? new Response("corrupt")
+                  : Response.json(
+                      Schema.encodeUnknownSync(RestoreAllowedResponse)({
+                        decision: "allowed",
+                        downloadPlan: [
+                          {
+                            method: "GET",
+                            object: {
+                              digest:
+                                "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                              key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                              kind: "manifest",
+                              size: 8,
+                            },
+                            route:
+                              "/v1/objects/manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                            transport: "worker-route",
+                          },
+                        ],
+                        manifest: {
+                          digest:
+                            "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                          key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          size: 8,
+                          snapshotId: "snap_123",
+                        },
+                        save: { allowed: false },
+                        snapshot: {
+                          id: "snap_123",
+                          manifestKey:
+                            "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          parent: null,
+                        },
+                        trustClass: "trusted",
+                        workspaceId: "ws_123",
+                      })
+                    ),
+              (url) =>
+                restoreProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: url,
+                })
+            )
+          );
+          const current = yield* fs.readFileString(
+            path.join(root, ".turbo/cache/current.txt")
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "size did not match");
+          assert.strictEqual(current, "current");
+        })
+      )
+    );
+
+    it.effect(
+      "rejects unsafe worker-route download plans before object fetch",
+      () =>
+        withWorkspace(setupRestoreWorkspace, () =>
+          Effect.gen(function* restoreRejectsUnsafeWorkerRouteEffect() {
+            const { requests } = yield* withProtocolServer(
+              () =>
+                Response.json({
+                  decision: "allowed",
+                  downloadPlan: [
+                    {
+                      method: "GET",
+                      object: {
+                        digest:
+                          "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                        key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                        kind: "manifest",
+                        size: 8,
+                      },
+                      route: "https://example.test/leak-token",
+                      transport: "worker-route",
+                    },
+                  ],
+                  manifest: {
+                    digest:
+                      "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                    key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                    size: 8,
+                    snapshotId: "snap_123",
+                  },
+                  save: { allowed: false },
+                  snapshot: {
+                    id: "snap_123",
+                    manifestKey:
+                      "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                    parent: null,
+                  },
+                  trustClass: "trusted",
+                  workspaceId: "ws_123",
+                }),
+              (url) =>
+                Effect.flip(
+                  restoreProgram({
+                    ...githubEnv,
+                    STATEFUL_CI_API_TOKEN: "test-token",
+                    STATEFUL_CI_API_URL: url,
+                  })
+                )
+            );
+
+            assert.strictEqual(requests.length, 1);
+            assert.strictEqual(requests[0]?.url, "/v1/restore");
+          })
+        )
+    );
+
+    it.effect("clears stale save authorization when restore fails", () =>
+      withWorkspace(setupRestoreWorkspace, ({ fs, path, root }) =>
+        Effect.gen(function* restoreClearsStaleSessionOnFailureEffect() {
+          const sessionPath = path.join(
+            root,
+            ".stateful-ci/restore-session.json"
+          );
+
+          yield* fs.makeDirectory(path.dirname(sessionPath), {
+            recursive: true,
+          });
+          yield* fs.writeFileString(
+            sessionPath,
+            '{"baseSnapshotId":"snap_old","runId":"123456789","workspaceId":"ws_old"}\n'
+          );
+
+          yield* Effect.flip(
+            withProtocolServer(
+              (request) =>
+                request.method === "GET"
+                  ? new Response("corrupt")
+                  : Response.json(
+                      Schema.encodeUnknownSync(RestoreAllowedResponse)({
+                        decision: "allowed",
+                        downloadPlan: [
+                          {
+                            method: "GET",
+                            object: {
+                              digest:
+                                "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                              key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                              kind: "manifest",
+                              size: 8,
+                            },
+                            route:
+                              "/v1/objects/manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                            transport: "worker-route",
+                          },
+                        ],
+                        manifest: {
+                          digest:
+                            "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                          key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          size: 8,
+                          snapshotId: "snap_123",
+                        },
+                        save: { allowed: false },
+                        snapshot: {
+                          id: "snap_123",
+                          manifestKey:
+                            "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          parent: null,
+                        },
+                        trustClass: "trusted",
+                        workspaceId: "ws_123",
+                      })
+                    ),
+              (url) =>
+                restoreProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: url,
+                })
+            )
+          );
+          const missingSession = yield* Effect.flip(
+            fs.readFileString(sessionPath)
+          );
+
+          assert.strictEqual(missingSession._tag, "PlatformError");
+        })
+      )
+    );
   });
 
   describe("save", () => {
@@ -452,45 +750,245 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         );
       });
 
-    it.effect("scans configured paths and sends manifest metadata", () =>
-      withWorkspace(setupSaveWorkspace, () =>
+    it.effect("prepares, uploads missing objects, and commits", () =>
+      withWorkspace(setupSaveWorkspace, ({ fs, path, root }) =>
         Effect.gen(function* saveScansConfiguredPathsEffect() {
           const { requests } = yield* withProtocolServer(
-            () =>
-              Response.json(
-                Schema.encodeUnknownSync(SaveDeniedResponse)({
+            (request) => {
+              if (request.url === "/v1/save/prepare") {
+                const prepareRequest = Schema.decodeUnknownSync(
+                  PrepareSaveRequest
+                )(request.body);
+                const [missingObject] = prepareRequest.objects;
+
+                return Response.json(
+                  Schema.encodeUnknownSync(PrepareSaveResponse)({
+                    baseSnapshotId: null,
+                    commitTarget: {
+                      namespace:
+                        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                      refName: "trusted/main/latest",
+                    },
+                    decision: "allowed",
+                    expectedHeadGeneration: 0,
+                    missingObjects: [
+                      {
+                        headers: {
+                          "x-stateful-ci-object-digest": missingObject.digest,
+                          "x-stateful-ci-object-kind": missingObject.kind,
+                          "x-stateful-ci-object-size": String(
+                            missingObject.size
+                          ),
+                        },
+                        method: "PUT",
+                        object: missingObject,
+                        route: `/v1/objects/${missingObject.key}`,
+                        transport: "worker-route",
+                      },
+                    ],
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.method === "PUT") {
+                return new Response(null, { status: 204 });
+              }
+
+              return Response.json(
+                Schema.encodeUnknownSync(CommitSaveResponse)({
                   decision: "denied",
                   reason: "backend_policy_not_configured",
                 })
-              ),
+              );
+            },
             (url) =>
               saveProgram({
                 ...githubEnv,
                 STATEFUL_CI_API_TOKEN: "test-token",
                 STATEFUL_CI_API_URL: url,
-                STATEFUL_CI_OIDC_TOKEN: undefined,
               })
           );
-          const [protocolRequest] = requests;
+          const [prepareProtocolRequest, uploadRequest, commitProtocolRequest] =
+            requests;
 
-          if (protocolRequest === undefined) {
-            return yield* Effect.die("Expected save to send one request.");
+          if (
+            prepareProtocolRequest === undefined ||
+            uploadRequest === undefined ||
+            commitProtocolRequest === undefined
+          ) {
+            return yield* Effect.die(
+              "Expected save to prepare, upload one object, and commit."
+            );
           }
 
-          const request = yield* decodeOrDie(SaveRequest, protocolRequest.body);
+          const prepareRequest = yield* decodeOrDie(
+            PrepareSaveRequest,
+            prepareProtocolRequest.body
+          );
+          const commitRequest = yield* decodeOrDie(
+            CommitSaveRequest,
+            commitProtocolRequest.body
+          );
+          const [missingObject] = prepareRequest.objects;
+
+          if (missingObject === undefined) {
+            return yield* Effect.die("Expected snapshot to include objects.");
+          }
+
+          const localObjectBytes = yield* fs.readFile(
+            path.join(root, ".stateful-ci/store", missingObject.key)
+          );
+
+          assert.strictEqual(requests.length, 3);
+          assert.strictEqual(prepareProtocolRequest.method, "POST");
+          assert.strictEqual(prepareProtocolRequest.url, "/v1/save/prepare");
+          assert.strictEqual(uploadRequest.method, "PUT");
+          assert.strictEqual(
+            uploadRequest.url,
+            `/v1/objects/${missingObject.key}`
+          );
+          assert.strictEqual(commitProtocolRequest.method, "POST");
+          assert.strictEqual(commitProtocolRequest.url, "/v1/save/commit");
+          assert.strictEqual(prepareRequest.objects.length > 1, true);
+          assert.strictEqual(prepareRequest.github.runId, "123456789");
+          assert.strictEqual(
+            prepareRequest.idempotencyKey,
+            "run-123456789-save"
+          );
+          assert.strictEqual(commitRequest.workspaceId, "ws_123");
+          assert.strictEqual(commitRequest.expectedHeadGeneration, 0);
+          assert.deepStrictEqual(commitRequest.objects, prepareRequest.objects);
+          assert.strictEqual(
+            uploadRequest.headers["x-stateful-ci-object-digest"],
+            missingObject.digest
+          );
+          assert.strictEqual(
+            uploadRequest.headers["x-stateful-ci-object-kind"],
+            missingObject.kind
+          );
+          assert.strictEqual(
+            uploadRequest.headers["x-stateful-ci-object-size"],
+            String(missingObject.size)
+          );
+          assert.deepStrictEqual(uploadRequest.bodyBytes, localObjectBytes);
+        })
+      )
+    );
+
+    it.effect("aborts before commit when object upload fails", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* saveAbortsBeforeCommitOnUploadFailureEffect() {
+          const error = yield* Effect.flip(
+            withProtocolServer(
+              (request) => {
+                if (request.url === "/v1/save/prepare") {
+                  const prepareRequest = Schema.decodeUnknownSync(
+                    PrepareSaveRequest
+                  )(request.body);
+                  const [missingObject] = prepareRequest.objects;
+
+                  return Response.json(
+                    Schema.encodeUnknownSync(PrepareSaveResponse)({
+                      baseSnapshotId: null,
+                      commitTarget: {
+                        namespace:
+                          "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                        refName: "trusted/main/latest",
+                      },
+                      decision: "allowed",
+                      expectedHeadGeneration: 0,
+                      missingObjects: [
+                        {
+                          headers: {
+                            "x-stateful-ci-object-digest": missingObject.digest,
+                            "x-stateful-ci-object-kind": missingObject.kind,
+                            "x-stateful-ci-object-size": String(
+                              missingObject.size
+                            ),
+                          },
+                          method: "PUT",
+                          object: missingObject,
+                          route: `/v1/objects/${missingObject.key}`,
+                          transport: "worker-route",
+                        },
+                      ],
+                      trustClass: "trusted",
+                      workspaceId: "ws_123",
+                    })
+                  );
+                }
+
+                if (request.method === "PUT") {
+                  return new Response(null, { status: 500 });
+                }
+
+                return Response.json({ unexpected: true });
+              },
+              (url) =>
+                saveProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: url,
+                })
+            )
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "returned HTTP 500");
+        })
+      )
+    );
+
+    it.effect("rejects unsafe worker-route upload plans before upload", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* saveRejectsUnsafeWorkerRouteEffect() {
+          const { requests } = yield* withProtocolServer(
+            (request) => {
+              const prepareRequest = Schema.decodeUnknownSync(
+                PrepareSaveRequest
+              )(request.body);
+              const [missingObject] = prepareRequest.objects;
+
+              return Response.json({
+                baseSnapshotId: null,
+                commitTarget: {
+                  namespace:
+                    "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                  refName: "trusted/main/latest",
+                },
+                decision: "allowed",
+                expectedHeadGeneration: 0,
+                missingObjects: [
+                  {
+                    headers: {
+                      "x-stateful-ci-object-digest": missingObject.digest,
+                      "x-stateful-ci-object-kind": missingObject.kind,
+                      "x-stateful-ci-object-size": String(missingObject.size),
+                    },
+                    method: "PUT",
+                    object: missingObject,
+                    route: "https://example.test/leak-token",
+                    transport: "worker-route",
+                  },
+                ],
+                trustClass: "trusted",
+                workspaceId: "ws_123",
+              });
+            },
+            (url) =>
+              Effect.flip(
+                saveProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: url,
+                })
+              )
+          );
 
           assert.strictEqual(requests.length, 1);
-          assert.strictEqual(protocolRequest.method, "POST");
-          assert.strictEqual(protocolRequest.url, "/v1/save");
-          assert.strictEqual(request.baseSnapshotId, null);
-          assert.strictEqual(request.manifest.fileCount, 1);
-          assert.deepStrictEqual(request.manifest.safety, {
-            skippedByBuiltInDenylist: 0,
-            skippedByUserExclude: 1,
-            skippedUnsupportedType: 0,
-          });
-          assert.strictEqual(request.runId, "123456789");
-          assert.strictEqual(request.workspaceId, "ws_123");
+          assert.strictEqual(requests[0]?.url, "/v1/save/prepare");
         })
       )
     );

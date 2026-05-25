@@ -1,5 +1,10 @@
 import type { RestoreRequest, TrustClass } from "@stateful-ci/core";
 
+type RunClassificationRequest = Pick<
+  RestoreRequest,
+  "git" | "github" | "workspace"
+>;
+
 export const defaultTrustedRefs = Object.freeze([
   "refs/heads/main",
   "refs/heads/master",
@@ -17,7 +22,7 @@ const isBranchRef = (ref: string) => ref.startsWith("refs/heads/");
 const isTagRef = (ref: string) => ref.startsWith("refs/tags/");
 
 export const classifyRunTrust = (
-  request: RestoreRequest,
+  request: RunClassificationRequest,
   options: RunClassificationOptions = {}
 ): TrustClass => {
   const { git, github, workspace } = request;

@@ -399,6 +399,29 @@ describe("protocol schemas", () => {
     ).toBe("signed-url");
   });
 
+  it("worker-route transfer plans must target the canonical object route", () => {
+    expect(
+      Result.isFailure(
+        Schema.decodeUnknownResult(ObjectTransferPlanEntry)({
+          method: "GET",
+          object: objects[1],
+          route: "https://example.test/leak-token",
+          transport: "worker-route",
+        })
+      )
+    ).toBeTruthy();
+    expect(
+      Result.isFailure(
+        Schema.decodeUnknownResult(ObjectTransferPlanEntry)({
+          method: "GET",
+          object: objects[1],
+          route: `/v1/objects/${chunkKey}`,
+          transport: "worker-route",
+        })
+      )
+    ).toBeTruthy();
+  });
+
   it("SaveRequest rejects malformed manifest digests", () => {
     expect(
       Result.isFailure(

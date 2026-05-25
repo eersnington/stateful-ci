@@ -1,31 +1,52 @@
-import type { ApiErrorType, DenialReason } from "@stateful-ci/core";
+import type {
+  ApiErrorType,
+  CommitSaveResponse,
+  DenialReason,
+} from "@stateful-ci/core";
 import {
+  CommitSaveConflictResponse,
+  CommitSaveDeniedResponse,
+  CommitSaveRequest,
   Forbidden,
+  HeadGeneration,
   HealthResponse,
   InvalidJsonBody,
   InvalidProtocolPayload,
   MethodNotAllowed,
+  PrepareSaveAllowedResponse,
+  PrepareSaveDeniedResponse,
+  PrepareSaveRequest,
   RequestBodyTooLarge,
+  RestoreAllowedResponse,
   RestoreDeniedResponse,
   RestoreRequest,
   RouteNotFound,
   RunId,
-  SaveCommittedResponse,
   routes,
   SaveDeniedResponse,
-  SaveRequest,
+  SnapshotObjectInventoryEntry,
   Unauthorized,
   WorkspaceId,
 } from "@stateful-ci/core";
 import { Effect, Exit, Schema } from "effect";
 
+import { BlobStore } from "./blob-store";
+import { BlobStoreError } from "./blob-store-error";
+import { createR2BlobStore } from "./blob-store-r2";
 import {
   createInMemoryMetadataBackend,
   currentIsoTimestamp,
+  manifestDescriptorFromSnapshotHeader,
   MetadataBackend,
-  snapshotHeaderFromManifest,
 } from "./metadata";
 import type { RefRow, RefTarget, SnapshotHeader } from "./metadata";
+import {
+  downloadPlanForObjects,
+  missingObjectPlans,
+  objectKindForKey,
+  parseObjectRouteKey,
+  validateObjectsPresent,
+} from "./object-data-plane";
 import { evaluateRestorePolicy, evaluateSavePolicy } from "./policy";
 import { classifyRunTrust, defaultTrustedRefs } from "./run-classification";
 
@@ -40,11 +61,13 @@ import { classifyRunTrust, defaultTrustedRefs } from "./run-classification";
 export const maxProtocolBodyBytes = 64 * 1024;
 
 interface WorkerEnv {
+  readonly STATEFUL_CI_OBJECTS?: R2Bucket;
   readonly STATEFUL_CI_API_TOKEN?: string;
   readonly STATEFUL_CI_TRUSTED_REFS?: string;
 }
 
 export interface HandleFetchOptions {
+  readonly blobStore?: BlobStore["Service"];
   readonly metadata?: MetadataBackend["Service"];
 }
 
@@ -55,6 +78,23 @@ const protocolBodyTooLarge = new RequestBodyTooLarge({
 });
 
 const defaultMetadata = createInMemoryMetadataBackend();
+
+const unconfiguredBlobStoreError = (key?: string) =>
+  new BlobStoreError({
+    ...(key === undefined ? {} : { key }),
+    message:
+      "The Worker does not have STATEFUL_CI_OBJECTS configured, so snapshot object storage is disabled. Bind the R2 bucket before using the object data plane.",
+    reason: "io_failed",
+  });
+
+const unconfiguredBlobStore = BlobStore.of({
+  get: (key) => Effect.fail(unconfiguredBlobStoreError(key)),
+  getRange: (key) => Effect.fail(unconfiguredBlobStoreError(key)),
+  head: (key) => Effect.fail(unconfiguredBlobStoreError(key)),
+  presignGet: (key) => Effect.fail(unconfiguredBlobStoreError(key)),
+  presignPut: (key) => Effect.fail(unconfiguredBlobStoreError(key)),
+  putIfAbsent: (input) => Effect.fail(unconfiguredBlobStoreError(input.key)),
+});
 
 const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
   const configured = env?.STATEFUL_CI_TRUSTED_REFS?.split(",")
@@ -77,6 +117,12 @@ const isApiError = (error: unknown): error is ApiErrorType =>
     error._tag === "RouteNotFound" ||
     error._tag === "Unauthorized" ||
     error._tag === "Forbidden");
+
+const isBlobStoreError = (error: unknown): error is BlobStoreError =>
+  typeof error === "object" &&
+  error !== null &&
+  "_tag" in error &&
+  error._tag === "BlobStoreError";
 
 const authorizeRequest = (request: Request, env: WorkerEnv | undefined) => {
   const expectedToken = env?.STATEFUL_CI_API_TOKEN;
@@ -204,7 +250,7 @@ const refSegment = (ref: string) => {
 };
 
 const metadataTargetForRestore = (
-  request: RestoreRequest,
+  request: Pick<RestoreRequest, "client" | "git" | "github" | "workspace">,
   trustedRefs: readonly string[]
 ): RefTarget => ({
   namespace: `repo=${request.workspace.repo}/workflow=${request.workspace.workflow}/job=${request.workspace.job}/config=${request.client.configHash}`,
@@ -246,6 +292,170 @@ const workspaceIdForTarget = (target: RefTarget) =>
 
 const runIdFromRestore = (request: RestoreRequest) =>
   Schema.decodeSync(RunId)(request.github.runId);
+
+const objectDataPlaneResponse = (error: BlobStoreError) => {
+  let status = 400;
+
+  if (error.reason === "missing") {
+    status = 404;
+  } else if (error.reason === "conflict") {
+    status = 409;
+  } else if (error.reason === "io_failed") {
+    status = 500;
+  }
+
+  return Response.json(error, { status });
+};
+
+const invalidObjectRouteResponse = (path: string) =>
+  Response.json(
+    new InvalidProtocolPayload({
+      message: `Snapshot object route ${path} does not contain a canonical production object key. Expected manifests/sha256/<hex>.json, packs/sha256/<hex>.scipack, or chunks/sha256/<hex>.`,
+    }),
+    { status: 400 }
+  );
+
+const invalidObjectUploadPlanResponse = (path: string) =>
+  Response.json(
+    new InvalidProtocolPayload({
+      message: `Snapshot object upload ${path} is missing or has invalid prepare-plan headers. Send x-stateful-ci-object-digest, x-stateful-ci-object-kind, and x-stateful-ci-object-size from the upload plan.`,
+    }),
+    { status: 400 }
+  );
+
+const expectedObjectFromHeaders = (
+  key: SnapshotObjectInventoryEntry["key"],
+  headers: Headers
+) => {
+  const expectedDigest = headers.get("x-stateful-ci-object-digest");
+  const expectedKind = headers.get("x-stateful-ci-object-kind");
+  const expectedSize = headers.get("x-stateful-ci-object-size");
+
+  if (
+    expectedDigest === null ||
+    expectedKind === null ||
+    expectedSize === null
+  ) {
+    return null;
+  }
+
+  const decoded = Schema.decodeUnknownExit(SnapshotObjectInventoryEntry)({
+    digest: expectedDigest,
+    key,
+    kind: expectedKind,
+    size: Number(expectedSize),
+  });
+
+  return Exit.isFailure(decoded) ? null : decoded.value;
+};
+
+const readObjectBody = (request: Request) =>
+  Effect.tryPromise({
+    catch: () =>
+      new BlobStoreError({
+        message:
+          "Could not read the snapshot object upload body. The object was not stored.",
+        reason: "io_failed",
+      }),
+    try: async () => new Uint8Array(await request.arrayBuffer()),
+  });
+
+const handleObjectRoute = Effect.fn("handleObjectRoute")(
+  function* handleObjectRouteEffect(
+    request: Request,
+    env: WorkerEnv | undefined,
+    key: SnapshotObjectInventoryEntry["key"]
+  ) {
+    const blobStore = yield* BlobStore;
+    yield* authorizeRequest(request, env);
+
+    if (request.method === "HEAD") {
+      const head = yield* blobStore.head(key);
+
+      return head === null
+        ? new Response(null, { status: 404 })
+        : new Response(null, {
+            headers: {
+              "content-length": String(head.size),
+              "x-stateful-ci-object-kind": objectKindForKey(key),
+            },
+            status: 200,
+          });
+    }
+
+    if (request.method === "GET") {
+      const bytes = yield* blobStore.get(key);
+
+      return new Response(bytes, {
+        headers: {
+          "content-length": String(bytes.byteLength),
+          "content-type": "application/octet-stream",
+          "x-stateful-ci-object-kind": objectKindForKey(key),
+        },
+      });
+    }
+
+    if (request.method === "PUT") {
+      const object = expectedObjectFromHeaders(key, request.headers);
+
+      if (object === null) {
+        return invalidObjectUploadPlanResponse(new URL(request.url).pathname);
+      }
+
+      const contentLength = request.headers.get("content-length");
+      const declaredSize = Number(contentLength);
+
+      if (
+        contentLength === null ||
+        !Number.isSafeInteger(declaredSize) ||
+        declaredSize !== object.size
+      ) {
+        return yield* new BlobStoreError({
+          key,
+          message: `Snapshot object ${key} upload declared ${contentLength ?? "no"} Content-Length, but the backend expected ${object.size}. The object was not stored.`,
+          reason: "size_mismatch",
+        });
+      }
+
+      const body = yield* readObjectBody(request);
+
+      yield* blobStore.putIfAbsent({
+        body,
+        expectedDigest: object.digest,
+        expectedSize: object.size,
+        key,
+      });
+
+      return new Response(null, { status: 204 });
+    }
+
+    const path = new URL(request.url).pathname;
+
+    return Response.json(
+      new MethodNotAllowed({
+        allowed: ["HEAD", "GET", "PUT"],
+        message: `The ${path} route only accepts HEAD, GET, or PUT requests.`,
+        method: request.method,
+        path,
+      }),
+      { headers: { Allow: "HEAD, GET, PUT" }, status: 405 }
+    );
+  }
+);
+
+const denyPrepareSave = (
+  reason: DenialReason,
+  trustClass: ReturnType<typeof classifyRunTrust>,
+  workspaceId?: WorkspaceId
+) =>
+  Response.json(
+    Schema.encodeUnknownSync(PrepareSaveDeniedResponse)({
+      decision: "denied",
+      reason,
+      trustClass,
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+    })
+  );
 
 const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   request: Request,
@@ -380,12 +590,50 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
 
   const createdAt = yield* currentIsoTimestamp;
 
+  const objectValidation = yield* validateObjectsPresent(
+    restored.snapshot.objects
+  ).pipe(
+    Effect.matchEffect({
+      onFailure: (error) =>
+        isBlobStoreError(error)
+          ? Effect.fail(error)
+          : Effect.succeed({ ok: false as const, reason: error }),
+      onSuccess: () => Effect.succeed({ ok: true as const }),
+    })
+  );
+
+  if (!objectValidation.ok) {
+    yield* metadata.appendAuditEvent({
+      ...target,
+      createdAt,
+      decision: "denied",
+      eventType: "restore",
+      reason: objectValidation.reason,
+      runId,
+      snapshotId: restored.snapshot.snapshotId,
+      trustClass,
+      workspaceId,
+    });
+
+    return Response.json(
+      Schema.encodeUnknownSync(RestoreDeniedResponse)({
+        decision: "denied",
+        reason: objectValidation.reason,
+        save: savePolicy.allowed
+          ? { allowed: true, target: target.refName }
+          : { allowed: false },
+        trustClass,
+        ...(savePolicy.allowed ? { workspaceId } : {}),
+      })
+    );
+  }
+
   yield* metadata.appendAuditEvent({
     ...target,
     createdAt,
-    decision: "denied",
+    decision: "allowed",
     eventType: "restore",
-    reason: "backend_policy_not_configured",
+    reason: null,
     runId,
     snapshotId: restored.snapshot.snapshotId,
     trustClass,
@@ -393,149 +641,218 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   });
 
   return Response.json(
-    Schema.encodeUnknownSync(RestoreDeniedResponse)({
-      decision: "denied",
-      reason: "backend_policy_not_configured",
+    Schema.encodeUnknownSync(RestoreAllowedResponse)({
+      decision: "allowed",
+      downloadPlan: downloadPlanForObjects(restored.snapshot.objects),
+      manifest: manifestDescriptorFromSnapshotHeader(restored.snapshot),
       save: savePolicy.allowed
         ? { allowed: true, target: target.refName }
         : { allowed: false },
+      snapshot: {
+        id: restored.snapshot.snapshotId,
+        manifestKey: restored.snapshot.manifestKey,
+        parent: restored.snapshot.parentSnapshotId,
+      },
       trustClass,
-      ...(savePolicy.allowed ? { workspaceId } : {}),
+      workspaceId,
     })
   );
 });
 
-const handleSave = Effect.fn("handleSave")(function* handleSaveEffect(
-  request: Request,
-  env: WorkerEnv | undefined
-) {
-  const metadata = yield* MetadataBackend;
-  yield* authorizeRequest(request, env);
-  const saveRequest = yield* readProtocolBody(request).pipe(
-    Effect.flatMap(parseProtocolJson),
-    Effect.flatMap(decodeProtocolPayload(SaveRequest))
-  );
-  const target = yield* metadata.getWorkspaceTarget(saveRequest.workspaceId);
-
-  if (target === null) {
-    const createdAt = yield* currentIsoTimestamp;
-
-    yield* metadata.appendAuditEvent({
-      createdAt,
-      decision: "denied",
-      eventType: "save",
-      namespace: "",
-      reason: "restore_required_before_save",
-      refName: "",
-      runId: saveRequest.runId,
-      snapshotId: saveRequest.manifest.id,
-      trustClass: null,
-      workspaceId: saveRequest.workspaceId,
+const handlePrepareSave = Effect.fn("handlePrepareSave")(
+  function* handlePrepareSaveEffect(
+    request: Request,
+    env: WorkerEnv | undefined
+  ) {
+    const metadata = yield* MetadataBackend;
+    yield* authorizeRequest(request, env);
+    const prepareRequest = yield* readProtocolBody(request).pipe(
+      Effect.flatMap(parseProtocolJson),
+      Effect.flatMap(decodeProtocolPayload(PrepareSaveRequest))
+    );
+    const trustedRefs = trustedRefsForEnv(env);
+    const trustClass = classifyRunTrust(prepareRequest, { trustedRefs });
+    const target = metadataTargetForRestore(prepareRequest, trustedRefs);
+    const workspaceId = workspaceIdForTarget(target);
+    const runId = Schema.decodeSync(RunId)(prepareRequest.github.runId);
+    const savePolicy = evaluateSavePolicy({
+      scopeKey: scopeKeyForTarget(target),
+      trustClass,
     });
 
-    return Response.json(
-      Schema.encodeUnknownSync(SaveDeniedResponse)({
-        decision: "denied",
-        reason: "restore_required_before_save",
-      })
-    );
-  }
-
-  if (target.runId !== saveRequest.runId) {
-    const createdAt = yield* currentIsoTimestamp;
-
-    yield* metadata.appendAuditEvent({
-      createdAt,
-      decision: "denied",
-      eventType: "save",
-      namespace: target.namespace,
-      reason: "save_run_context_mismatch",
-      refName: target.refName,
-      runId: saveRequest.runId,
-      snapshotId: saveRequest.manifest.id,
-      trustClass: target.trustClass,
-      workspaceId: saveRequest.workspaceId,
-    });
-
-    return Response.json(
-      Schema.encodeUnknownSync(SaveDeniedResponse)({
-        decision: "denied",
-        reason: "save_run_context_mismatch",
-      })
-    );
-  }
-
-  const savePolicy = evaluateSavePolicy({
-    scopeKey: scopeKeyForTarget(target),
-    trustClass: target.trustClass,
-  });
-
-  if (!savePolicy.allowed) {
-    const createdAt = yield* currentIsoTimestamp;
-
-    yield* metadata.appendAuditEvent({
-      createdAt,
-      decision: "denied",
-      eventType: "save",
-      namespace: target.namespace,
-      reason: savePolicy.reason,
-      refName: target.refName,
-      runId: saveRequest.runId,
-      snapshotId: saveRequest.manifest.id,
-      trustClass: target.trustClass,
-      workspaceId: saveRequest.workspaceId,
-    });
-
-    return Response.json(
-      Schema.encodeUnknownSync(SaveDeniedResponse)({
-        decision: "denied",
-        reason: savePolicy.reason,
-      })
-    );
-  }
-
-  const createdAt = yield* currentIsoTimestamp;
-  const snapshotHeader = yield* snapshotHeaderFromManifest(
-    saveRequest.manifest,
-    {
-      createdAt,
-      parentSnapshotId: saveRequest.baseSnapshotId,
-      runId: saveRequest.runId,
-      trustClass: target.trustClass,
-      workspaceId: saveRequest.workspaceId,
+    if (!savePolicy.allowed) {
+      return denyPrepareSave(savePolicy.reason, trustClass, workspaceId);
     }
-  ).pipe(
-    Effect.mapError(
-      (error) =>
-        new InvalidProtocolPayload({
-          message: error.message,
+
+    const missing = yield* missingObjectPlans(prepareRequest.objects).pipe(
+      Effect.matchEffect({
+        onFailure: (error) =>
+          isBlobStoreError(error)
+            ? Effect.fail(error)
+            : Effect.succeed({ ok: false as const, reason: error }),
+        onSuccess: (plans) => Effect.succeed({ ok: true as const, plans }),
+      })
+    );
+
+    if (!missing.ok) {
+      return denyPrepareSave(missing.reason, trustClass, workspaceId);
+    }
+
+    const ref = yield* metadata.getRef(target.namespace, target.refName);
+
+    yield* metadata.rememberWorkspaceTarget({
+      ...target,
+      runId,
+      trustClass,
+      workspaceId,
+    });
+
+    return Response.json(
+      Schema.encodeUnknownSync(PrepareSaveAllowedResponse)({
+        baseSnapshotId: ref?.snapshotId ?? null,
+        commitTarget: target,
+        decision: "allowed",
+        expectedHeadGeneration: Schema.decodeSync(HeadGeneration)(
+          ref?.version ?? 0
+        ),
+        missingObjects: missing.plans,
+        trustClass,
+        workspaceId,
+      })
+    );
+  }
+);
+
+const handleCommitSave = Effect.fn("handleCommitSave")(
+  function* handleCommitSaveEffect(
+    request: Request,
+    env: WorkerEnv | undefined
+  ) {
+    const metadata = yield* MetadataBackend;
+    yield* authorizeRequest(request, env);
+    const commitRequest = yield* readProtocolBody(request).pipe(
+      Effect.flatMap(parseProtocolJson),
+      Effect.flatMap(decodeProtocolPayload(CommitSaveRequest))
+    );
+    const target = yield* metadata.getWorkspaceTarget(
+      commitRequest.workspaceId
+    );
+
+    if (target === null) {
+      return Response.json(
+        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
+          decision: "denied",
+          reason: "restore_required_before_save",
         })
-    )
-  );
+      );
+    }
 
-  yield* metadata.putSnapshotHeader(snapshotHeader);
-  yield* metadata.setRef(target, saveRequest.manifest.id, target.trustClass);
-  yield* metadata.appendAuditEvent({
-    ...target,
-    createdAt,
-    decision: "committed",
-    eventType: "save",
-    reason: null,
-    runId: saveRequest.runId,
-    snapshotId: saveRequest.manifest.id,
-    trustClass: target.trustClass,
-    workspaceId: saveRequest.workspaceId,
-  });
+    if (
+      target.runId !== commitRequest.runId ||
+      target.namespace !== commitRequest.target.namespace ||
+      target.refName !== commitRequest.target.refName
+    ) {
+      return Response.json(
+        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
+          decision: "denied",
+          reason: "save_run_context_mismatch",
+        })
+      );
+    }
 
-  return Response.json(
-    Schema.encodeUnknownSync(SaveCommittedResponse)({
-      decision: "committed",
-      latest: true,
-      snapshotId: saveRequest.manifest.id,
-      workspaceId: saveRequest.workspaceId,
-    })
-  );
-});
+    if (commitRequest.baseSnapshotId !== null) {
+      const baseSnapshot = yield* metadata.getSnapshotHeader(
+        commitRequest.baseSnapshotId
+      );
+
+      if (baseSnapshot === null) {
+        return Response.json(
+          Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
+            decision: "denied",
+            reason: "save_run_context_mismatch",
+          })
+        );
+      }
+    }
+
+    const savePolicy = evaluateSavePolicy({
+      scopeKey: scopeKeyForTarget(target),
+      trustClass: target.trustClass,
+    });
+
+    if (!savePolicy.allowed) {
+      return Response.json(
+        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
+          decision: "denied",
+          reason: savePolicy.reason,
+        })
+      );
+    }
+
+    const ref = yield* metadata.getRef(target.namespace, target.refName);
+    const actualGeneration = ref?.version ?? 0;
+
+    if (actualGeneration !== commitRequest.expectedHeadGeneration) {
+      return Response.json(
+        Schema.encodeUnknownSync(CommitSaveConflictResponse)({
+          actualHeadGeneration:
+            Schema.decodeSync(HeadGeneration)(actualGeneration),
+          decision: "conflict",
+          reason: "head_generation_mismatch",
+        })
+      );
+    }
+
+    const objectValidation = yield* validateObjectsPresent(
+      commitRequest.objects
+    ).pipe(
+      Effect.matchEffect({
+        onFailure: (error) =>
+          isBlobStoreError(error)
+            ? Effect.fail(error)
+            : Effect.succeed({ ok: false as const, reason: error }),
+        onSuccess: () => Effect.succeed({ ok: true as const }),
+      })
+    );
+
+    if (!objectValidation.ok) {
+      return Response.json(
+        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
+          decision: "denied",
+          reason: objectValidation.reason,
+        })
+      );
+    }
+
+    return Response.json(
+      Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
+        decision: "denied",
+        reason: "backend_policy_not_configured",
+      } satisfies CommitSaveResponse)
+    );
+  }
+);
+
+const handleLegacySave = Effect.fn("handleLegacySave")(
+  function* handleLegacySaveEffect(
+    request: Request,
+    env: WorkerEnv | undefined
+  ) {
+    yield* authorizeRequest(request, env);
+    yield* readProtocolBody(request).pipe(
+      Effect.flatMap(parseProtocolJson),
+      Effect.flatMap(decodeProtocolPayload(Schema.Unknown))
+    );
+
+    return Response.json(
+      Schema.encodeUnknownSync(SaveDeniedResponse)({
+        decision: "denied",
+        reason: "backend_policy_not_configured",
+      }),
+      { status: 410 }
+    );
+  }
+);
 
 const methodNotAllowed = (path: string, method: string, allowed: string) =>
   Response.json(
@@ -548,7 +865,14 @@ const methodNotAllowed = (path: string, method: string, allowed: string) =>
     { headers: { Allow: allowed }, status: 405 }
   );
 
-const handleRequest = (request: Request, env?: WorkerEnv) => {
+const handleRequest = (
+  request: Request,
+  env?: WorkerEnv
+): Effect.Effect<
+  Response,
+  ApiErrorType | BlobStoreError,
+  BlobStore | MetadataBackend
+> => {
   const path = new URL(request.url).pathname;
 
   if (path === routes.health.path && request.method !== routes.health.method) {
@@ -569,6 +893,14 @@ const handleRequest = (request: Request, env?: WorkerEnv) => {
     );
   }
 
+  if (path.startsWith(routes.objects.pathPrefix)) {
+    const key = parseObjectRouteKey(path);
+
+    return key === null
+      ? Effect.succeed(invalidObjectRouteResponse(path))
+      : handleObjectRoute(request, env, key);
+  }
+
   if (
     path === routes.restore.path &&
     request.method !== routes.restore.method
@@ -582,6 +914,32 @@ const handleRequest = (request: Request, env?: WorkerEnv) => {
     return handleRestore(request, env);
   }
 
+  if (
+    path === routes.prepareSave.path &&
+    request.method !== routes.prepareSave.method
+  ) {
+    return Effect.succeed(
+      methodNotAllowed(path, request.method, routes.prepareSave.method)
+    );
+  }
+
+  if (path === routes.prepareSave.path) {
+    return handlePrepareSave(request, env);
+  }
+
+  if (
+    path === routes.commitSave.path &&
+    request.method !== routes.commitSave.method
+  ) {
+    return Effect.succeed(
+      methodNotAllowed(path, request.method, routes.commitSave.method)
+    );
+  }
+
+  if (path === routes.commitSave.path) {
+    return handleCommitSave(request, env);
+  }
+
   if (path === routes.save.path && request.method !== routes.save.method) {
     return Effect.succeed(
       methodNotAllowed(path, request.method, routes.save.method)
@@ -589,7 +947,7 @@ const handleRequest = (request: Request, env?: WorkerEnv) => {
   }
 
   if (path === routes.save.path) {
-    return handleSave(request, env);
+    return handleLegacySave(request, env);
   }
 
   return Effect.succeed(
@@ -639,6 +997,24 @@ const apiErrorResponse = (error: ApiErrorType) =>
       })
     : Response.json(error, { status: apiErrorStatus(error) });
 
+const errorResponse = (error: unknown) => {
+  if (isBlobStoreError(error)) {
+    return objectDataPlaneResponse(error);
+  }
+
+  if (isApiError(error)) {
+    return apiErrorResponse(error);
+  }
+
+  return Response.json(
+    new InvalidProtocolPayload({
+      message:
+        "The Worker could not process this Stateful CI request. Check backend logs for the unexpected failure.",
+    }),
+    { status: 500 }
+  );
+};
+
 export const handleFetch = (
   request: Request,
   env?: WorkerEnv,
@@ -647,13 +1023,20 @@ export const handleFetch = (
   Effect.runPromise(
     handleRequest(request, env).pipe(
       Effect.provideService(
+        BlobStore,
+        options.blobStore ??
+          (env?.STATEFUL_CI_OBJECTS === undefined
+            ? unconfiguredBlobStore
+            : createR2BlobStore(env.STATEFUL_CI_OBJECTS))
+      ),
+      Effect.provideService(
         MetadataBackend,
         // Until D1/DO bindings exist, default Worker fetches are intentionally
         // request-local. Tests and local dev can inject a shared backend.
         options.metadata ?? defaultMetadata
       ),
       Effect.match({
-        onFailure: apiErrorResponse,
+        onFailure: errorResponse,
         onSuccess: (response) => response,
       })
     )

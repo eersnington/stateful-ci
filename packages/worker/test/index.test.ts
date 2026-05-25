@@ -3,14 +3,20 @@ import {
   ChunkKey,
   ManifestKey,
   PackKey,
-  RestoreDeniedResponse,
+  RestoreAllowedResponse,
+  PrepareSaveAllowedResponse,
+  CommitSaveResponse,
   RunId,
   Sha256Digest,
   SnapshotId,
   WorkspaceId,
 } from "@stateful-ci/core";
+import type { SnapshotObjectKey } from "@stateful-ci/core";
 import { Effect, Schema } from "effect";
 
+import { BlobStore } from "../src/blob-store";
+import { BlobStoreError } from "../src/blob-store-error";
+import { createInMemoryBlobStore } from "../src/blob-store-memory";
 import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
@@ -55,17 +61,21 @@ const manifestDigest =
 const manifestKey =
   "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
 const seededManifestDigest =
-  "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f";
 const seededManifestKey =
-  "manifests/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json";
+  "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json";
 const seededPackDigest =
-  "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  "sha256:4862f447f2c7f272fa2f4aaf89dadb3b1ac09105bd5864f8d1a0c9452bb0a226";
 const seededPackKey =
-  "packs/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.scipack";
+  "packs/sha256/4862f447f2c7f272fa2f4aaf89dadb3b1ac09105bd5864f8d1a0c9452bb0a226.scipack";
 const seededChunkDigest =
-  "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  "sha256:6c87f68371b28954707ebb92afee7ccffb74c6f71ec8fea8a98cf6104289585b";
 const seededChunkKey =
-  "chunks/sha256/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  "chunks/sha256/6c87f68371b28954707ebb92afee7ccffb74c6f71ec8fea8a98cf6104289585b";
+const seededManifestBytes = new TextEncoder().encode("manifest");
+const seededPackBytes = new TextEncoder().encode("pack");
+const seededChunkBytes = new TextEncoder().encode("chunk");
+const seededWorkspaceTotalBytes = 481_203_912;
 const saveObjects = [
   {
     digest: manifestDigest,
@@ -89,7 +99,7 @@ const saveRequest = {
       skippedByUserExclude: 12,
       skippedUnsupportedType: 1,
     },
-    totalBytes: 481_203_912,
+    totalBytes: seededWorkspaceTotalBytes,
   },
   protocolVersion: 1,
   runId: "123456789",
@@ -109,31 +119,31 @@ const seededSnapshot = {
   createdAt: "2026-05-16T00:00:00.000Z",
   manifestDigest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
   manifestKey: Schema.decodeSync(ManifestKey)(seededManifestKey),
-  manifestSize: 128,
+  manifestSize: seededManifestBytes.byteLength,
   objects: [
     {
       digest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
       key: Schema.decodeSync(ManifestKey)(seededManifestKey),
       kind: "manifest",
-      size: 128,
+      size: seededManifestBytes.byteLength,
     },
     {
       digest: Schema.decodeSync(Sha256Digest)(seededPackDigest),
       key: Schema.decodeSync(PackKey)(seededPackKey),
       kind: "pack",
-      size: 2048,
+      size: seededPackBytes.byteLength,
     },
     {
       digest: Schema.decodeSync(Sha256Digest)(seededChunkDigest),
       key: Schema.decodeSync(ChunkKey)(seededChunkKey),
       kind: "chunk",
-      size: 4096,
+      size: seededChunkBytes.byteLength,
     },
   ],
   parentSnapshotId: null,
   runId: Schema.decodeSync(RunId)("123456788"),
   snapshotId: seededSnapshotId,
-  totalBytes: 128,
+  totalBytes: seededWorkspaceTotalBytes,
   trustClass: "trusted",
   workspaceId: seededWorkspaceId,
 } satisfies SnapshotHeader;
@@ -207,6 +217,36 @@ const jsonRequest = (path: string, body: unknown) =>
     method: "POST",
   });
 
+const seededBlobStore = () =>
+  createInMemoryBlobStore(
+    new Map<SnapshotObjectKey, Uint8Array>([
+      [Schema.decodeSync(ManifestKey)(seededManifestKey), seededManifestBytes],
+      [Schema.decodeSync(PackKey)(seededPackKey), seededPackBytes],
+      [Schema.decodeSync(ChunkKey)(seededChunkKey), seededChunkBytes],
+    ])
+  );
+
+const failingHeadBlobStore = () => {
+  const backing = createInMemoryBlobStore();
+
+  return BlobStore.of({
+    get: (key) => backing.get(key),
+    getRange: (key, offset, length) => backing.getRange(key, offset, length),
+    head: (key) =>
+      Effect.fail(
+        new BlobStoreError({
+          key,
+          message: `Could not inspect snapshot object ${key} in test storage.`,
+          reason: "io_failed",
+        })
+      ),
+    presignGet: (key, ttlSeconds) => backing.presignGet(key, ttlSeconds),
+    presignPut: (key, ttlSeconds, constraints) =>
+      backing.presignPut(key, ttlSeconds, constraints),
+    putIfAbsent: (input) => backing.putIfAbsent(input),
+  });
+};
+
 describe("worker API", () => {
   it("GET /health returns protocol health", async () => {
     const response = await worker.fetch(
@@ -219,6 +259,203 @@ describe("worker API", () => {
       protocolVersion: 1,
       service: "stateful-ci-worker",
       status: "ok",
+    });
+  });
+
+  it.effect("PUT /v1/objects stores and serves immutable objects", () =>
+    Effect.gen(function* objectRouteStoresAndServesEffect() {
+      const blobStore = createInMemoryBlobStore();
+      const bytes = new TextEncoder().encode("manifest");
+      const route = `/v1/objects/${seededManifestKey}`;
+      const put = () =>
+        handleFetch(
+          new Request(`https://stateful-ci.test${route}`, {
+            body: bytes,
+            headers: {
+              authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+              "content-length": String(bytes.byteLength),
+              "x-stateful-ci-object-digest": seededManifestDigest,
+              "x-stateful-ci-object-kind": "manifest",
+              "x-stateful-ci-object-size": String(bytes.byteLength),
+            },
+            method: "PUT",
+          }),
+          env,
+          { blobStore }
+        );
+
+      const firstPut = yield* Effect.promise(put);
+      const secondPut = yield* Effect.promise(put);
+      const head = yield* Effect.promise(() =>
+        handleFetch(
+          new Request(`https://stateful-ci.test${route}`, {
+            headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+            method: "HEAD",
+          }),
+          env,
+          { blobStore }
+        )
+      );
+      const get = yield* Effect.promise(() =>
+        handleFetch(
+          new Request(`https://stateful-ci.test${route}`, {
+            headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+            method: "GET",
+          }),
+          env,
+          { blobStore }
+        )
+      );
+
+      assert.strictEqual(firstPut.status, 204);
+      assert.strictEqual(secondPut.status, 204);
+      assert.strictEqual(head.status, 200);
+      assert.strictEqual(
+        head.headers.get("content-length"),
+        String(bytes.byteLength)
+      );
+      assert.strictEqual(get.status, 200);
+      assert.deepStrictEqual(
+        new Uint8Array(yield* Effect.promise(() => get.arrayBuffer())),
+        bytes
+      );
+    })
+  );
+
+  it("PUT /v1/objects rejects non-canonical keys and digest mismatches", async () => {
+    const malformed = await handleFetch(
+      new Request("https://stateful-ci.test/v1/objects/chunks/sha256/ABC", {
+        body: "bad",
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "PUT",
+      }),
+      env,
+      { blobStore: createInMemoryBlobStore() }
+    );
+    const mismatch = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        body: "wrong",
+        headers: {
+          authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+          "content-length": "5",
+          "x-stateful-ci-object-digest": seededManifestDigest,
+          "x-stateful-ci-object-kind": "manifest",
+          "x-stateful-ci-object-size": "5",
+        },
+        method: "PUT",
+      }),
+      env,
+      { blobStore: createInMemoryBlobStore() }
+    );
+
+    expect(malformed.status).toBe(400);
+    expect(mismatch.status).toBe(400);
+    await expect(mismatch.json()).resolves.toMatchObject({
+      reason: "digest_mismatch",
+    });
+  });
+
+  it("object routes fail closed without an R2 binding or injected blob store", async () => {
+    const response = await worker.fetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "HEAD",
+      }),
+      env
+    );
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "BlobStoreError",
+      reason: "io_failed",
+    });
+  });
+
+  it("PUT /v1/objects requires prepare-plan headers", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        body: "manifest",
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "PUT",
+      }),
+      env,
+      { blobStore: createInMemoryBlobStore() }
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "InvalidProtocolPayload",
+    });
+  });
+
+  it("PUT /v1/objects rejects missing prepare-plan headers without reading the body", async () => {
+    const request = new Request(
+      `https://stateful-ci.test/v1/objects/${seededManifestKey}`,
+      {
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "PUT",
+      }
+    );
+
+    Object.defineProperty(request, "arrayBuffer", {
+      value: () => {
+        throw new Error("object body should not be read without upload plan");
+      },
+    });
+
+    const response = await handleFetch(request, env, {
+      blobStore: createInMemoryBlobStore(),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "InvalidProtocolPayload",
+    });
+  });
+
+  it("PUT /v1/objects rejects invalid prepare-plan headers", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        body: "manifest",
+        headers: {
+          authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+          "x-stateful-ci-object-digest": seededManifestDigest,
+          "x-stateful-ci-object-kind": "chunk",
+          "x-stateful-ci-object-size": "not-a-number",
+        },
+        method: "PUT",
+      }),
+      env,
+      { blobStore: createInMemoryBlobStore() }
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "InvalidProtocolPayload",
+    });
+  });
+
+  it("PUT /v1/objects rejects declared size mismatches before storage", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        body: "manifest",
+        headers: {
+          authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+          "content-length": "999",
+          "x-stateful-ci-object-digest": seededManifestDigest,
+          "x-stateful-ci-object-kind": "manifest",
+          "x-stateful-ci-object-size": "8",
+        },
+        method: "PUT",
+      }),
+      env,
+      { blobStore: createInMemoryBlobStore() }
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "BlobStoreError",
+      reason: "size_mismatch",
     });
   });
 
@@ -238,7 +475,7 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/restore denies compatible snapshots until object data plane is configured", async () => {
+  it("POST /v1/restore denies compatible snapshots with missing objects", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
       snapshots: [seededSnapshot],
@@ -247,6 +484,7 @@ describe("worker API", () => {
       jsonRequest("/v1/restore", restoreRequest),
       env,
       {
+        blobStore: createInMemoryBlobStore(),
         metadata,
       }
     );
@@ -254,12 +492,45 @@ describe("worker API", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      reason: "snapshot_object_missing",
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
       workspaceId: seededWorkspaceId,
     });
   });
+
+  it.effect("POST /v1/restore returns object download plans", () =>
+    Effect.gen(function* restoreReturnsDownloadPlansEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        refs: [seededRef],
+        snapshots: [seededSnapshot],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
+          blobStore: seededBlobStore(),
+          metadata,
+        })
+      );
+      const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(body.decision, "allowed");
+      assert.deepStrictEqual(
+        body.downloadPlan.map((entry) => ({
+          key: entry.object.key,
+          method: entry.method,
+          route: entry.transport === "worker-route" ? entry.route : null,
+        })),
+        seededSnapshot.objects.map((object) => ({
+          key: object.key,
+          method: "GET" as const,
+          route: `/v1/objects/${object.key}`,
+        }))
+      );
+    })
+  );
 
   it("POST /v1/restore lets trusted main seed same-repo pull requests", async () => {
     const metadata = createInMemoryMetadataBackend({
@@ -269,13 +540,13 @@ describe("worker API", () => {
     const response = await handleFetch(
       jsonRequest("/v1/restore", internalPullRequest),
       env,
-      { metadata }
+      { blobStore: createInMemoryBlobStore(), metadata }
     );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      reason: "snapshot_object_missing",
       save: { allowed: true, target: "internal/refs-pull-12-merge/latest" },
       trustClass: "internal",
     });
@@ -289,13 +560,13 @@ describe("worker API", () => {
     const response = await handleFetch(
       jsonRequest("/v1/restore", externalPullRequest),
       env,
-      { metadata }
+      { blobStore: createInMemoryBlobStore(), metadata }
     );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      reason: "snapshot_object_missing",
       save: { allowed: false },
       trustClass: "external",
     });
@@ -309,13 +580,13 @@ describe("worker API", () => {
     const response = await handleFetch(
       jsonRequest("/v1/restore", privilegedRelease),
       env,
-      { metadata }
+      { blobStore: createInMemoryBlobStore(), metadata }
     );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      reason: "snapshot_object_missing",
       save: { allowed: false },
       trustClass: "privileged",
     });
@@ -520,178 +791,261 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/save validates requests and denies without an allowed workspace target", async () => {
+  it("POST /v1/save fails closed", async () => {
     const response = await worker.fetch(
       jsonRequest("/v1/save", saveRequest),
       env
     );
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(410);
     await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
-      reason: "restore_required_before_save",
+      reason: "backend_policy_not_configured",
     });
   });
 
-  it.effect(
-    "POST /v1/save commits snapshot metadata and advances latest after allowed restore",
-    () =>
-      Effect.gen(function* saveCommitsSnapshotMetadataEffect() {
-        const metadata = createInMemoryMetadataBackend({
-          refs: [seededRef],
-          snapshots: [seededSnapshot],
-        });
-        const restoreResponse = yield* Effect.promise(() =>
-          handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
-            metadata,
-          })
-        );
-        const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
-          yield* Effect.promise(() => restoreResponse.json())
-        );
+  it.effect("POST /v1/save/prepare returns missing upload plans", () =>
+    Effect.gen(function* prepareReturnsMissingObjectsEffect() {
+      const blobStore = createInMemoryBlobStore(
+        new Map([
+          [
+            Schema.decodeSync(ManifestKey)(seededManifestKey),
+            new TextEncoder().encode("manifest"),
+          ],
+        ])
+      );
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/prepare", {
+            client: restoreRequest.client,
+            git: restoreRequest.git,
+            github: restoreRequest.github,
+            idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_132",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            workspace: restoreRequest.workspace,
+          }),
+          env,
+          { blobStore }
+        )
+      );
+      const body = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
 
-        if (restoreBody.workspaceId === undefined) {
-          return yield* Effect.die(
-            "Restore response did not include a save workspace."
-          );
-        }
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(
+        body.missingObjects.map((entry) => entry.object.key),
+        [seededPackKey, seededChunkKey]
+      );
+      assert.strictEqual(body.expectedHeadGeneration, 0);
+    })
+  );
 
-        const response = yield* Effect.promise(() =>
-          handleFetch(
-            jsonRequest("/v1/save", {
-              ...saveRequest,
-              workspaceId: restoreBody.workspaceId,
-            }),
-            env,
-            { metadata }
-          )
-        );
-        const body = yield* Effect.promise(() => response.json());
-        const header = yield* metadata.getSnapshotHeader(
-          Schema.decodeSync(SnapshotId)("snap_124")
-        );
-        const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+  it("POST /v1/save/prepare returns backend failure when object HEAD fails", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/save/prepare", {
+        client: restoreRequest.client,
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        idempotencyKey: "run-123456789-save",
+        identity: restoreRequest.identity,
+        manifest: {
+          digest: seededManifestDigest,
+          key: seededManifestKey,
+          size: 8,
+          snapshotId: "snap_132",
+        },
+        objects: seededSnapshot.objects,
+        protocolVersion: 1,
+        workspace: restoreRequest.workspace,
+      }),
+      env,
+      { blobStore: failingHeadBlobStore() }
+    );
 
-        assert.strictEqual(response.status, 200);
-        assert.deepStrictEqual(body, {
-          decision: "committed",
-          latest: true,
-          snapshotId: "snap_124",
-          workspaceId: seededWorkspaceId,
-        });
-        assert.isNotNull(header);
-        assert.strictEqual(header.manifestKey, manifestKey);
-        assert.strictEqual(header.parentSnapshotId, "snap_123");
-        assert.strictEqual(header.snapshotId, "snap_124");
-        assert.strictEqual(header.workspaceId, seededWorkspaceId);
-        assert.isNotNull(ref);
-        assert.strictEqual(ref.snapshotId, "snap_124");
-        assert.strictEqual(ref.version, 2);
-      })
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "BlobStoreError",
+      reason: "io_failed",
+    });
+  });
+
+  it("POST /v1/save/prepare fails closed without object storage", async () => {
+    const response = await worker.fetch(
+      jsonRequest("/v1/save/prepare", {
+        client: restoreRequest.client,
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        idempotencyKey: "run-123456789-save",
+        identity: restoreRequest.identity,
+        manifest: {
+          digest: seededManifestDigest,
+          key: seededManifestKey,
+          size: 8,
+          snapshotId: "snap_132",
+        },
+        objects: seededSnapshot.objects,
+        protocolVersion: 1,
+        workspace: restoreRequest.workspace,
+      }),
+      env
+    );
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "BlobStoreError",
+      reason: "io_failed",
+    });
+  });
+
+  it.effect("POST /v1/save/commit checks context before objects", () =>
+    Effect.gen(function* commitChecksContextBeforeObjectsEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save",
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_132",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          env,
+          { blobStore: failingHeadBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "restore_required_before_save",
+      });
+    })
+  );
+
+  it.effect("POST /v1/save/commit validates object presence", () =>
+    Effect.gen(function* commitValidatesObjectsEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            namespace: seededNamespace,
+            refName: seededRefName,
+            runId: Schema.decodeSync(RunId)("123456789"),
+            trustClass: "trusted",
+            workspaceId: seededWorkspaceId,
+          },
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save",
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_132",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          env,
+          { blobStore: createInMemoryBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_132")
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "snapshot_object_missing",
+      });
+      assert.isNull(header);
+    })
   );
 
   it.effect(
-    "POST /v1/save rejects saves whose run id does not match the restored run",
+    "POST /v1/save/commit does not mutate refs without coordinator",
     () =>
-      Effect.gen(function* saveRejectsRunMismatchEffect() {
+      Effect.gen(function* commitDoesNotMutateWithoutCoordinatorEffect() {
         const metadata = createInMemoryMetadataBackend({
-          refs: [seededRef],
-          snapshots: [seededSnapshot],
+          workspaceTargets: [
+            {
+              namespace: seededNamespace,
+              refName: seededRefName,
+              runId: Schema.decodeSync(RunId)("123456789"),
+              trustClass: "trusted",
+              workspaceId: seededWorkspaceId,
+            },
+          ],
         });
-        const restoreResponse = yield* Effect.promise(() =>
-          handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
-            metadata,
-          })
-        );
-        const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
-          yield* Effect.promise(() => restoreResponse.json())
-        );
-
-        if (restoreBody.workspaceId === undefined) {
-          return yield* Effect.die(
-            "Restore response did not include a save workspace."
-          );
-        }
-
         const response = yield* Effect.promise(() =>
           handleFetch(
-            jsonRequest("/v1/save", {
-              ...saveRequest,
-              runId: "987654321",
-              workspaceId: restoreBody.workspaceId,
+            jsonRequest("/v1/save/commit", {
+              baseSnapshotId: null,
+              expectedHeadGeneration: 0,
+              idempotencyKey: "run-123456789-save",
+              manifest: {
+                digest: seededManifestDigest,
+                key: seededManifestKey,
+                size: 8,
+                snapshotId: "snap_132",
+              },
+              objects: seededSnapshot.objects,
+              protocolVersion: 1,
+              runId: "123456789",
+              target: { namespace: seededNamespace, refName: seededRefName },
+              workspaceId: seededWorkspaceId,
             }),
             env,
-            { metadata }
+            { blobStore: seededBlobStore(), metadata }
           )
         );
-        const body = yield* Effect.promise(() => response.json());
-        const header = yield* metadata.getSnapshotHeader(
-          Schema.decodeSync(SnapshotId)("snap_124")
-        );
-
-        assert.strictEqual(response.status, 200);
-        assert.deepStrictEqual(body, {
-          decision: "denied",
-          reason: "save_run_context_mismatch",
-        });
-        assert.isNull(header);
-      })
-  );
-
-  it.effect(
-    "POST /v1/restore lets a trusted first run save when no compatible snapshot exists",
-    () =>
-      Effect.gen(function* restoreAllowsTrustedFirstRunSaveEffect() {
-        const metadata = createInMemoryMetadataBackend();
-        const response = yield* Effect.promise(() =>
-          handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
-            metadata,
-          })
-        );
-
-        assert.strictEqual(response.status, 200);
-        const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
+        const body = Schema.decodeUnknownSync(CommitSaveResponse)(
           yield* Effect.promise(() => response.json())
         );
-
-        assert.deepStrictEqual(restoreBody, {
-          decision: "denied",
-          reason: "no_compatible_snapshot",
-          save: { allowed: true, target: seededRefName },
-          trustClass: "trusted",
-          workspaceId: seededWorkspaceId,
-        });
-
-        const saveResponse = yield* Effect.promise(() =>
-          handleFetch(
-            jsonRequest("/v1/save", {
-              ...saveRequest,
-              baseSnapshotId: null,
-              workspaceId: restoreBody.workspaceId,
-            }),
-            env,
-            { metadata }
-          )
-        );
-        const saveBody = yield* Effect.promise(() => saveResponse.json());
         const header = yield* metadata.getSnapshotHeader(
-          Schema.decodeSync(SnapshotId)("snap_124")
+          Schema.decodeSync(SnapshotId)("snap_132")
         );
         const ref = yield* metadata.getRef(seededNamespace, seededRefName);
 
-        assert.deepStrictEqual(saveBody, {
-          decision: "committed",
-          latest: true,
-          snapshotId: "snap_124",
-          workspaceId: seededWorkspaceId,
+        assert.strictEqual(response.status, 200);
+        assert.deepStrictEqual(body, {
+          decision: "denied",
+          reason: "backend_policy_not_configured",
         });
-        assert.isNotNull(header);
-        assert.strictEqual(header.parentSnapshotId, null);
-        assert.strictEqual(header.snapshotId, "snap_124");
-        assert.strictEqual(header.workspaceId, seededWorkspaceId);
-        assert.isNotNull(ref);
-        assert.strictEqual(ref.snapshotId, "snap_124");
-        assert.strictEqual(ref.trustClass, "trusted");
+        assert.isNull(header);
+        assert.isNull(ref);
       })
   );
 
@@ -714,13 +1068,13 @@ describe("worker API", () => {
         ...env,
         STATEFUL_CI_TRUSTED_REFS: "refs/heads/master",
       },
-      { metadata }
+      { blobStore: createInMemoryBlobStore(), metadata }
     );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      reason: "snapshot_object_missing",
       trustClass: "internal",
     });
   });
@@ -744,207 +1098,47 @@ describe("worker API", () => {
         ...env,
         STATEFUL_CI_TRUSTED_REFS: "refs/heads/main,refs/heads/release",
       },
-      { metadata }
+      { blobStore: createInMemoryBlobStore(), metadata }
     );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      reason: "snapshot_object_missing",
       trustClass: "internal",
     });
   });
 
-  it("default worker fetches preserve restore targets for the following save request", async () => {
-    const metadata = createInMemoryMetadataBackend({
-      refs: [seededRef],
-      snapshots: [seededSnapshot],
-    });
-    const restoreResponse = await handleFetch(
-      jsonRequest("/v1/restore", restoreRequest),
-      env,
-      { metadata }
-    );
-    const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
-      await restoreResponse.json()
-    );
+  it.effect("POST /v1/save is fail-closed and does not mutate metadata", () =>
+    Effect.gen(function* legacySaveIsFailClosedEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            namespace: seededNamespace,
+            refName: seededRefName,
+            runId: Schema.decodeSync(RunId)("123456789"),
+            trustClass: "trusted",
+            workspaceId: seededWorkspaceId,
+          },
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(jsonRequest("/v1/save", saveRequest), env, { metadata })
+      );
+      const body = yield* Effect.promise(() => response.json());
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_124")
+      );
+      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
 
-    if (restoreBody.workspaceId === undefined) {
-      throw new Error("Restore response did not include a save workspace.");
-    }
-
-    const response = await worker.fetch(
-      jsonRequest("/v1/save", {
-        ...saveRequest,
-        workspaceId: restoreBody.workspaceId,
-      }),
-      env
-    );
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
-      decision: "committed",
-      snapshotId: "snap_124",
-      workspaceId: restoreBody.workspaceId,
-    });
-  });
-
-  it.effect(
-    "POST /v1/save commits same-repo pull request snapshots to internal refs",
-    () =>
-      Effect.gen(function* saveCommitsInternalPullRequestSnapshotEffect() {
-        const metadata = createInMemoryMetadataBackend({
-          refs: [seededRef],
-          snapshots: [seededSnapshot],
-        });
-        const restoreResponse = yield* Effect.promise(() =>
-          handleFetch(jsonRequest("/v1/restore", internalPullRequest), env, {
-            metadata,
-          })
-        );
-        const restoreBody = Schema.decodeUnknownSync(RestoreDeniedResponse)(
-          yield* Effect.promise(() => restoreResponse.json())
-        );
-
-        if (restoreBody.workspaceId === undefined) {
-          return yield* Effect.die(
-            "Restore response did not include a save workspace."
-          );
-        }
-
-        const response = yield* Effect.promise(() =>
-          handleFetch(
-            jsonRequest("/v1/save", {
-              ...saveRequest,
-              workspaceId: restoreBody.workspaceId,
-            }),
-            env,
-            { metadata }
-          )
-        );
-        const body = yield* Effect.promise(() => response.json());
-        const ref = yield* metadata.getRef(
-          seededNamespace,
-          "internal/refs-pull-12-merge/latest"
-        );
-
-        assert.strictEqual(response.status, 200);
-        assert.deepStrictEqual(body, {
-          decision: "committed",
-          latest: true,
-          snapshotId: "snap_124",
-          workspaceId: restoreBody.workspaceId,
-        });
-        assert.isNotNull(ref);
-        assert.strictEqual(ref.snapshotId, "snap_124");
-        assert.strictEqual(ref.trustClass, "internal");
-      })
-  );
-
-  it("POST /v1/save has no remembered target for fork pull requests", async () => {
-    const metadata = createInMemoryMetadataBackend({
-      refs: [seededRef],
-      snapshots: [seededSnapshot],
-    });
-    const restoreResponse = await handleFetch(
-      jsonRequest("/v1/restore", externalPullRequest),
-      env,
-      { metadata }
-    );
-    await expect(restoreResponse.json()).resolves.toMatchObject({
-      decision: "denied",
-      reason: "backend_policy_not_configured",
-      save: { allowed: false },
-      trustClass: "external",
-    });
-    const response = await handleFetch(
-      jsonRequest("/v1/save", {
-        ...saveRequest,
-        workspaceId: seededWorkspaceId,
-      }),
-      env,
-      { metadata }
-    );
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toStrictEqual({
-      decision: "denied",
-      reason: "restore_required_before_save",
-    });
-  });
-
-  it("POST /v1/save has no remembered target for privileged snapshots", async () => {
-    const metadata = createInMemoryMetadataBackend({
-      refs: [seededRef],
-      snapshots: [seededSnapshot],
-    });
-    const restoreResponse = await handleFetch(
-      jsonRequest("/v1/restore", privilegedRelease),
-      env,
-      { metadata }
-    );
-    await expect(restoreResponse.json()).resolves.toMatchObject({
-      decision: "denied",
-      reason: "backend_policy_not_configured",
-      save: { allowed: false },
-      trustClass: "privileged",
-    });
-    const response = await handleFetch(
-      jsonRequest("/v1/save", {
-        ...saveRequest,
-        workspaceId: seededWorkspaceId,
-      }),
-      env,
-      { metadata }
-    );
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toStrictEqual({
-      decision: "denied",
-      reason: "restore_required_before_save",
-    });
-  });
-
-  it.effect(
-    "restore and save record audit metadata for allow and deny decisions",
-    () =>
-      Effect.gen(function* restoreAndSaveRecordAuditMetadataEffect() {
-        const metadata = createInMemoryMetadataBackend({
-          refs: [seededRef],
-          snapshots: [seededSnapshot],
-        });
-
-        yield* Effect.promise(() =>
-          handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
-            metadata,
-          })
-        );
-        yield* Effect.promise(() =>
-          handleFetch(jsonRequest("/v1/save", saveRequest), env, { metadata })
-        );
-
-        const auditEvents = yield* metadata.listAuditEvents;
-
-        assert.deepStrictEqual(
-          auditEvents.map(({ decision, eventType, reason }) => ({
-            decision,
-            eventType,
-            reason,
-          })),
-          [
-            {
-              decision: "denied",
-              eventType: "restore",
-              reason: "backend_policy_not_configured",
-            },
-            {
-              decision: "denied",
-              eventType: "save",
-              reason: "restore_required_before_save",
-            },
-          ]
-        );
-      })
+      assert.strictEqual(response.status, 410);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "backend_policy_not_configured",
+      });
+      assert.isNull(header);
+      assert.isNull(ref);
+    })
   );
 
   it("invalid JSON returns structured 400", async () => {
