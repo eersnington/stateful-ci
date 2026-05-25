@@ -64,6 +64,7 @@ export type RestoreCoordinatorResult =
     };
 
 export interface AuthorizeRestoreInput {
+  readonly auditPayloadJson?: string | null | undefined;
   readonly candidates: readonly RestoreCandidate[];
   readonly runId: RunId;
   readonly target: RefTarget;
@@ -72,6 +73,7 @@ export interface AuthorizeRestoreInput {
 }
 
 export interface PrepareSaveInput {
+  readonly auditPayloadJson?: string | null | undefined;
   readonly expiresAt: string;
   readonly producer: ProducerContext;
   readonly runId: RunId;
@@ -89,6 +91,7 @@ export type PrepareSaveCoordinatorResult =
   | { readonly decision: "denied"; readonly reason: DenialReason };
 
 export interface CommitSaveInput {
+  readonly auditPayloadJson?: string | null | undefined;
   readonly baseSnapshotId: SnapshotId | null;
   readonly expectedHeadGeneration: HeadGeneration;
   readonly idempotencyKey: IdempotencyKey;
@@ -124,6 +127,7 @@ export class SnapshotCoordinator extends Context.Service<
       MetadataBackend
     >;
     readonly recordRestoreAllowed: (input: {
+      readonly auditPayloadJson?: string | null | undefined;
       readonly runId: RunId;
       readonly snapshotId: SnapshotId;
       readonly target: RefTarget;
@@ -131,6 +135,7 @@ export class SnapshotCoordinator extends Context.Service<
       readonly workspaceId: WorkspaceId;
     }) => Effect.Effect<void, MetadataBackendError, MetadataBackend>;
     readonly recordRestoreObjectDenial: (input: {
+      readonly auditPayloadJson?: string | null | undefined;
       readonly reason: DenialReason;
       readonly runId: RunId;
       readonly snapshotId: SnapshotId;
@@ -231,6 +236,45 @@ const producerFromTarget = (
   sha: target?.producerSha ?? fallback.sha,
   workflow: target?.producerWorkflow ?? fallback.workflow,
 });
+
+const producerMatchesTarget = (
+  target: WorkspaceTarget,
+  producer: ProducerContext
+) =>
+  (target.producerActor === undefined ||
+    target.producerActor === producer.actor) &&
+  (target.producerEvent === undefined ||
+    target.producerEvent === producer.event) &&
+  (target.producerJob === undefined || target.producerJob === producer.job) &&
+  (target.producerRef === undefined || target.producerRef === producer.ref) &&
+  (target.producerRepository === undefined ||
+    target.producerRepository === producer.repository) &&
+  (target.producerSha === undefined || target.producerSha === producer.sha) &&
+  (target.producerWorkflow === undefined ||
+    target.producerWorkflow === producer.workflow);
+
+const validateCommitTarget = (
+  target: WorkspaceTarget,
+  input: CommitSaveInput
+): DenialReason | null => {
+  if (
+    target.runId !== input.producer.runId ||
+    target.namespace !== input.target.namespace ||
+    target.refName !== input.target.refName
+  ) {
+    return "save_run_context_mismatch";
+  }
+
+  if (
+    input.auditPayloadJson !== null &&
+    input.auditPayloadJson !== undefined &&
+    !producerMatchesTarget(target, input.producer)
+  ) {
+    return "save_run_context_mismatch";
+  }
+
+  return null;
+};
 
 const recoverIdempotentCommit = Effect.fn("recoverIdempotentCommit")(
   function* recoverIdempotentCommit(
@@ -349,7 +393,7 @@ export const createMetadataSnapshotCoordinator =
               createdAt,
               decision: "denied",
               eventType: "restore",
-              payloadJson: null,
+              payloadJson: input.auditPayloadJson ?? null,
               reason: "unable_to_classify_run_context",
               runId: input.runId,
               snapshotId: null,
@@ -422,7 +466,7 @@ export const createMetadataSnapshotCoordinator =
             createdAt,
             decision: "denied",
             eventType: "restore",
-            payloadJson: null,
+            payloadJson: input.auditPayloadJson ?? null,
             reason: deniedReason ?? "no_compatible_snapshot",
             runId: input.runId,
             snapshotId: deniedSnapshotId,
@@ -464,14 +508,12 @@ export const createMetadataSnapshotCoordinator =
             });
           }
 
-          if (
-            target.runId !== input.producer.runId ||
-            target.namespace !== input.target.namespace ||
-            target.refName !== input.target.refName
-          ) {
+          const targetValidation = validateCommitTarget(target, input);
+
+          if (targetValidation !== null) {
             return Schema.decodeSync(CommitSaveDeniedResponse)({
               decision: "denied",
-              reason: "save_run_context_mismatch",
+              reason: targetValidation,
             });
           }
 
@@ -629,7 +671,7 @@ export const createMetadataSnapshotCoordinator =
             createdAt,
             decision: "committed",
             eventType: "commit",
-            payloadJson: null,
+            payloadJson: input.auditPayloadJson ?? null,
             reason: null,
             runId: input.producer.runId,
             snapshotId: input.manifest.snapshotId,
@@ -648,6 +690,19 @@ export const createMetadataSnapshotCoordinator =
           });
 
           if (!savePolicy.allowed) {
+            const createdAt = yield* currentIsoTimestamp;
+            yield* metadata.appendAuditEvent({
+              ...input.target,
+              createdAt,
+              decision: "denied",
+              eventType: "prepare-save",
+              payloadJson: input.auditPayloadJson ?? null,
+              reason: savePolicy.reason,
+              runId: input.runId,
+              snapshotId: null,
+              trustClass: input.trustClass,
+              workspaceId: input.workspaceId,
+            });
             return { decision: "denied" as const, reason: savePolicy.reason };
           }
 
@@ -670,6 +725,20 @@ export const createMetadataSnapshotCoordinator =
             workspaceId: input.workspaceId,
           });
 
+          const createdAt = yield* currentIsoTimestamp;
+          yield* metadata.appendAuditEvent({
+            ...input.target,
+            createdAt,
+            decision: "allowed",
+            eventType: "prepare-save",
+            payloadJson: input.auditPayloadJson ?? null,
+            reason: null,
+            runId: input.runId,
+            snapshotId: ref?.snapshotId ?? null,
+            trustClass: input.trustClass,
+            workspaceId: input.workspaceId,
+          });
+
           return {
             baseSnapshotId: ref?.snapshotId ?? null,
             decision: "allowed" as const,
@@ -684,7 +753,7 @@ export const createMetadataSnapshotCoordinator =
             createdAt,
             decision: "allowed",
             eventType: "restore",
-            payloadJson: null,
+            payloadJson: input.auditPayloadJson ?? null,
             reason: null,
             runId: input.runId,
             snapshotId: input.snapshotId,
@@ -700,7 +769,7 @@ export const createMetadataSnapshotCoordinator =
             createdAt,
             decision: "denied",
             eventType: "restore",
-            payloadJson: null,
+            payloadJson: input.auditPayloadJson ?? null,
             reason: input.reason,
             runId: input.runId,
             snapshotId: input.snapshotId,

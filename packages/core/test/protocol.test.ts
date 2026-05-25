@@ -116,6 +116,7 @@ const commitSaveRequest = {
   baseSnapshotId: "snap_123",
   expectedHeadGeneration: 7,
   idempotencyKey: "run-123456789-save",
+  identity,
   manifest,
   objects,
   protocolVersion: 1,

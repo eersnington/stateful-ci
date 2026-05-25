@@ -21,6 +21,7 @@ import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
 
 const env = {
+  STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY: "true",
   STATEFUL_CI_API_TOKEN: "test-token",
 };
 
@@ -785,6 +786,63 @@ describe("worker API", () => {
     });
   });
 
+  it("POST /v1/restore denies unverified production identity", async () => {
+    const metadata = createInMemoryMetadataBackend();
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      { STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN },
+      { metadata }
+    );
+    const audit = await Effect.runPromise(metadata.listAuditEvents());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "oidc_invalid",
+      save: { allowed: false },
+      trustClass: "unknown",
+    });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
+      decision: "denied",
+      eventType: "restore",
+      reason: "oidc_invalid",
+      trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/save/prepare fails closed with malformed configured JWKS", async () => {
+    const response = await worker.fetch(
+      jsonRequest("/v1/save/prepare", {
+        client: restoreRequest.client,
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        idempotencyKey: "run-123456789-save",
+        identity: restoreRequest.identity,
+        manifest: {
+          digest: seededManifestDigest,
+          key: seededManifestKey,
+          size: 8,
+          snapshotId: "snap_132",
+        },
+        objects: seededSnapshot.objects,
+        protocolVersion: 1,
+        workspace: restoreRequest.workspace,
+      }),
+      {
+        STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
+        STATEFUL_CI_GITHUB_JWKS_JSON: "not json",
+      }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "oidc_invalid",
+      trustClass: "unknown",
+    });
+  });
+
   it("POST /v1/save fails closed", async () => {
     const response = await worker.fetch(
       jsonRequest("/v1/save", saveRequest),
@@ -808,6 +866,7 @@ describe("worker API", () => {
           ],
         ])
       );
+      const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
           jsonRequest("/v1/save/prepare", {
@@ -827,12 +886,13 @@ describe("worker API", () => {
             workspace: restoreRequest.workspace,
           }),
           env,
-          { blobStore }
+          { blobStore, metadata }
         )
       );
       const body = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
         yield* Effect.promise(() => response.json())
       );
+      const audit = yield* metadata.listAuditEvents();
 
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(
@@ -840,6 +900,11 @@ describe("worker API", () => {
         [seededPackKey, seededChunkKey]
       );
       assert.strictEqual(body.expectedHeadGeneration, 0);
+      assert.deepInclude(audit[0], {
+        decision: "allowed",
+        eventType: "prepare-save",
+        reason: null,
+      });
     })
   );
 
@@ -909,6 +974,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -932,6 +998,56 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("POST /v1/save/commit denies unverified production identity", () =>
+    Effect.gen(function* commitDeniesUnverifiedProductionIdentityEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            namespace: seededNamespace,
+            refName: seededRefName,
+            runId: Schema.decodeSync(RunId)("123456789"),
+            trustClass: "trusted",
+            workspaceId: seededWorkspaceId,
+          },
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_132",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          { STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN },
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "oidc_invalid",
+      });
+      assert.isNull(ref);
+    })
+  );
+
   it.effect("POST /v1/save/commit validates object presence", () =>
     Effect.gen(function* commitValidatesObjectsEffect() {
       const metadata = createInMemoryMetadataBackend({
@@ -951,6 +1067,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -1002,6 +1119,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -1025,6 +1143,7 @@ describe("worker API", () => {
         Schema.decodeSync(SnapshotId)("snap_132")
       );
       const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+      const audit = yield* metadata.listAuditEvents();
 
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(body, {
@@ -1035,6 +1154,11 @@ describe("worker API", () => {
       });
       assert.isNotNull(header);
       assert.strictEqual(ref?.snapshotId, "snap_132");
+      assert.deepInclude(audit.at(-1), {
+        decision: "committed",
+        eventType: "commit",
+        reason: null,
+      });
     })
   );
 

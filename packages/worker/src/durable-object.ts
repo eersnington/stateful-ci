@@ -42,6 +42,7 @@ const ProducerContextSchema = Schema.Struct({
 });
 
 const AuthorizeRestoreInputSchema = Schema.Struct({
+  auditPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
   candidates: Schema.Array(RefTargetSchema),
   runId: RunId,
   target: RefTargetSchema,
@@ -50,6 +51,7 @@ const AuthorizeRestoreInputSchema = Schema.Struct({
 });
 
 const PrepareSaveInputSchema = Schema.Struct({
+  auditPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
   expiresAt: Schema.String.check(Schema.isMinLength(1)),
   producer: ProducerContextSchema,
   runId: RunId,
@@ -59,6 +61,7 @@ const PrepareSaveInputSchema = Schema.Struct({
 });
 
 const CommitSaveInputSchema = Schema.Struct({
+  auditPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
   baseSnapshotId: Schema.NullOr(SnapshotId),
   expectedHeadGeneration: HeadGeneration,
   idempotencyKey: IdempotencyKey,
@@ -70,6 +73,7 @@ const CommitSaveInputSchema = Schema.Struct({
 });
 
 const RestoreAuditInputSchema = Schema.Struct({
+  auditPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
   runId: RunId,
   snapshotId: SnapshotId,
   target: RefTargetSchema,
@@ -78,6 +82,7 @@ const RestoreAuditInputSchema = Schema.Struct({
 });
 
 const RestoreObjectDenialInputSchema = Schema.Struct({
+  auditPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
   reason: DenialReason,
   runId: RunId,
   snapshotId: SnapshotId,

@@ -46,6 +46,11 @@ const authHeaders = {
   "content-type": "application/json",
 };
 
+const legacyEnv = {
+  ...env,
+  STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY: "true",
+};
+
 const jsonRequest = (path: string, body: unknown) =>
   new Request(`https://stateful-ci.test${path}`, {
     body: JSON.stringify(body),
@@ -126,7 +131,7 @@ describe("Worker Cloudflare runtime bindings", () => {
 
     const prepare = await worker.fetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
-      env
+      legacyEnv
     );
     const prepareBody = await prepare.json<{
       expectedHeadGeneration: number;
@@ -142,6 +147,7 @@ describe("Worker Cloudflare runtime bindings", () => {
         baseSnapshotId: null,
         expectedHeadGeneration: Schema.decodeSync(HeadGeneration)(0),
         idempotencyKey: prepareRequest.idempotencyKey,
+        identity: prepareRequest.identity,
         manifest: prepareRequest.manifest,
         objects: prepareRequest.objects,
         protocolVersion: 1,
@@ -149,7 +155,7 @@ describe("Worker Cloudflare runtime bindings", () => {
         target: { namespace, refName },
         workspaceId,
       }),
-      env
+      legacyEnv
     );
     const commitBody = await commit.json<{ decision: string }>();
     const ref = await Effect.runPromise(metadata().getRef(namespace, refName));
@@ -179,7 +185,7 @@ describe("Worker Cloudflare runtime bindings", () => {
 
     const prepare = await worker.fetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
-      env
+      legacyEnv
     );
     expect(prepare.status).toBe(200);
 
@@ -188,6 +194,7 @@ describe("Worker Cloudflare runtime bindings", () => {
         baseSnapshotId: null,
         expectedHeadGeneration: Schema.decodeSync(HeadGeneration)(0),
         idempotencyKey: prepareRequest.idempotencyKey,
+        identity: prepareRequest.identity,
         manifest: prepareRequest.manifest,
         objects: prepareRequest.objects,
         protocolVersion: 1,
@@ -195,7 +202,7 @@ describe("Worker Cloudflare runtime bindings", () => {
         target: { namespace, refName },
         workspaceId,
       }),
-      env
+      legacyEnv
     );
     const commitBody = await commit.json<{
       decision: string;
@@ -215,6 +222,7 @@ describe("Worker Cloudflare runtime bindings", () => {
     const response = await handleFetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
       {
+        STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY: "true",
         STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
         STATEFUL_CI_METADATA: env.STATEFUL_CI_METADATA,
         STATEFUL_CI_OBJECTS: env.STATEFUL_CI_OBJECTS,

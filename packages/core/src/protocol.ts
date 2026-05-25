@@ -253,6 +253,7 @@ export const CommitSaveRequest = Schema.Struct({
   baseSnapshotId: Schema.NullOr(SnapshotId),
   expectedHeadGeneration: HeadGeneration,
   idempotencyKey: IdempotencyKey,
+  identity: GitHubOidcIdentity,
   manifest: ManifestDescriptor,
   objects: SnapshotObjectInventory,
   protocolVersion: Schema.Literal(protocolVersion),

@@ -1,4 +1,8 @@
-import type { RestoreRequest, TrustClass } from "@stateful-ci/core";
+import type {
+  RestoreRequest,
+  TrustClass,
+  VerifiedGitHubActionsIdentity,
+} from "@stateful-ci/core";
 
 type RunClassificationRequest = Pick<
   RestoreRequest,
@@ -20,6 +24,22 @@ const isPresent = (value: string | null) =>
 const isBranchRef = (ref: string) => ref.startsWith("refs/heads/");
 
 const isTagRef = (ref: string) => ref.startsWith("refs/tags/");
+
+const classifyPullRequestTrust = (
+  identity: VerifiedGitHubActionsIdentity
+): TrustClass => {
+  if (!isPresent(identity.baseRef) || !isPresent(identity.headRef)) {
+    return "unknown";
+  }
+
+  if (!isPresent(identity.headRepository)) {
+    return "external";
+  }
+
+  return identity.headRepository === identity.repository
+    ? "internal"
+    : "external";
+};
 
 export const classifyRunTrust = (
   request: RunClassificationRequest,
@@ -72,6 +92,52 @@ export const classifyRunTrust = (
     return "unknown";
   }
   if (trustedRefs.includes(git.ref)) {
+    return "trusted";
+  }
+
+  return "internal";
+};
+
+export const classifyVerifiedGitHubTrust = (
+  identity: VerifiedGitHubActionsIdentity,
+  options: RunClassificationOptions = {}
+): TrustClass => {
+  const trustedRefs =
+    options.trustedRefs === undefined || options.trustedRefs.length === 0
+      ? defaultTrustedRefs
+      : options.trustedRefs;
+
+  if (!isPresent(identity.event)) {
+    return "unknown";
+  }
+  if (!isPresent(identity.ref)) {
+    return "unknown";
+  }
+  if (!isPresent(identity.repository)) {
+    return "unknown";
+  }
+
+  if (identity.event === "pull_request_target") {
+    return "unknown";
+  }
+  if (identity.event === "release" || identity.event === "deployment") {
+    return isTagRef(identity.ref) ? "privileged" : "unknown";
+  }
+  if (isTagRef(identity.ref)) {
+    return "unknown";
+  }
+
+  if (identity.event === "pull_request") {
+    return classifyPullRequestTrust(identity);
+  }
+
+  if (identity.event !== "push") {
+    return "unknown";
+  }
+  if (!isBranchRef(identity.ref)) {
+    return "unknown";
+  }
+  if (trustedRefs.includes(identity.ref)) {
     return "trusted";
   }
 
