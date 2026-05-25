@@ -512,8 +512,11 @@ const workspaceTargetFromRow = (
   row: Record<string, unknown>
 ): WorkspaceTarget =>
   ({
-    expiresAt: stringColumn(row, "expires_at"),
     namespace: stringColumn(row, "namespace"),
+    ...optionalStringField(
+      "expiresAt",
+      nullableStringColumn(row, "expires_at")
+    ),
     ...optionalStringField(
       "producerActor",
       nullableStringColumn(row, "producer_actor")
@@ -716,47 +719,67 @@ export const createD1MetadataBackend = (
             operation: "listAuditEvents",
           }),
         try: async () => {
+          const predicates = [
+            query.namespace === undefined
+              ? null
+              : { sql: "namespace = ?", value: query.namespace },
+            query.refName === undefined
+              ? null
+              : { sql: "ref_name = ?", value: query.refName },
+            query.workspaceId === undefined
+              ? null
+              : { sql: "workspace_id = ?", value: query.workspaceId },
+            query.runId === undefined
+              ? null
+              : { sql: "run_id = ?", value: query.runId },
+          ].filter(
+            (
+              predicate
+            ): predicate is { readonly sql: string; readonly value: string } =>
+              predicate !== null
+          );
+          const where =
+            predicates.length === 0
+              ? ""
+              : ` where ${predicates.map((predicate) => predicate.sql).join(" and ")}`;
           const result = await db
-            .prepare("select * from audit_events order by created_at, id")
-            .all<Record<string, unknown>>();
-          return result.results
-            .map(
-              (row): AuditEvent => ({
-                createdAt: stringColumn(row, "created_at"),
-                decision: Schema.decodeUnknownSync(AuditDecisionSchema)(
-                  stringColumn(row, "decision")
-                ),
-                eventType: Schema.decodeUnknownSync(AuditEventTypeSchema)(
-                  stringColumn(row, "event_type")
-                ),
-                id: stringColumn(row, "id"),
-                namespace: stringColumn(row, "namespace"),
-                payloadJson: nullableStringColumn(row, "payload_json"),
-                reason: nullableDecodedColumn(
-                  DenialReasonSchema,
-                  row,
-                  "reason"
-                ),
-                refName: stringColumn(row, "ref_name"),
-                runId: nullableDecodedColumn(RunIdSchema, row, "run_id"),
-                snapshotId: nullableDecodedColumn(
-                  SnapshotIdSchema,
-                  row,
-                  "snapshot_id"
-                ),
-                trustClass: nullableDecodedColumn(
-                  TrustClassSchema,
-                  row,
-                  "trust_class"
-                ),
-                workspaceId: nullableDecodedColumn(
-                  WorkspaceIdSchema,
-                  row,
-                  "workspace_id"
-                ),
-              })
+            .prepare(
+              `select * from audit_events${where} order by created_at, id`
             )
-            .filter((event) => auditMatchesQuery(event, query));
+            .bind(...predicates.map((predicate) => predicate.value))
+            .all<Record<string, unknown>>();
+          return result.results.map(
+            (row): AuditEvent => ({
+              createdAt: stringColumn(row, "created_at"),
+              decision: Schema.decodeUnknownSync(AuditDecisionSchema)(
+                stringColumn(row, "decision")
+              ),
+              eventType: Schema.decodeUnknownSync(AuditEventTypeSchema)(
+                stringColumn(row, "event_type")
+              ),
+              id: stringColumn(row, "id"),
+              namespace: stringColumn(row, "namespace"),
+              payloadJson: nullableStringColumn(row, "payload_json"),
+              reason: nullableDecodedColumn(DenialReasonSchema, row, "reason"),
+              refName: stringColumn(row, "ref_name"),
+              runId: nullableDecodedColumn(RunIdSchema, row, "run_id"),
+              snapshotId: nullableDecodedColumn(
+                SnapshotIdSchema,
+                row,
+                "snapshot_id"
+              ),
+              trustClass: nullableDecodedColumn(
+                TrustClassSchema,
+                row,
+                "trust_class"
+              ),
+              workspaceId: nullableDecodedColumn(
+                WorkspaceIdSchema,
+                row,
+                "workspace_id"
+              ),
+            })
+          );
         },
       }),
     putSnapshotHeader: (header) =>
@@ -789,25 +812,47 @@ export const createD1MetadataBackend = (
         "putSnapshotHeader"
       ),
     putSnapshotObjects: (snapshotId, objects) =>
-      Effect.forEach(
-        objects,
-        (object) =>
-          runStatement(
-            db
-              .prepare(
-                "insert into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
-              )
-              .bind(
-                snapshotId,
-                object.key,
-                object.digest,
-                object.kind,
-                object.size
-              ),
-            "putSnapshotObjects"
-          ),
-        { discard: true }
-      ),
+      Effect.gen(function* putSnapshotObjectsD1Effect() {
+        const existing = yield* queryOne(
+          db
+            .prepare(
+              "select object_key from snapshot_objects where snapshot_id = ? limit 1"
+            )
+            .bind(snapshotId),
+          "getSnapshotObjectsForWrite",
+          (row) => stringColumn(row, "object_key")
+        );
+
+        if (existing !== null) {
+          return yield* Effect.fail(
+            new MetadataBackendError({
+              message:
+                "D1 metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
+              operation: "putSnapshotObjects",
+            })
+          );
+        }
+
+        yield* Effect.forEach(
+          snapshotRowsFromInventory(snapshotId, objects),
+          (object) =>
+            runStatement(
+              db
+                .prepare(
+                  "insert into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
+                )
+                .bind(
+                  object.snapshotId,
+                  object.key,
+                  object.digest,
+                  object.kind,
+                  object.size
+                ),
+              "putSnapshotObjects"
+            ),
+          { discard: true }
+        );
+      }),
     rememberIdempotentCommit: (commit) =>
       Effect.map(
         runStatement(
@@ -842,7 +887,7 @@ export const createD1MetadataBackend = (
             target.refName,
             target.runId,
             target.trustClass,
-            target.expiresAt ?? "",
+            target.expiresAt ?? null,
             target.producerRepository ?? null,
             target.producerWorkflow ?? null,
             target.producerJob ?? null,

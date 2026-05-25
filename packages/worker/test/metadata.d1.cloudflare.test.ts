@@ -361,10 +361,15 @@ describe("D1 metadata backend contract", () => {
       Effect.runPromise(metadata.listAuditEvents({ namespace }))
     ).resolves.toStrictEqual([event]);
     await expect(
+      Effect.runPromise(metadata.listAuditEvents({ refName }))
+    ).resolves.toStrictEqual([event, other]);
+    await expect(
       Effect.runPromise(metadata.listAuditEvents({ workspaceId }))
     ).resolves.toStrictEqual([event]);
-    await expect(
-      Effect.runPromise(metadata.listAuditEvents({ runId }))
-    ).resolves.toStrictEqual([event, other]);
+    const byRun = await Effect.runPromise(metadata.listAuditEvents({ runId }));
+    expect({ byRun, byRunLength: byRun.length }).toStrictEqual({
+      byRun: expect.arrayContaining([event, other]),
+      byRunLength: 2,
+    });
   });
 });

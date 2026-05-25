@@ -282,7 +282,11 @@ export class WorkspaceSnapshotCoordinatorDurableObject {
               return jsonResponse({ ok: true });
             }
             default: {
-              return jsonResponse({ message: "Unknown coordinator action." });
+              const unhandled: never = message;
+              return Response.json(
+                { message: "Unknown coordinator action.", unhandled },
+                { status: 400 }
+              );
             }
           }
         }).pipe(

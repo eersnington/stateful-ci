@@ -47,7 +47,7 @@ create table if not exists workspace_targets (
   ref_name text not null,
   run_id text not null,
   trust_class text not null,
-  expires_at text not null,
+  expires_at text,
   producer_repository text,
   producer_workflow text,
   producer_job text,

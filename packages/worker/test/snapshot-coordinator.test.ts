@@ -24,6 +24,7 @@ const workspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${namespace}:${refName}`
 );
 const runId = Schema.decodeSync(RunId)("123456789");
+const expiresAt = "2026-05-22T01:00:00.000Z";
 const manifestDigest = Schema.decodeSync(Sha256Digest)(
   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 );
@@ -97,7 +98,14 @@ describe("snapshot coordinator", () => {
     Effect.gen(function* coordinatorReplaysIdempotencyEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
-          { namespace, refName, runId, trustClass: "trusted", workspaceId },
+          {
+            expiresAt,
+            namespace,
+            refName,
+            runId,
+            trustClass: "trusted",
+            workspaceId,
+          },
         ],
       });
       const coordinator = createMetadataSnapshotCoordinator();
@@ -122,7 +130,14 @@ describe("snapshot coordinator", () => {
     Effect.gen(function* coordinatorRejectsIdempotencyConflictEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
-          { namespace, refName, runId, trustClass: "trusted", workspaceId },
+          {
+            expiresAt,
+            namespace,
+            refName,
+            runId,
+            trustClass: "trusted",
+            workspaceId,
+          },
         ],
       });
       const coordinator = createMetadataSnapshotCoordinator();
@@ -155,7 +170,14 @@ describe("snapshot coordinator", () => {
           refs: [refFor(otherSnapshotId)],
           snapshots: [{ ...committedHeader, snapshotId: otherSnapshotId }],
           workspaceTargets: [
-            { namespace, refName, runId, trustClass: "trusted", workspaceId },
+            {
+              expiresAt,
+              namespace,
+              refName,
+              runId,
+              trustClass: "trusted",
+              workspaceId,
+            },
           ],
         });
         const coordinator = createMetadataSnapshotCoordinator();
@@ -179,7 +201,14 @@ describe("snapshot coordinator", () => {
           refs: [refFor(commitInput.manifest.snapshotId)],
           snapshots: [committedHeader],
           workspaceTargets: [
-            { namespace, refName, runId, trustClass: "trusted", workspaceId },
+            {
+              expiresAt,
+              namespace,
+              refName,
+              runId,
+              trustClass: "trusted",
+              workspaceId,
+            },
           ],
         });
         const coordinator = createMetadataSnapshotCoordinator();
