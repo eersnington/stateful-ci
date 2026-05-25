@@ -56,7 +56,6 @@ import {
   validateObjectsPresent,
 } from "./object-data-plane";
 import {
-  classifyRunTrust,
   classifyVerifiedGitHubTrust,
   defaultTrustedRefs,
 } from "./run-classification";
@@ -82,7 +81,6 @@ interface WorkerEnv {
   readonly STATEFUL_CI_METADATA?: D1Database;
   readonly STATEFUL_CI_OBJECTS?: R2Bucket;
   readonly STATEFUL_CI_API_TOKEN?: string;
-  readonly STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY?: string;
   readonly STATEFUL_CI_GITHUB_JWKS_JSON?: string;
   readonly STATEFUL_CI_OIDC_AUDIENCE?: string;
   readonly STATEFUL_CI_TRUSTED_REFS?: string;
@@ -163,9 +161,6 @@ const oidcAudienceForEnv = (env: WorkerEnv | undefined) =>
     ? defaultGitHubOidcAudience
     : env.STATEFUL_CI_OIDC_AUDIENCE.trim();
 
-const allowUnverifiedIdentityForEnv = (env: WorkerEnv | undefined) =>
-  env?.STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY === "true";
-
 const oidcJwksForEnv = (env: WorkerEnv | undefined) => {
   if (env?.STATEFUL_CI_GITHUB_JWKS_JSON === undefined) {
     return { status: "unset" as const };
@@ -206,35 +201,18 @@ const isMetadataBackendError = (
   "_tag" in error &&
   error._tag === "MetadataBackendError";
 
-const producerContextFor = (
-  request: Pick<PrepareSaveRequest, "git" | "github" | "workspace">
-) => ({
-  actor: request.github.actor,
-  event: request.github.event,
-  job: request.workspace.job,
-  ref: request.git.ref,
-  repository: request.workspace.repo,
-  runId: Schema.decodeSync(RunId)(request.github.runId),
-  sha: request.git.sha,
-  workflow: request.workspace.workflow,
-});
-
 const producerContextForIdentity = (
-  identity: VerifiedGitHubActionsIdentity,
-  job: string
+  identity: VerifiedGitHubActionsIdentity
 ) => ({
   actor: identity.actor,
   event: identity.event,
-  job,
+  job: identity.checkRunId ?? identity.workflow,
   ref: identity.ref,
   repository: identity.repository,
   runId: Schema.decodeSync(RunId)(identity.runId),
   sha: identity.sha,
   workflow: identity.workflow,
 });
-
-const verifiedJobScopeForIdentity = (identity: VerifiedGitHubActionsIdentity) =>
-  identity.job ?? identity.jobWorkflowRef;
 
 const authorizeRequest = (request: Request, env: WorkerEnv | undefined) => {
   const expectedToken = env?.STATEFUL_CI_API_TOKEN;
@@ -361,21 +339,12 @@ const refSegment = (ref: string) => {
   return ref.replaceAll("/", "-");
 };
 
-const metadataTargetForRestore = (
-  request: Pick<RestoreRequest, "client" | "git" | "github" | "workspace">,
-  trustedRefs: readonly string[]
-): RefTarget => ({
-  namespace: `repo=${request.workspace.repo}/workflow=${request.workspace.workflow}/job=${request.workspace.job}/config=${request.client.configHash}`,
-  refName: `${classifyRunTrust(request, { trustedRefs })}/${refSegment(request.git.ref)}/latest`,
-});
-
 const metadataTargetForIdentity = (
   request: Pick<RestoreRequest, "client">,
   identity: VerifiedGitHubActionsIdentity,
-  job: string,
   trustClass: ReturnType<typeof classifyVerifiedGitHubTrust>
 ): RefTarget => ({
-  namespace: `repo=${identity.repository}/workflow=${identity.workflow}/job=${job}/config=${request.client.configHash}`,
+  namespace: `repo=${identity.repository}/workflow=${identity.workflow}/config=${request.client.configHash}`,
   refName: `${trustClass}/${refSegment(identity.ref)}/latest`,
 });
 
@@ -390,7 +359,7 @@ const trustedSeedTargetsFor = (
 
 const restoreCandidateTargets = (
   target: RefTarget,
-  trustClass: ReturnType<typeof classifyRunTrust>,
+  trustClass: ReturnType<typeof classifyVerifiedGitHubTrust>,
   trustedRefs: readonly string[]
 ) =>
   trustClass === "trusted" || trustClass === "unknown"
@@ -400,16 +369,12 @@ const restoreCandidateTargets = (
 const workspaceIdForTarget = (target: RefTarget) =>
   Schema.decodeSync(WorkspaceId)(`ws:${target.namespace}:${target.refName}`);
 
-const runIdFromRestore = (request: RestoreRequest) =>
-  Schema.decodeSync(RunId)(request.github.runId);
-
-const verifyRequestIdentity = (token: string, env: WorkerEnv | undefined) =>
+const verifyRequestIdentity = (
+  token: string | null | undefined,
+  env: WorkerEnv | undefined
+) =>
   Effect.gen(function* verifyRequestIdentityEffect() {
     const audience = oidcAudienceForEnv(env);
-
-    if (allowUnverifiedIdentityForEnv(env)) {
-      return null;
-    }
 
     const jwks = oidcJwksForEnv(env);
     if (jwks.status === "invalid") {
@@ -420,7 +385,7 @@ const verifyRequestIdentity = (token: string, env: WorkerEnv | undefined) =>
       });
     }
 
-    const identity = yield* verifyGitHubOidcToken(token, {
+    const identity = yield* verifyGitHubOidcToken(token ?? "", {
       audience,
       ...(jwks.status === "valid" ? { jwks: jwks.jwks } : {}),
     });
@@ -503,6 +468,33 @@ const recordCommitDeniedAudit = Effect.fn("recordCommitDeniedAudit")(
       snapshotId: input.request.manifest.snapshotId,
       trustClass: input.trustClass,
       workspaceId: input.request.workspaceId,
+    });
+  }
+);
+
+const recordPrepareDeniedAudit = Effect.fn("recordPrepareDeniedAudit")(
+  function* recordPrepareDeniedAuditEffect(input: {
+    readonly auditPayloadJson: string | null;
+    readonly reason: DenialReason;
+    readonly runId: RunId;
+    readonly target: RefTarget;
+    readonly trustClass: ReturnType<typeof classifyVerifiedGitHubTrust>;
+    readonly workspaceId: WorkspaceId;
+  }) {
+    const metadata = yield* MetadataBackend;
+    const createdAt = yield* currentIsoTimestamp;
+
+    yield* metadata.appendAuditEvent({
+      ...input.target,
+      createdAt,
+      decision: "denied",
+      eventType: "prepare-save",
+      payloadJson: input.auditPayloadJson,
+      reason: input.reason,
+      runId: input.runId,
+      snapshotId: null,
+      trustClass: input.trustClass,
+      workspaceId: input.workspaceId,
     });
   }
 );
@@ -667,7 +659,7 @@ const handleObjectRoute = Effect.fn("handleObjectRoute")(
 
 const denyPrepareSave = (
   reason: DenialReason,
-  trustClass: ReturnType<typeof classifyRunTrust>,
+  trustClass: ReturnType<typeof classifyVerifiedGitHubTrust>,
   workspaceId?: WorkspaceId
 ) =>
   Response.json(
@@ -690,15 +682,15 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
     Effect.flatMap(decodeProtocolPayload(RestoreRequest))
   );
   const verified = yield* verifyRequestIdentity(
-    restoreRequest.identity.token,
+    restoreRequest.identity?.token,
     env
   ).pipe(
     Effect.match({
       onFailure: (error) => ({ error, status: "denied" as const }),
-      onSuccess: (result) =>
-        result === null
-          ? { status: "legacy" as const }
-          : { identity: result.identity, status: "verified" as const },
+      onSuccess: (result) => ({
+        identity: result.identity,
+        status: "verified" as const,
+      }),
     })
   );
 
@@ -712,53 +704,18 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   }
 
   const trustedRefs = trustedRefsForEnv(env);
-  const verifiedJob =
-    verified.status === "verified"
-      ? verifiedJobScopeForIdentity(verified.identity)
-      : null;
-
-  if (verified.status === "verified" && verifiedJob === null) {
-    yield* recordOidcDeniedAudit({
-      eventType: "restore",
-      reason: "unable_to_classify_identity",
-      request: restoreRequest,
-    });
-    return Response.json(
-      Schema.encodeUnknownSync(RestoreDeniedResponse)({
-        decision: "denied",
-        reason: "unable_to_classify_identity",
-        save: { allowed: false },
-        trustClass: "unknown",
-      })
-    );
-  }
-  const verifiedJobScope = verifiedJob ?? "";
-
-  const trustClass =
-    verified.status === "verified"
-      ? classifyVerifiedGitHubTrust(verified.identity, {
-          trustedRefs,
-        })
-      : classifyRunTrust(restoreRequest, { trustedRefs });
-  const target =
-    verified.status === "verified"
-      ? metadataTargetForIdentity(
-          restoreRequest,
-          verified.identity,
-          verifiedJobScope,
-          trustClass
-        )
-      : metadataTargetForRestore(restoreRequest, trustedRefs);
+  const trustClass = classifyVerifiedGitHubTrust(verified.identity, {
+    trustedRefs,
+  });
+  const target = metadataTargetForIdentity(
+    restoreRequest,
+    verified.identity,
+    trustClass
+  );
   const workspaceId = workspaceIdForTarget(target);
-  const runId =
-    verified.status === "verified"
-      ? Schema.decodeSync(RunId)(verified.identity.runId)
-      : runIdFromRestore(restoreRequest);
+  const runId = Schema.decodeSync(RunId)(verified.identity.runId);
   const restore = yield* coordinator.authorizeRestore({
-    auditPayloadJson:
-      verified.status === "verified"
-        ? identityAuditPayload(verified.identity, null)
-        : null,
+    auditPayloadJson: identityAuditPayload(verified.identity, null),
     candidates: restoreCandidateTargets(target, trustClass, trustedRefs),
     runId,
     target,
@@ -793,10 +750,7 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
 
   if (!objectValidation.ok) {
     yield* coordinator.recordRestoreObjectDenial({
-      auditPayloadJson:
-        verified.status === "verified"
-          ? identityAuditPayload(verified.identity, null)
-          : null,
+      auditPayloadJson: identityAuditPayload(verified.identity, null),
       reason: objectValidation.reason,
       runId,
       snapshotId: restore.snapshot.snapshotId,
@@ -820,10 +774,7 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   }
 
   yield* coordinator.recordRestoreAllowed({
-    auditPayloadJson:
-      verified.status === "verified"
-        ? identityAuditPayload(verified.identity, null)
-        : null,
+    auditPayloadJson: identityAuditPayload(verified.identity, null),
     runId,
     snapshotId: restore.snapshot.snapshotId,
     target,
@@ -863,15 +814,15 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
       Effect.flatMap(decodeProtocolPayload(PrepareSaveRequest))
     );
     const verified = yield* verifyRequestIdentity(
-      prepareRequest.identity.token,
+      prepareRequest.identity?.token,
       env
     ).pipe(
       Effect.match({
         onFailure: (error) => ({ error, status: "denied" as const }),
-        onSuccess: (result) =>
-          result === null
-            ? { status: "legacy" as const }
-            : { identity: result.identity, status: "verified" as const },
+        onSuccess: (result) => ({
+          identity: result.identity,
+          status: "verified" as const,
+        }),
       })
     );
 
@@ -885,68 +836,18 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
     }
 
     const trustedRefs = trustedRefsForEnv(env);
-    const verifiedJob =
-      verified.status === "verified"
-        ? verifiedJobScopeForIdentity(verified.identity)
-        : null;
-
-    if (verified.status === "verified" && verifiedJob === null) {
-      yield* recordOidcDeniedAudit({
-        eventType: "prepare-save",
-        reason: "unable_to_classify_identity",
-        request: prepareRequest,
-      });
-      return Response.json(
-        Schema.encodeUnknownSync(PrepareSaveDeniedResponse)({
-          decision: "denied",
-          reason: "unable_to_classify_identity",
-          trustClass: "unknown",
-        })
-      );
-    }
-    const verifiedJobScope = verifiedJob ?? "";
-
-    const trustClass =
-      verified.status === "verified"
-        ? classifyVerifiedGitHubTrust(verified.identity, {
-            trustedRefs,
-          })
-        : classifyRunTrust(prepareRequest, { trustedRefs });
-    const target =
-      verified.status === "verified"
-        ? metadataTargetForIdentity(
-            prepareRequest,
-            verified.identity,
-            verifiedJobScope,
-            trustClass
-          )
-        : metadataTargetForRestore(prepareRequest, trustedRefs);
-    const workspaceId = workspaceIdForTarget(target);
-    const runId =
-      verified.status === "verified"
-        ? Schema.decodeSync(RunId)(verified.identity.runId)
-        : Schema.decodeSync(RunId)(prepareRequest.github.runId);
-    const expiresAt = yield* currentIsoTimestamp;
-    const saveAuthorization = yield* coordinator.prepareSave({
-      auditPayloadJson:
-        verified.status === "verified"
-          ? identityAuditPayload(verified.identity, null)
-          : null,
-      expiresAt,
-      producer:
-        verified.status === "verified"
-          ? producerContextForIdentity(verified.identity, verifiedJobScope)
-          : producerContextFor(prepareRequest),
-      runId,
-      target,
-      trustClass,
-      workspaceId,
+    const trustClass = classifyVerifiedGitHubTrust(verified.identity, {
+      trustedRefs,
     });
-
-    if (saveAuthorization.decision === "denied") {
-      return denyPrepareSave(saveAuthorization.reason, trustClass, workspaceId);
-    }
-
+    const target = metadataTargetForIdentity(
+      prepareRequest,
+      verified.identity,
+      trustClass
+    );
+    const workspaceId = workspaceIdForTarget(target);
+    const runId = Schema.decodeSync(RunId)(verified.identity.runId);
+    const expiresAt = yield* currentIsoTimestamp;
+    const auditPayloadJson = identityAuditPayload(verified.identity, null);
     const missing = yield* missingObjectPlans(prepareRequest.objects).pipe(
       Effect.matchEffect({
         onFailure: (error) =>
@@ -958,7 +859,29 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
     );
 
     if (!missing.ok) {
+      yield* recordPrepareDeniedAudit({
+        auditPayloadJson,
+        reason: missing.reason,
+        runId,
+        target,
+        trustClass,
+        workspaceId,
+      });
       return denyPrepareSave(missing.reason, trustClass, workspaceId);
+    }
+
+    const saveAuthorization = yield* coordinator.prepareSave({
+      auditPayloadJson,
+      expiresAt,
+      producer: producerContextForIdentity(verified.identity),
+      runId,
+      target,
+      trustClass,
+      workspaceId,
+    });
+
+    if (saveAuthorization.decision === "denied") {
+      return denyPrepareSave(saveAuthorization.reason, trustClass, workspaceId);
     }
 
     return Response.json(
@@ -987,15 +910,15 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
       Effect.flatMap(decodeProtocolPayload(CommitSaveRequest))
     );
     const verified = yield* verifyRequestIdentity(
-      commitRequest.identity.token,
+      commitRequest.identity?.token,
       env
     ).pipe(
       Effect.match({
         onFailure: (error) => ({ error, status: "denied" as const }),
-        onSuccess: (result) =>
-          result === null
-            ? { status: "legacy" as const }
-            : { identity: result.identity, status: "verified" as const },
+        onSuccess: (result) => ({
+          identity: result.identity,
+          status: "verified" as const,
+        }),
       })
     );
 
@@ -1009,29 +932,7 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
       return commitDeniedResponse(verified.error.reason);
     }
 
-    const verifiedJob =
-      verified.status === "verified"
-        ? verifiedJobScopeForIdentity(verified.identity)
-        : null;
-
-    if (verified.status === "verified" && verifiedJob === null) {
-      yield* recordCommitDeniedAudit({
-        payloadJson: identityAuditPayload(
-          verified.identity,
-          "unable_to_classify_identity"
-        ),
-        reason: "unable_to_classify_identity",
-        request: commitRequest,
-        trustClass: "unknown",
-      });
-      return commitDeniedResponse("unable_to_classify_identity");
-    }
-    const verifiedJobScope = verifiedJob ?? "";
-
-    if (
-      verified.status === "verified" &&
-      verified.identity.runId !== commitRequest.runId
-    ) {
+    if (verified.identity.runId !== commitRequest.runId) {
       yield* recordCommitDeniedAudit({
         payloadJson: identityAuditPayload(
           verified.identity,
@@ -1060,40 +961,19 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
 
     if (!objectValidation.ok) {
       yield* recordCommitDeniedAudit({
-        payloadJson:
-          verified.status === "verified"
-            ? identityAuditPayload(verified.identity, null)
-            : null,
+        payloadJson: identityAuditPayload(verified.identity, null),
         reason: objectValidation.reason,
         request: commitRequest,
-        trustClass:
-          verified.status === "verified"
-            ? classifyVerifiedGitHubTrust(verified.identity, {
-                trustedRefs: trustedRefsForEnv(env),
-              })
-            : "unknown",
+        trustClass: classifyVerifiedGitHubTrust(verified.identity, {
+          trustedRefs: trustedRefsForEnv(env),
+        }),
       });
       return commitDeniedResponse(objectValidation.reason);
     }
 
-    const producer =
-      verified.status === "verified"
-        ? producerContextForIdentity(verified.identity, verifiedJobScope)
-        : {
-            actor: "unknown",
-            event: "unknown",
-            job: commitRequest.target.refName,
-            ref: commitRequest.target.refName,
-            repository: commitRequest.target.namespace,
-            runId: commitRequest.runId,
-            sha: "unknown",
-            workflow: commitRequest.target.namespace,
-          };
+    const producer = producerContextForIdentity(verified.identity);
     const result = yield* coordinator.commitSave({
-      auditPayloadJson:
-        verified.status === "verified"
-          ? identityAuditPayload(verified.identity, null)
-          : null,
+      auditPayloadJson: identityAuditPayload(verified.identity, null),
       baseSnapshotId: commitRequest.baseSnapshotId,
       expectedHeadGeneration: commitRequest.expectedHeadGeneration,
       idempotencyKey: commitRequest.idempotencyKey,

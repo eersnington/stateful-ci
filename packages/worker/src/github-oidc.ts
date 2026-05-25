@@ -26,22 +26,24 @@ const GitHubOidcClaims = Schema.Struct({
     Schema.Array(Schema.String.check(Schema.isMinLength(1))),
   ]),
   base_ref: Schema.optional(Schema.String),
+  check_run_id: Schema.optional(Schema.String),
+  environment: Schema.optional(Schema.String),
   event_name: Schema.String.check(Schema.isMinLength(1)),
   exp: Schema.Number,
   head_ref: Schema.optional(Schema.String),
-  head_repository: Schema.optional(Schema.String),
   iat: Schema.Number,
   iss: Schema.String.check(Schema.isMinLength(1)),
-  job: Schema.optional(Schema.String),
   job_workflow_ref: Schema.optional(Schema.String),
   nbf: Schema.optional(Schema.Number),
   ref: Schema.String.check(Schema.isMinLength(1)),
+  ref_type: Schema.optional(Schema.String),
   repository: Schema.String.check(Schema.isMinLength(1)),
   repository_owner: Schema.String.check(Schema.isMinLength(1)),
   run_id: Schema.String.check(Schema.isMinLength(1)),
   sha: Schema.String.check(Schema.isMinLength(1)),
   sub: Schema.String.check(Schema.isMinLength(1)),
   workflow: Schema.String.check(Schema.isMinLength(1)),
+  workflow_ref: Schema.optional(Schema.String),
 });
 
 const GitHubJwk = Schema.Struct({
@@ -75,6 +77,15 @@ export interface GitHubOidcVerificationOptions {
   readonly jwks?: readonly GitHubJwk[];
   readonly jwksUrl?: string;
 }
+
+interface CachedJwks {
+  readonly expiresAtMillis: number;
+  readonly keys: readonly GitHubJwk[];
+  readonly url: string;
+}
+
+const jwksCacheTtlMillis = 5 * 60 * 1000;
+let cachedJwks: CachedJwks | null = null;
 
 const oidcError = (reason: DenialReason, message: string) =>
   new GitHubOidcVerificationError({ message, reason });
@@ -162,45 +173,14 @@ const verifyTimeClaims = (
 const verifySubjectClaim = (claims: GitHubOidcClaims) => {
   const repositoryPrefix = `repo:${claims.repository}:`;
 
-  if (!claims.sub.startsWith(repositoryPrefix)) {
+  if (
+    claims.sub.startsWith("repo:") &&
+    !claims.sub.startsWith(repositoryPrefix)
+  ) {
     return oidcError(
       "oidc_invalid",
       "GitHub OIDC token subject did not match the verified repository claim. Restore/save was denied because identity could not be trusted."
     );
-  }
-
-  if (claims.event_name === "push") {
-    const expectedSubject = `${repositoryPrefix}ref:${claims.ref}`;
-
-    return claims.sub === expectedSubject
-      ? null
-      : oidcError(
-          "oidc_invalid",
-          "GitHub OIDC token subject did not match the verified push ref. Restore/save was denied because identity could not be trusted."
-        );
-  }
-
-  if (claims.event_name === "release" || claims.event_name === "deployment") {
-    const expectedSubject = `${repositoryPrefix}ref:${claims.ref}`;
-
-    return claims.sub === expectedSubject
-      ? null
-      : oidcError(
-          "oidc_invalid",
-          "GitHub OIDC token subject did not match the verified privileged ref. Restore/save was denied because identity could not be trusted."
-        );
-  }
-
-  if (
-    claims.event_name === "pull_request" ||
-    claims.event_name === "pull_request_target"
-  ) {
-    return claims.sub === `${repositoryPrefix}pull_request`
-      ? null
-      : oidcError(
-          "oidc_invalid",
-          "GitHub OIDC token subject did not match the verified pull request event. Restore/save was denied because identity could not be trusted."
-        );
   }
 
   return null;
@@ -235,6 +215,59 @@ const fetchJwks = (jwksUrl: string) =>
       : decoded.value.keys;
   });
 
+const jwksForVerification = Effect.fn("jwksForVerification")(
+  function* jwksForVerificationEffect(jwksUrl: string, forceRefresh: boolean) {
+    const now = yield* Clock.currentTimeMillis;
+
+    if (
+      !forceRefresh &&
+      cachedJwks !== null &&
+      cachedJwks.url === jwksUrl &&
+      cachedJwks.expiresAtMillis > now
+    ) {
+      return cachedJwks.keys;
+    }
+
+    const keys = yield* fetchJwks(jwksUrl);
+    cachedJwks = {
+      expiresAtMillis: now + jwksCacheTtlMillis,
+      keys,
+      url: jwksUrl,
+    };
+
+    return keys;
+  }
+);
+
+const verificationKeysFor = Effect.fn("verificationKeysFor")(
+  function* verificationKeysForEffect(
+    header: JwtHeader,
+    options: GitHubOidcVerificationOptions
+  ) {
+    if (options.jwks !== undefined) {
+      return {
+        jwk: options.jwks.find((key) => key.kid === header.kid),
+        keys: options.jwks,
+      } as const;
+    }
+
+    const jwksUrl = options.jwksUrl ?? githubJwksUrl;
+    const cachedKeys = yield* jwksForVerification(jwksUrl, false);
+    const cachedKey = cachedKeys.find((key) => key.kid === header.kid);
+
+    if (cachedKey !== undefined) {
+      return { jwk: cachedKey, keys: cachedKeys } as const;
+    }
+
+    const refreshedKeys = yield* jwksForVerification(jwksUrl, true);
+
+    return {
+      jwk: refreshedKeys.find((key) => key.kid === header.kid),
+      keys: refreshedKeys,
+    } as const;
+  }
+);
+
 const importVerificationKey = (jwk: GitHubJwk) =>
   Effect.tryPromise({
     catch: () =>
@@ -264,20 +297,22 @@ const normalizeIdentity = (claims: GitHubOidcClaims) => {
       actor: claims.actor,
       audience: claims.aud,
       baseRef: claims.base_ref ?? null,
+      checkRunId: claims.check_run_id ?? null,
+      environment: claims.environment ?? null,
       event: claims.event_name,
       headRef: claims.head_ref ?? null,
-      headRepository: claims.head_repository ?? null,
       issuer: claims.iss,
-      job: claims.job ?? null,
       jobWorkflowRef: claims.job_workflow_ref ?? null,
       provider: "github-actions",
       ref: claims.ref,
+      refType: claims.ref_type ?? null,
       repository: claims.repository,
       repositoryOwner: claims.repository_owner,
       runId: claims.run_id,
       sha: claims.sha,
       subject: claims.sub,
       workflow: claims.workflow,
+      workflowRef: claims.workflow_ref ?? null,
     }
   );
 
@@ -349,9 +384,7 @@ export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
       return yield* subjectError;
     }
 
-    const keys =
-      options.jwks ?? (yield* fetchJwks(options.jwksUrl ?? githubJwksUrl));
-    const jwk = keys.find((key) => key.kid === header.kid);
+    const { jwk } = yield* verificationKeysFor(header, options);
 
     if (jwk === undefined) {
       return yield* oidcError(

@@ -194,15 +194,13 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  it("RestoreRequest rejects missing OIDC identity", () => {
+  it("RestoreRequest accepts missing OIDC identity for audited Worker denial", () => {
     expect(
-      Result.isFailure(
-        decodeRestoreRequest({
-          ...restoreRequest,
-          identity: undefined,
-        })
-      )
-    ).toBeTruthy();
+      Schema.decodeUnknownSync(RestoreRequest)({
+        ...restoreRequest,
+        identity: undefined,
+      }).identity
+    ).toBeUndefined();
   });
 
   it("RestoreRequest does not decode client-provided trust class as authority", () => {

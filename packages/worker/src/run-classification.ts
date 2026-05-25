@@ -32,13 +32,7 @@ const classifyPullRequestTrust = (
     return "unknown";
   }
 
-  if (!isPresent(identity.headRepository)) {
-    return "external";
-  }
-
-  return identity.headRepository === identity.repository
-    ? "internal"
-    : "external";
+  return "external";
 };
 
 export const classifyRunTrust = (
@@ -121,7 +115,7 @@ export const classifyVerifiedGitHubTrust = (
     return "unknown";
   }
   if (identity.event === "release" || identity.event === "deployment") {
-    return isTagRef(identity.ref) ? "privileged" : "unknown";
+    return "privileged";
   }
   if (isTagRef(identity.ref)) {
     return "unknown";

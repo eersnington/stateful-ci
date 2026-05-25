@@ -244,6 +244,25 @@ const oidcTokenFromEnv = (env: RuntimeEnv) =>
       : decoded.value.value;
   });
 
+const githubOidcIdentityFromEnv = (env: RuntimeEnv) =>
+  Effect.gen(function* githubOidcIdentityFromEnvEffect() {
+    return {
+      provider: "github-actions" as const,
+      token: yield* oidcTokenFromEnv(env),
+    };
+  });
+
+const withFreshIdentity = <A extends { readonly identity?: unknown }>(
+  request: A,
+  env: RuntimeEnv
+) =>
+  Effect.gen(function* withFreshIdentityEffect() {
+    return {
+      ...request,
+      identity: yield* githubOidcIdentityFromEnv(env),
+    };
+  });
+
 const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
   Effect.gen(function* restoreRequestFromEnvEffect() {
     const request = {
@@ -259,10 +278,6 @@ const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
         actor: yield* requiredEnv(env, "GITHUB_ACTOR"),
         event: yield* requiredEnv(env, "GITHUB_EVENT_NAME"),
         runId: yield* requiredEnv(env, "GITHUB_RUN_ID"),
-      },
-      identity: {
-        provider: "github-actions",
-        token: yield* oidcTokenFromEnv(env),
       },
       managedRoots: workspacePathsForConfig(loaded.config),
       protocolVersion,
@@ -623,7 +638,8 @@ const restoreProgramEffect = Effect.fn("restoreProgram")(
   function* restoreProgramEffect(env: RuntimeEnv) {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const request = yield* restoreRequestFromEnv(env, loaded);
+    const context = yield* restoreRequestFromEnv(env, loaded);
+    const request = yield* withFreshIdentity(context, env);
 
     yield* clearRestoreSession(process.cwd());
 
@@ -690,11 +706,15 @@ export const saveProgram = (env: RuntimeEnv) =>
       loaded,
       session
     );
+    const prepareRequest = yield* withFreshIdentity(
+      prepared.prepareRequest,
+      env
+    );
     const prepareResponseText = yield* postProtocol(
       api,
       routes.prepareSave.path,
       Schema.encodeUnknownSync(Schema.fromJsonString(PrepareSaveRequest))(
-        prepared.prepareRequest
+        prepareRequest
       )
     );
     const prepareResponse = yield* decodeProtocolResponse(
@@ -714,10 +734,10 @@ export const saveProgram = (env: RuntimeEnv) =>
     const commitRequest = {
       baseSnapshotId: prepareResponse.baseSnapshotId,
       expectedHeadGeneration: prepareResponse.expectedHeadGeneration,
-      idempotencyKey: prepared.prepareRequest.idempotencyKey,
-      identity: context.identity,
-      manifest: prepared.prepareRequest.manifest,
-      objects: prepared.prepareRequest.objects,
+      idempotencyKey: prepareRequest.idempotencyKey,
+      identity: yield* githubOidcIdentityFromEnv(env),
+      manifest: prepareRequest.manifest,
+      objects: prepareRequest.objects,
       protocolVersion,
       runId: context.github.runId,
       target: prepareResponse.commitTarget,

@@ -11,13 +11,17 @@ import {
 } from "@stateful-ci/core";
 import { env } from "cloudflare:workers";
 import { Effect, Schema } from "effect";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import worker, { handleFetch } from "../src/index";
 import { createD1MetadataBackend } from "../src/metadata";
+import {
+  createSignedGitHubOidcToken,
+  githubOidcClaims,
+} from "./oidc-test-token";
 
 const namespace =
-  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const refName = "trusted/main/latest";
 const runId = Schema.decodeSync(RunId)("123456789");
 const workspaceId = Schema.decodeSync(WorkspaceId)(
@@ -46,9 +50,14 @@ const authHeaders = {
   "content-type": "application/json",
 };
 
-const legacyEnv = {
+let signedOidcToken = "";
+let signedOidcJwksJson = "";
+
+const testEnv = {
   ...env,
-  STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY: "true",
+  get STATEFUL_CI_GITHUB_JWKS_JSON() {
+    return signedOidcJwksJson;
+  },
 };
 
 const jsonRequest = (path: string, body: unknown) =>
@@ -79,7 +88,9 @@ const prepareRequest = {
   idempotencyKey: Schema.decodeSync(IdempotencyKey)("run-123456789-save"),
   identity: {
     provider: "github-actions",
-    token: "oidc.jwt.token",
+    get token() {
+      return signedOidcToken;
+    },
   },
   manifest: {
     digest: manifestDigest,
@@ -123,6 +134,15 @@ const cleanD1 = async () => {
 };
 
 describe("Worker Cloudflare runtime bindings", () => {
+  beforeAll(async () => {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const signed = await Effect.runPromise(
+      createSignedGitHubOidcToken(githubOidcClaims(nowSeconds))
+    );
+    signedOidcToken = signed.token;
+    signedOidcJwksJson = signed.jwksJson;
+  });
+
   beforeEach(cleanD1);
 
   it("uses the Durable Object coordinator path for prepare and commit", async () => {
@@ -131,7 +151,7 @@ describe("Worker Cloudflare runtime bindings", () => {
 
     const prepare = await worker.fetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
-      legacyEnv
+      testEnv
     );
     const prepareBody = await prepare.json<{
       expectedHeadGeneration: number;
@@ -155,7 +175,7 @@ describe("Worker Cloudflare runtime bindings", () => {
         target: { namespace, refName },
         workspaceId,
       }),
-      legacyEnv
+      testEnv
     );
     const commitBody = await commit.json<{ decision: string }>();
     const ref = await Effect.runPromise(metadata().getRef(namespace, refName));
@@ -185,7 +205,7 @@ describe("Worker Cloudflare runtime bindings", () => {
 
     const prepare = await worker.fetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
-      legacyEnv
+      testEnv
     );
     expect(prepare.status).toBe(200);
 
@@ -202,7 +222,7 @@ describe("Worker Cloudflare runtime bindings", () => {
         target: { namespace, refName },
         workspaceId,
       }),
-      legacyEnv
+      testEnv
     );
     const commitBody = await commit.json<{
       decision: string;
@@ -222,8 +242,8 @@ describe("Worker Cloudflare runtime bindings", () => {
     const response = await handleFetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
       {
-        STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY: "true",
         STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
+        STATEFUL_CI_GITHUB_JWKS_JSON: signedOidcJwksJson,
         STATEFUL_CI_METADATA: env.STATEFUL_CI_METADATA,
         STATEFUL_CI_OBJECTS: env.STATEFUL_CI_OBJECTS,
       }

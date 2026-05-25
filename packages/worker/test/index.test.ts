@@ -14,15 +14,86 @@ import {
 } from "@stateful-ci/core";
 import type { SnapshotObjectKey } from "@stateful-ci/core";
 import { Effect, Schema } from "effect";
+import { beforeAll } from "vitest";
 
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
 import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
+import {
+  createSignedGitHubOidcToken,
+  githubOidcClaims,
+} from "./oidc-test-token";
+
+let signedOidcToken = "";
+let signedOidcJwksJson = "";
+let featureOidcToken = "";
+let pullRequestOidcToken = "";
+let releaseOidcToken = "";
+
+const setupOidcTokens = async () => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const signed = await Effect.runPromise(
+    createSignedGitHubOidcToken(githubOidcClaims(nowSeconds), "main-key")
+  );
+  signedOidcToken = signed.token;
+  const featureSigned = await Effect.runPromise(
+    createSignedGitHubOidcToken(
+      githubOidcClaims(nowSeconds, {
+        ref: "refs/heads/feature",
+        sub: "repo:eersnington/stateful-ci:ref:refs/heads/feature",
+      }),
+      "feature-key"
+    )
+  );
+  featureOidcToken = featureSigned.token;
+  const pullRequestSigned = await Effect.runPromise(
+    createSignedGitHubOidcToken(
+      githubOidcClaims(nowSeconds, {
+        base_ref: "main",
+        event_name: "pull_request",
+        head_ref: "feature",
+        ref: "refs/pull/12/merge",
+        sub: "repo:eersnington/stateful-ci:pull_request",
+      }),
+      "pull-request-key"
+    )
+  );
+  pullRequestOidcToken = pullRequestSigned.token;
+  const releaseSigned = await Effect.runPromise(
+    createSignedGitHubOidcToken(
+      githubOidcClaims(nowSeconds, {
+        event_name: "release",
+        ref: "refs/tags/v1.0.0",
+        ref_type: "tag",
+        sub: "repo:eersnington/stateful-ci:ref:refs/tags/v1.0.0",
+      }),
+      "release-key"
+    )
+  );
+  releaseOidcToken = releaseSigned.token;
+  signedOidcJwksJson = JSON.stringify({
+    keys: [
+      ...signed.jwks.keys,
+      ...featureSigned.jwks.keys,
+      ...pullRequestSigned.jwks.keys,
+      ...releaseSigned.jwks.keys,
+    ],
+  });
+};
+
+const oidcIdentityFor = (token: () => string) => ({
+  provider: "github-actions" as const,
+  get token() {
+    return token();
+  },
+});
 
 const env = {
-  STATEFUL_CI_ALLOW_UNVERIFIED_IDENTITY: "true",
   STATEFUL_CI_API_TOKEN: "test-token",
+  get STATEFUL_CI_GITHUB_JWKS_JSON() {
+    return signedOidcJwksJson;
+  },
 };
 
 const restoreRequest = {
@@ -43,10 +114,7 @@ const restoreRequest = {
     event: "push",
     runId: "123456789",
   },
-  identity: {
-    provider: "github-actions",
-    token: "oidc.jwt.token",
-  },
+  identity: oidcIdentityFor(() => signedOidcToken),
   managedRoots: [".turbo"],
   protocolVersion: 1,
   workspace: {
@@ -107,7 +175,7 @@ const saveRequest = {
 };
 
 const seededNamespace =
-  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
 const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${seededNamespace}:${seededRefName}`
@@ -207,6 +275,7 @@ const internalPullRequest = {
     ref: "refs/pull/12/merge",
   },
   github: { ...restoreRequest.github, event: "pull_request" },
+  identity: oidcIdentityFor(() => pullRequestOidcToken),
 };
 
 const externalPullRequest = {
@@ -218,6 +287,7 @@ const privilegedRelease = {
   ...restoreRequest,
   git: { ...restoreRequest.git, ref: "refs/tags/v1.0.0" },
   github: { ...restoreRequest.github, event: "release" },
+  identity: oidcIdentityFor(() => releaseOidcToken),
 };
 
 const jsonRequest = (path: string, body: unknown) =>
@@ -243,6 +313,8 @@ const failingHeadBlobStore = () =>
   createInMemoryBlobStore(new Map(), { failHead: true });
 
 describe("worker API", () => {
+  beforeAll(setupOidcTokens);
+
   it("GET /health returns protocol health", async () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/health"),
@@ -527,7 +599,7 @@ describe("worker API", () => {
     })
   );
 
-  it("POST /v1/restore lets trusted main seed same-repo pull requests", async () => {
+  it("POST /v1/restore treats same-repo pull requests as external without verified PR metadata", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
       snapshots: [seededSnapshot],
@@ -542,8 +614,8 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
       reason: "snapshot_object_missing",
-      save: { allowed: true, target: "internal/refs-pull-12-merge/latest" },
-      trustClass: "internal",
+      save: { allowed: false },
+      trustClass: "external",
     });
   });
 
@@ -635,6 +707,7 @@ describe("worker API", () => {
       jsonRequest("/v1/restore", {
         ...restoreRequest,
         git: { ...restoreRequest.git, ref: "refs/heads/feature" },
+        identity: oidcIdentityFor(() => featureOidcToken),
       }),
       env,
       { metadata }
@@ -755,7 +828,7 @@ describe("worker API", () => {
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
       workspaceId: workspaceIdFor(
-        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         seededRefName
       ),
     });
@@ -773,6 +846,7 @@ describe("worker API", () => {
           ref: "refs/pull/12/merge",
         },
         github: { ...restoreRequest.github, event: "pull_request" },
+        identity: oidcIdentityFor(() => pullRequestOidcToken),
       }),
       env
     );
@@ -789,7 +863,10 @@ describe("worker API", () => {
   it("POST /v1/restore denies unverified production identity", async () => {
     const metadata = createInMemoryMetadataBackend();
     const response = await handleFetch(
-      jsonRequest("/v1/restore", restoreRequest),
+      jsonRequest("/v1/restore", {
+        ...restoreRequest,
+        identity: { provider: "github-actions", token: "" },
+      }),
       { STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN },
       { metadata }
     );
@@ -798,7 +875,7 @@ describe("worker API", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
-      reason: "oidc_invalid",
+      reason: "oidc_missing",
       save: { allowed: false },
       trustClass: "unknown",
     });
@@ -806,7 +883,7 @@ describe("worker API", () => {
     expect(audit[0]).toMatchObject({
       decision: "denied",
       eventType: "restore",
-      reason: "oidc_invalid",
+      reason: "oidc_missing",
       trustClass: "unknown",
     });
   });
@@ -1017,7 +1094,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
-            identity: restoreRequest.identity,
+            identity: { provider: "github-actions", token: "" },
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -1042,7 +1119,7 @@ describe("worker API", () => {
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(body, {
         decision: "denied",
-        reason: "oidc_invalid",
+        reason: "oidc_missing",
       });
       assert.isNull(ref);
     })
@@ -1188,7 +1265,7 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
       reason: "snapshot_object_missing",
-      trustClass: "internal",
+      trustClass: "external",
     });
   });
 
@@ -1218,7 +1295,7 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
       reason: "snapshot_object_missing",
-      trustClass: "internal",
+      trustClass: "external",
     });
   });
 
