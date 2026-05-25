@@ -21,7 +21,7 @@ export interface R2BlobStoreBucket {
       | null
       | Blob,
     options?: R2PutOptions
-  ) => Promise<unknown>;
+  ) => Promise<R2Object | null>;
 }
 
 const sameBytes = (left: Uint8Array, right: Uint8Array) => {
@@ -140,11 +140,28 @@ export const createR2BlobStore = (
           });
         }
 
+        const inserted = yield* Effect.tryPromise({
+          catch: () =>
+            new BlobStoreError({
+              key: input.key,
+              message: `Could not conditionally store snapshot object ${input.key} in R2. Check the bucket binding and retry.`,
+              reason: "io_failed",
+            }),
+          try: () =>
+            bucket.put(input.key, input.body, {
+              onlyIf: new Headers({ "If-None-Match": "*" }),
+            }),
+        });
+
+        if (inserted !== null) {
+          return { status: "inserted" as const };
+        }
+
         const existing = yield* Effect.tryPromise({
           catch: () =>
             new BlobStoreError({
               key: input.key,
-              message: `Could not inspect existing snapshot object ${input.key} in R2 before upload. Check the bucket binding and retry.`,
+              message: `Could not inspect existing snapshot object ${input.key} in R2 after conditional upload was not inserted. Check the bucket binding and retry.`,
               reason: "io_failed",
             }),
           try: async () => {
@@ -156,28 +173,22 @@ export const createR2BlobStore = (
           },
         });
 
-        if (existing !== null) {
-          if (!sameBytes(existing, input.body)) {
-            return yield* new BlobStoreError({
-              key: input.key,
-              message: `Snapshot object ${input.key} already exists in R2 with different bytes. Immutable snapshot objects cannot be overwritten.`,
-              reason: "conflict",
-            });
-          }
-
-          return { status: "already-present" as const };
+        if (existing === null) {
+          return yield* new BlobStoreError({
+            key: input.key,
+            message: `Snapshot object ${input.key} was not inserted by R2, but no existing object could be read. Retry after checking the bucket binding and object key.`,
+            reason: "io_failed",
+          });
         }
 
-        yield* Effect.tryPromise({
-          catch: () =>
-            new BlobStoreError({
-              key: input.key,
-              message: `Could not store snapshot object ${input.key} in R2. Check the bucket binding and retry.`,
-              reason: "io_failed",
-            }),
-          try: () => bucket.put(input.key, input.body),
-        });
+        if (!sameBytes(existing, input.body)) {
+          return yield* new BlobStoreError({
+            key: input.key,
+            message: `Snapshot object ${input.key} already exists in R2 with different bytes. Immutable snapshot objects cannot be overwritten.`,
+            reason: "conflict",
+          });
+        }
 
-        return { status: "stored" as const };
+        return { status: "already-present" as const };
       }),
   });

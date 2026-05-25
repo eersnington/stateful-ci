@@ -226,11 +226,12 @@ const seededBlobStore = () =>
     ])
   );
 
-const failingHeadBlobStore = () =>
-  BlobStore.of({
-    get: (key) => createInMemoryBlobStore().get(key),
-    getRange: (key, offset, length) =>
-      createInMemoryBlobStore().getRange(key, offset, length),
+const failingHeadBlobStore = () => {
+  const backing = createInMemoryBlobStore();
+
+  return BlobStore.of({
+    get: (key) => backing.get(key),
+    getRange: (key, offset, length) => backing.getRange(key, offset, length),
     head: (key) =>
       Effect.fail(
         new BlobStoreError({
@@ -239,12 +240,12 @@ const failingHeadBlobStore = () =>
           reason: "io_failed",
         })
       ),
-    presignGet: (key, ttlSeconds) =>
-      createInMemoryBlobStore().presignGet(key, ttlSeconds),
+    presignGet: (key, ttlSeconds) => backing.presignGet(key, ttlSeconds),
     presignPut: (key, ttlSeconds, constraints) =>
-      createInMemoryBlobStore().presignPut(key, ttlSeconds, constraints),
-    putIfAbsent: (input) => createInMemoryBlobStore().putIfAbsent(input),
+      backing.presignPut(key, ttlSeconds, constraints),
+    putIfAbsent: (input) => backing.putIfAbsent(input),
   });
+};
 
 describe("worker API", () => {
   it("GET /health returns protocol health", async () => {
@@ -309,7 +310,10 @@ describe("worker API", () => {
       assert.strictEqual(firstPut.status, 204);
       assert.strictEqual(secondPut.status, 204);
       assert.strictEqual(head.status, 200);
-      assert.strictEqual(head.headers.get("content-length"), "8");
+      assert.strictEqual(
+        head.headers.get("content-length"),
+        String(bytes.byteLength)
+      );
       assert.strictEqual(get.status, 200);
       assert.deepStrictEqual(
         new Uint8Array(yield* Effect.promise(() => get.arrayBuffer())),
