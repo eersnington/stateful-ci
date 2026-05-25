@@ -97,7 +97,7 @@ export const createInMemoryBlobStore = (
         }
 
         objects.set(input.key, new Uint8Array(input.body));
-        return { status: "stored" as const };
+        return { status: "inserted" as const };
       }),
   });
 };

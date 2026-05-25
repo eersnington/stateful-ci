@@ -16,7 +16,7 @@ export interface PutIfAbsentInput {
 }
 
 export interface PutIfAbsentResult {
-  readonly status: "already-present" | "inserted" | "stored";
+  readonly status: "already-present" | "inserted";
 }
 
 export class BlobStore extends Context.Service<
