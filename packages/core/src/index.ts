@@ -33,6 +33,7 @@ export {
   GitHubContext,
   GitHubOidcIdentity,
   GitHubOidcToken,
+  VerifiedGitHubActionsIdentity,
 } from "./github";
 export {
   ChunkKey,

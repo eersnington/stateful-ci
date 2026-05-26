@@ -478,6 +478,10 @@ describe("Durable Object snapshot coordinator", () => {
     }).toMatchObject({
       audit: [
         {
+          decision: "allowed",
+          eventType: "prepare-save",
+        },
+        {
           decision: "committed",
           eventType: "commit",
           snapshotId: "snap_450",

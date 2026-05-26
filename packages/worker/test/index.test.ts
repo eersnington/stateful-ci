@@ -14,14 +14,86 @@ import {
 } from "@stateful-ci/core";
 import type { SnapshotObjectKey } from "@stateful-ci/core";
 import { Effect, Schema } from "effect";
+import { beforeAll } from "vitest";
 
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
 import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
+import {
+  createSignedGitHubOidcToken,
+  githubOidcClaims,
+} from "./oidc-test-token";
+
+let signedOidcToken = "";
+let signedOidcJwksJson = "";
+let featureOidcToken = "";
+let pullRequestOidcToken = "";
+let releaseOidcToken = "";
+
+const setupOidcTokens = async () => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const signed = await Effect.runPromise(
+    createSignedGitHubOidcToken(githubOidcClaims(nowSeconds), "main-key")
+  );
+  signedOidcToken = signed.token;
+  const featureSigned = await Effect.runPromise(
+    createSignedGitHubOidcToken(
+      githubOidcClaims(nowSeconds, {
+        ref: "refs/heads/feature",
+        sub: "repo:eersnington/stateful-ci:ref:refs/heads/feature",
+      }),
+      "feature-key"
+    )
+  );
+  featureOidcToken = featureSigned.token;
+  const pullRequestSigned = await Effect.runPromise(
+    createSignedGitHubOidcToken(
+      githubOidcClaims(nowSeconds, {
+        base_ref: "main",
+        event_name: "pull_request",
+        head_ref: "feature",
+        ref: "refs/pull/12/merge",
+        sub: "repo:eersnington/stateful-ci:pull_request",
+      }),
+      "pull-request-key"
+    )
+  );
+  pullRequestOidcToken = pullRequestSigned.token;
+  const releaseSigned = await Effect.runPromise(
+    createSignedGitHubOidcToken(
+      githubOidcClaims(nowSeconds, {
+        event_name: "release",
+        ref: "refs/tags/v1.0.0",
+        ref_type: "tag",
+        sub: "repo:eersnington/stateful-ci:ref:refs/tags/v1.0.0",
+      }),
+      "release-key"
+    )
+  );
+  releaseOidcToken = releaseSigned.token;
+  signedOidcJwksJson = JSON.stringify({
+    keys: [
+      ...signed.jwks.keys,
+      ...featureSigned.jwks.keys,
+      ...pullRequestSigned.jwks.keys,
+      ...releaseSigned.jwks.keys,
+    ],
+  });
+};
+
+const oidcIdentityFor = (token: () => string) => ({
+  provider: "github-actions" as const,
+  get token() {
+    return token();
+  },
+});
 
 const env = {
   STATEFUL_CI_API_TOKEN: "test-token",
+  get STATEFUL_CI_GITHUB_JWKS_JSON() {
+    return signedOidcJwksJson;
+  },
 };
 
 const restoreRequest = {
@@ -42,10 +114,7 @@ const restoreRequest = {
     event: "push",
     runId: "123456789",
   },
-  identity: {
-    provider: "github-actions",
-    token: "oidc.jwt.token",
-  },
+  identity: oidcIdentityFor(() => signedOidcToken),
   managedRoots: [".turbo"],
   protocolVersion: 1,
   workspace: {
@@ -106,7 +175,7 @@ const saveRequest = {
 };
 
 const seededNamespace =
-  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
 const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${seededNamespace}:${seededRefName}`
@@ -206,6 +275,7 @@ const internalPullRequest = {
     ref: "refs/pull/12/merge",
   },
   github: { ...restoreRequest.github, event: "pull_request" },
+  identity: oidcIdentityFor(() => pullRequestOidcToken),
 };
 
 const externalPullRequest = {
@@ -217,6 +287,7 @@ const privilegedRelease = {
   ...restoreRequest,
   git: { ...restoreRequest.git, ref: "refs/tags/v1.0.0" },
   github: { ...restoreRequest.github, event: "release" },
+  identity: oidcIdentityFor(() => releaseOidcToken),
 };
 
 const jsonRequest = (path: string, body: unknown) =>
@@ -242,6 +313,8 @@ const failingHeadBlobStore = () =>
   createInMemoryBlobStore(new Map(), { failHead: true });
 
 describe("worker API", () => {
+  beforeAll(setupOidcTokens);
+
   it("GET /health returns protocol health", async () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/health"),
@@ -526,7 +599,7 @@ describe("worker API", () => {
     })
   );
 
-  it("POST /v1/restore lets trusted main seed same-repo pull requests", async () => {
+  it("POST /v1/restore treats same-repo pull requests as external without verified PR metadata", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
       snapshots: [seededSnapshot],
@@ -541,8 +614,8 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
       reason: "snapshot_object_missing",
-      save: { allowed: true, target: "internal/refs-pull-12-merge/latest" },
-      trustClass: "internal",
+      save: { allowed: false },
+      trustClass: "external",
     });
   });
 
@@ -634,6 +707,7 @@ describe("worker API", () => {
       jsonRequest("/v1/restore", {
         ...restoreRequest,
         git: { ...restoreRequest.git, ref: "refs/heads/feature" },
+        identity: oidcIdentityFor(() => featureOidcToken),
       }),
       env,
       { metadata }
@@ -754,7 +828,7 @@ describe("worker API", () => {
       save: { allowed: true, target: seededRefName },
       trustClass: "trusted",
       workspaceId: workspaceIdFor(
-        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         seededRefName
       ),
     });
@@ -772,6 +846,7 @@ describe("worker API", () => {
           ref: "refs/pull/12/merge",
         },
         github: { ...restoreRequest.github, event: "pull_request" },
+        identity: oidcIdentityFor(() => pullRequestOidcToken),
       }),
       env
     );
@@ -782,6 +857,66 @@ describe("worker API", () => {
       reason: "no_compatible_snapshot",
       save: { allowed: false },
       trustClass: "external",
+    });
+  });
+
+  it("POST /v1/restore denies unverified production identity", async () => {
+    const metadata = createInMemoryMetadataBackend();
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", {
+        ...restoreRequest,
+        identity: { provider: "github-actions", token: "" },
+      }),
+      { STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN },
+      { metadata }
+    );
+    const audit = await Effect.runPromise(metadata.listAuditEvents());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "oidc_missing",
+      save: { allowed: false },
+      trustClass: "unknown",
+    });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
+      decision: "denied",
+      eventType: "restore",
+      reason: "oidc_missing",
+      trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/save/prepare fails closed with malformed configured JWKS", async () => {
+    const response = await worker.fetch(
+      jsonRequest("/v1/save/prepare", {
+        client: restoreRequest.client,
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        idempotencyKey: "run-123456789-save",
+        identity: restoreRequest.identity,
+        manifest: {
+          digest: seededManifestDigest,
+          key: seededManifestKey,
+          size: 8,
+          snapshotId: "snap_132",
+        },
+        objects: seededSnapshot.objects,
+        protocolVersion: 1,
+        workspace: restoreRequest.workspace,
+      }),
+      {
+        STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
+        STATEFUL_CI_GITHUB_JWKS_JSON: "not json",
+      }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "oidc_invalid",
+      trustClass: "unknown",
     });
   });
 
@@ -808,6 +943,7 @@ describe("worker API", () => {
           ],
         ])
       );
+      const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
           jsonRequest("/v1/save/prepare", {
@@ -827,12 +963,13 @@ describe("worker API", () => {
             workspace: restoreRequest.workspace,
           }),
           env,
-          { blobStore }
+          { blobStore, metadata }
         )
       );
       const body = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
         yield* Effect.promise(() => response.json())
       );
+      const audit = yield* metadata.listAuditEvents();
 
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(
@@ -840,6 +977,11 @@ describe("worker API", () => {
         [seededPackKey, seededChunkKey]
       );
       assert.strictEqual(body.expectedHeadGeneration, 0);
+      assert.deepInclude(audit[0], {
+        decision: "allowed",
+        eventType: "prepare-save",
+        reason: null,
+      });
     })
   );
 
@@ -909,6 +1051,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -932,6 +1075,56 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("POST /v1/save/commit denies unverified production identity", () =>
+    Effect.gen(function* commitDeniesUnverifiedProductionIdentityEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            namespace: seededNamespace,
+            refName: seededRefName,
+            runId: Schema.decodeSync(RunId)("123456789"),
+            trustClass: "trusted",
+            workspaceId: seededWorkspaceId,
+          },
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save",
+            identity: { provider: "github-actions", token: "" },
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_132",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          { STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN },
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "oidc_missing",
+      });
+      assert.isNull(ref);
+    })
+  );
+
   it.effect("POST /v1/save/commit validates object presence", () =>
     Effect.gen(function* commitValidatesObjectsEffect() {
       const metadata = createInMemoryMetadataBackend({
@@ -951,6 +1144,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -1002,6 +1196,7 @@ describe("worker API", () => {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
+            identity: restoreRequest.identity,
             manifest: {
               digest: seededManifestDigest,
               key: seededManifestKey,
@@ -1025,6 +1220,7 @@ describe("worker API", () => {
         Schema.decodeSync(SnapshotId)("snap_132")
       );
       const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+      const audit = yield* metadata.listAuditEvents();
 
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(body, {
@@ -1035,6 +1231,11 @@ describe("worker API", () => {
       });
       assert.isNotNull(header);
       assert.strictEqual(ref?.snapshotId, "snap_132");
+      assert.deepInclude(audit.at(-1), {
+        decision: "committed",
+        eventType: "commit",
+        reason: null,
+      });
     })
   );
 
@@ -1064,7 +1265,7 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
       reason: "snapshot_object_missing",
-      trustClass: "internal",
+      trustClass: "external",
     });
   });
 
@@ -1094,7 +1295,7 @@ describe("worker API", () => {
     await expect(response.json()).resolves.toMatchObject({
       decision: "denied",
       reason: "snapshot_object_missing",
-      trustClass: "internal",
+      trustClass: "external",
     });
   });
 

@@ -71,6 +71,7 @@ interface PreparedLocalSave {
 }
 
 const restoreSessionFile = ".stateful-ci/restore-session.json";
+const defaultOidcAudience = "stateful-ci";
 
 const RestoreSession = Schema.Struct({
   baseSnapshotId: Schema.NullOr(SnapshotId),
@@ -173,6 +174,95 @@ const apiConfigFromEnv = (env: RuntimeEnv) =>
     } satisfies ApiConfig;
   });
 
+const oidcAudienceFromEnv = (env: RuntimeEnv) =>
+  optionalEnv(env, "STATEFUL_CI_OIDC_AUDIENCE") ?? defaultOidcAudience;
+
+const oidcTokenFromEnv = (env: RuntimeEnv) =>
+  Effect.gen(function* oidcTokenFromEnvEffect() {
+    const explicitToken = optionalEnv(env, "STATEFUL_CI_OIDC_TOKEN");
+
+    if (explicitToken !== null) {
+      return explicitToken;
+    }
+
+    const requestUrl = optionalEnv(env, "ACTIONS_ID_TOKEN_REQUEST_URL");
+    const requestToken = optionalEnv(env, "ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+
+    if (requestUrl === null || requestToken === null) {
+      return yield* Effect.fail(
+        cliFailure(
+          "Missing GitHub Actions OIDC acquisition environment. Set ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN by granting id-token: write, or provide STATEFUL_CI_OIDC_TOKEN only for local/bootstrap flows."
+        )
+      );
+    }
+
+    const url = yield* Effect.try({
+      catch: () =>
+        cliFailure(
+          "GitHub Actions OIDC token endpoint URL was invalid. Restore/save did not contact the backend; check ACTIONS_ID_TOKEN_REQUEST_URL."
+        ),
+      try: () => new URL(requestUrl),
+    });
+    url.searchParams.set("audience", oidcAudienceFromEnv(env));
+
+    const response = yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          "Could not acquire a GitHub Actions OIDC token. Restore/save did not contact the backend; check id-token: write permissions and retry."
+        ),
+      try: () =>
+        fetch(url, {
+          headers: { authorization: `Bearer ${requestToken}` },
+        }),
+    });
+
+    if (!response.ok) {
+      return yield* Effect.fail(
+        cliFailure(
+          `GitHub Actions OIDC token endpoint returned HTTP ${response.status}. Restore/save did not contact the backend; check id-token: write permissions.`
+        )
+      );
+    }
+
+    const body = yield* Effect.tryPromise({
+      catch: () =>
+        cliFailure(
+          "GitHub Actions OIDC token response was not readable JSON. Restore/save did not contact the backend."
+        ),
+      try: () => response.json(),
+    });
+    const decoded = Schema.decodeUnknownExit(
+      Schema.Struct({ value: Schema.String.check(Schema.isMinLength(1)) })
+    )(body);
+
+    return Exit.isFailure(decoded)
+      ? yield* Effect.fail(
+          cliFailure(
+            "GitHub Actions OIDC token response did not include a token value. Restore/save did not contact the backend."
+          )
+        )
+      : decoded.value.value;
+  });
+
+const githubOidcIdentityFromEnv = (env: RuntimeEnv) =>
+  Effect.gen(function* githubOidcIdentityFromEnvEffect() {
+    return {
+      provider: "github-actions" as const,
+      token: yield* oidcTokenFromEnv(env),
+    };
+  });
+
+const withFreshIdentity = <A extends { readonly identity?: unknown }>(
+  request: A,
+  env: RuntimeEnv
+) =>
+  Effect.gen(function* withFreshIdentityEffect() {
+    return {
+      ...request,
+      identity: yield* githubOidcIdentityFromEnv(env),
+    };
+  });
+
 const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
   Effect.gen(function* restoreRequestFromEnvEffect() {
     const request = {
@@ -188,10 +278,6 @@ const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
         actor: yield* requiredEnv(env, "GITHUB_ACTOR"),
         event: yield* requiredEnv(env, "GITHUB_EVENT_NAME"),
         runId: yield* requiredEnv(env, "GITHUB_RUN_ID"),
-      },
-      identity: {
-        provider: "github-actions",
-        token: yield* requiredEnv(env, "STATEFUL_CI_OIDC_TOKEN"),
       },
       managedRoots: workspacePathsForConfig(loaded.config),
       protocolVersion,
@@ -552,7 +638,8 @@ const restoreProgramEffect = Effect.fn("restoreProgram")(
   function* restoreProgramEffect(env: RuntimeEnv) {
     const loaded = yield* loadConfig(process.cwd());
     const api = yield* apiConfigFromEnv(env);
-    const request = yield* restoreRequestFromEnv(env, loaded);
+    const context = yield* restoreRequestFromEnv(env, loaded);
+    const request = yield* withFreshIdentity(context, env);
 
     yield* clearRestoreSession(process.cwd());
 
@@ -619,11 +706,15 @@ export const saveProgram = (env: RuntimeEnv) =>
       loaded,
       session
     );
+    const prepareRequest = yield* withFreshIdentity(
+      prepared.prepareRequest,
+      env
+    );
     const prepareResponseText = yield* postProtocol(
       api,
       routes.prepareSave.path,
       Schema.encodeUnknownSync(Schema.fromJsonString(PrepareSaveRequest))(
-        prepared.prepareRequest
+        prepareRequest
       )
     );
     const prepareResponse = yield* decodeProtocolResponse(
@@ -643,9 +734,10 @@ export const saveProgram = (env: RuntimeEnv) =>
     const commitRequest = {
       baseSnapshotId: prepareResponse.baseSnapshotId,
       expectedHeadGeneration: prepareResponse.expectedHeadGeneration,
-      idempotencyKey: prepared.prepareRequest.idempotencyKey,
-      manifest: prepared.prepareRequest.manifest,
-      objects: prepared.prepareRequest.objects,
+      idempotencyKey: prepareRequest.idempotencyKey,
+      identity: yield* githubOidcIdentityFromEnv(env),
+      manifest: prepareRequest.manifest,
+      objects: prepareRequest.objects,
       protocolVersion,
       runId: context.github.runId,
       target: prepareResponse.commitTarget,

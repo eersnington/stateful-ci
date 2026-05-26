@@ -2,16 +2,44 @@ import { Schema } from "effect";
 
 import { Sha256Digest } from "./ids";
 
-export const GitHubOidcToken = Schema.String.check(Schema.isMinLength(1)).pipe(
+export const GitHubOidcToken = Schema.String.pipe(
   Schema.brand("@stateful-ci/GitHubOidcToken")
 );
 export type GitHubOidcToken = Schema.Schema.Type<typeof GitHubOidcToken>;
 
 export const GitHubOidcIdentity = Schema.Struct({
   provider: Schema.Literal("github-actions"),
-  token: GitHubOidcToken,
+  token: Schema.NullOr(GitHubOidcToken),
 });
 export type GitHubOidcIdentity = Schema.Schema.Type<typeof GitHubOidcIdentity>;
+
+export const VerifiedGitHubActionsIdentity = Schema.Struct({
+  actor: Schema.String.check(Schema.isMinLength(1)),
+  audience: Schema.Union([
+    Schema.String.check(Schema.isMinLength(1)),
+    Schema.Array(Schema.String.check(Schema.isMinLength(1))),
+  ]),
+  baseRef: Schema.NullOr(Schema.String),
+  checkRunId: Schema.NullOr(Schema.String),
+  environment: Schema.NullOr(Schema.String),
+  event: Schema.String.check(Schema.isMinLength(1)),
+  headRef: Schema.NullOr(Schema.String),
+  issuer: Schema.String.check(Schema.isMinLength(1)),
+  jobWorkflowRef: Schema.NullOr(Schema.String),
+  provider: Schema.Literal("github-actions"),
+  ref: Schema.String.check(Schema.isMinLength(1)),
+  refType: Schema.NullOr(Schema.String),
+  repository: Schema.String.check(Schema.isMinLength(1)),
+  repositoryOwner: Schema.String.check(Schema.isMinLength(1)),
+  runId: Schema.String.check(Schema.isMinLength(1)),
+  sha: Schema.String.check(Schema.isMinLength(1)),
+  subject: Schema.String.check(Schema.isMinLength(1)),
+  workflow: Schema.String.check(Schema.isMinLength(1)),
+  workflowRef: Schema.NullOr(Schema.String),
+});
+export type VerifiedGitHubActionsIdentity = Schema.Schema.Type<
+  typeof VerifiedGitHubActionsIdentity
+>;
 
 export const GitHubContext = Schema.Struct({
   actor: Schema.String.check(Schema.isMinLength(1)),

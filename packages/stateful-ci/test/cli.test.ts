@@ -292,6 +292,110 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
     );
 
     it.effect(
+      "acquires a GitHub Actions OIDC token when no explicit token is provided",
+      () =>
+        withWorkspace(setupRestoreWorkspace, () =>
+          Effect.gen(function* restoreAcquiresActionsOidcTokenEffect() {
+            const { requests } = yield* withProtocolServer(
+              (request) =>
+                request.url?.startsWith("/oidc") === true
+                  ? Response.json({ value: "acquired.jwt.token" })
+                  : Response.json(
+                      Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                        decision: "denied",
+                        reason: "backend_policy_not_configured",
+                        save: { allowed: false },
+                        trustClass: "unknown",
+                      })
+                    ),
+              (url) =>
+                restoreProgram({
+                  ...githubEnv,
+                  ACTIONS_ID_TOKEN_REQUEST_TOKEN: "actions-request-token",
+                  ACTIONS_ID_TOKEN_REQUEST_URL: `${url}/oidc?existing=1`,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: url,
+                  STATEFUL_CI_OIDC_AUDIENCE: "stateful-ci-test",
+                  STATEFUL_CI_OIDC_TOKEN: undefined,
+                })
+            );
+            const [oidcRequest, restoreProtocolRequest] = requests;
+
+            if (
+              oidcRequest === undefined ||
+              restoreProtocolRequest === undefined
+            ) {
+              return yield* Effect.die("Expected OIDC and restore requests.");
+            }
+
+            const restoreRequest = yield* decodeOrDie(
+              RestoreRequest,
+              restoreProtocolRequest.body
+            );
+
+            assert.strictEqual(requests.length, 2);
+            assert.strictEqual(oidcRequest.method, "GET");
+            assert.strictEqual(
+              oidcRequest.authorization,
+              "Bearer actions-request-token"
+            );
+            assert.strictEqual(
+              oidcRequest.url,
+              "/oidc?existing=1&audience=stateful-ci-test"
+            );
+            if (restoreRequest.identity === undefined) {
+              return yield* Effect.die("Expected restore identity.");
+            }
+            assert.strictEqual(
+              restoreRequest.identity.token,
+              "acquired.jwt.token"
+            );
+          })
+        )
+    );
+
+    it.effect("fails before backend calls when OIDC cannot be acquired", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreFailsWithoutOidcAcquisitionEffect() {
+          const error = yield* Effect.flip(
+            restoreProgram({
+              ...githubEnv,
+              STATEFUL_CI_API_TOKEN: "test-token",
+              STATEFUL_CI_API_URL: "https://stateful-ci.example",
+              STATEFUL_CI_OIDC_TOKEN: undefined,
+            })
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(
+            error.message,
+            "Missing GitHub Actions OIDC acquisition"
+          );
+        })
+      )
+    );
+
+    it.effect("reports malformed OIDC acquisition URL as a CLI failure", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreFailsWithMalformedOidcUrlEffect() {
+          const error = yield* Effect.flip(
+            restoreProgram({
+              ...githubEnv,
+              ACTIONS_ID_TOKEN_REQUEST_TOKEN: "actions-request-token",
+              ACTIONS_ID_TOKEN_REQUEST_URL: "not a url",
+              STATEFUL_CI_API_TOKEN: "test-token",
+              STATEFUL_CI_API_URL: "https://stateful-ci.example",
+              STATEFUL_CI_OIDC_TOKEN: undefined,
+            })
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "OIDC token endpoint URL was invalid");
+        })
+      )
+    );
+
+    it.effect(
       "records backend workspace when denied restore may still save",
       () =>
         withWorkspace(setupRestoreWorkspace, ({ fs, path, root }) =>
@@ -753,8 +857,14 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
     it.effect("prepares, uploads missing objects, and commits", () =>
       withWorkspace(setupSaveWorkspace, ({ fs, path, root }) =>
         Effect.gen(function* saveScansConfiguredPathsEffect() {
+          let oidcRequestCount = 0;
           const { requests } = yield* withProtocolServer(
             (request) => {
+              if (request.url?.startsWith("/oidc") === true) {
+                oidcRequestCount += 1;
+                return Response.json({ value: `oidc-${oidcRequestCount}` });
+              }
+
               if (request.url === "/v1/save/prepare") {
                 const prepareRequest = Schema.decodeUnknownSync(
                   PrepareSaveRequest
@@ -806,20 +916,30 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             (url) =>
               saveProgram({
                 ...githubEnv,
+                ACTIONS_ID_TOKEN_REQUEST_TOKEN: "actions-request-token",
+                ACTIONS_ID_TOKEN_REQUEST_URL: `${url}/oidc`,
                 STATEFUL_CI_API_TOKEN: "test-token",
                 STATEFUL_CI_API_URL: url,
+                STATEFUL_CI_OIDC_TOKEN: undefined,
               })
           );
-          const [prepareProtocolRequest, uploadRequest, commitProtocolRequest] =
-            requests;
+          const [
+            prepareOidcRequest,
+            prepareProtocolRequest,
+            uploadRequest,
+            commitOidcRequest,
+            commitProtocolRequest,
+          ] = requests;
 
           if (
+            prepareOidcRequest === undefined ||
             prepareProtocolRequest === undefined ||
             uploadRequest === undefined ||
+            commitOidcRequest === undefined ||
             commitProtocolRequest === undefined
           ) {
             return yield* Effect.die(
-              "Expected save to prepare, upload one object, and commit."
+              "Expected save to acquire OIDC, prepare, upload one object, reacquire OIDC, and commit."
             );
           }
 
@@ -841,7 +961,15 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             path.join(root, ".stateful-ci/store", missingObject.key)
           );
 
-          assert.strictEqual(requests.length, 3);
+          assert.strictEqual(requests.length, 5);
+          assert.strictEqual(
+            prepareOidcRequest.url,
+            "/oidc?audience=stateful-ci"
+          );
+          assert.strictEqual(
+            commitOidcRequest.url,
+            "/oidc?audience=stateful-ci"
+          );
           assert.strictEqual(prepareProtocolRequest.method, "POST");
           assert.strictEqual(prepareProtocolRequest.url, "/v1/save/prepare");
           assert.strictEqual(uploadRequest.method, "PUT");
@@ -859,6 +987,10 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           );
           assert.strictEqual(commitRequest.workspaceId, "ws_123");
           assert.strictEqual(commitRequest.expectedHeadGeneration, 0);
+          assert.deepStrictEqual(
+            [prepareRequest.identity?.token, commitRequest.identity?.token],
+            ["oidc-1", "oidc-2"]
+          );
           assert.deepStrictEqual(commitRequest.objects, prepareRequest.objects);
           assert.strictEqual(
             uploadRequest.headers["x-stateful-ci-object-digest"],
