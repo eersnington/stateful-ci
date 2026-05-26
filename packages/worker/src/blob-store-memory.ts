@@ -20,7 +20,8 @@ const sameBytes = (left: Uint8Array, right: Uint8Array) => {
 };
 
 export const createInMemoryBlobStore = (
-  seed: ReadonlyMap<SnapshotObjectKey, Uint8Array> = new Map()
+  seed: ReadonlyMap<SnapshotObjectKey, Uint8Array> = new Map(),
+  options: { readonly failHead?: boolean } = {}
 ): BlobStore["Service"] => {
   const objects = new Map(
     [...seed].map(([key, bytes]) => [key, new Uint8Array(bytes)] as const)
@@ -54,6 +55,16 @@ export const createInMemoryBlobStore = (
         : Effect.succeed(new Uint8Array(bytes).slice(offset, offset + length));
     },
     head: (key) => {
+      if (options.failHead === true) {
+        return Effect.fail(
+          new BlobStoreError({
+            key,
+            message: `Could not inspect snapshot object ${key} in in-memory storage. The configured test backend failed the HEAD operation.`,
+            reason: "io_failed",
+          })
+        );
+      }
+
       const bytes = objects.get(key);
 
       return Effect.succeed(

@@ -188,6 +188,9 @@ export class MetadataBackend extends Context.Service<
       snapshotId: SnapshotId,
       objects: readonly SnapshotObjectInventoryEntry[]
     ) => Effect.Effect<void, MetadataBackendError>;
+    readonly releaseIdempotentCommit: (
+      commit: IdempotentCommit
+    ) => Effect.Effect<void, MetadataBackendError>;
     readonly rememberIdempotentCommit: (
       commit: IdempotentCommit
     ) => Effect.Effect<boolean, MetadataBackendError>;
@@ -359,6 +362,20 @@ export const createInMemoryMetadataBackend = (
           snapshotRowsFromInventory(snapshotId, objects)
         );
       }),
+    releaseIdempotentCommit: (commit) =>
+      Effect.sync(() => {
+        const existing = idempotentCommits.get(commit.idempotencyKey);
+
+        if (
+          existing?.workspaceId === commit.workspaceId &&
+          existing.runId === commit.runId &&
+          existing.snapshotId === commit.snapshotId &&
+          existing.manifestDigest === commit.manifestDigest &&
+          existing.headGeneration === commit.headGeneration
+        ) {
+          idempotentCommits.delete(commit.idempotencyKey);
+        }
+      }),
     rememberIdempotentCommit: (commit) =>
       Effect.sync(() => {
         if (idempotentCommits.has(commit.idempotencyKey)) {
@@ -414,12 +431,26 @@ const changedRows = (result: D1Result<unknown>) => {
 
 const stringColumn = (row: Record<string, unknown>, column: string) => {
   const value = row[column];
-  return typeof value === "string" ? value : String(value);
+
+  if (typeof value !== "string") {
+    throw new TypeError(
+      `Invalid D1 metadata row: expected string column "${column}", got ${typeof value}. Check the D1 migration and stored metadata before retrying.`
+    );
+  }
+
+  return value;
 };
 
 const numberColumn = (row: Record<string, unknown>, column: string) => {
   const value = row[column];
-  return typeof value === "number" ? value : Number(value);
+
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    throw new TypeError(
+      `Invalid D1 metadata row: expected number column "${column}", got ${typeof value}. Check the D1 migration and stored metadata before retrying.`
+    );
+  }
+
+  return value;
 };
 
 const nullableStringColumn = (row: Record<string, unknown>, column: string) => {
@@ -853,6 +884,22 @@ export const createD1MetadataBackend = (
           { discard: true }
         );
       }),
+    releaseIdempotentCommit: (commit) =>
+      runStatement(
+        db
+          .prepare(
+            "delete from idempotent_commits where idempotency_key = ? and workspace_id = ? and run_id = ? and snapshot_id = ? and manifest_digest = ? and head_generation = ?"
+          )
+          .bind(
+            commit.idempotencyKey,
+            commit.workspaceId,
+            commit.runId,
+            commit.snapshotId,
+            commit.manifestDigest,
+            commit.headGeneration
+          ),
+        "releaseIdempotentCommit"
+      ).pipe(Effect.asVoid),
     rememberIdempotentCommit: (commit) =>
       Effect.map(
         runStatement(

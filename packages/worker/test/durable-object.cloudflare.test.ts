@@ -78,6 +78,7 @@ const snapshotHeader = {
 const metadata = () => createD1MetadataBackend(env.STATEFUL_CI_METADATA);
 const coordinator = () =>
   createDurableObjectSnapshotCoordinator(env.STATEFUL_CI_COORDINATORS);
+const futureExpiresAt = () => new Date(Date.now() + 60_000).toISOString();
 const runCoordinator = <A, E>(effect: Effect.Effect<A, E, MetadataBackend>) =>
   Effect.runPromise(
     effect.pipe(Effect.provideService(MetadataBackend, metadata()))
@@ -120,7 +121,7 @@ const seedRestoreSnapshot = async () => {
 const prepareSave = () =>
   runCoordinator(
     coordinator().prepareSave({
-      expiresAt: "2026-05-22T01:00:00.000Z",
+      expiresAt: futureExpiresAt(),
       producer,
       runId,
       target,
@@ -318,7 +319,7 @@ describe("Durable Object snapshot coordinator", () => {
     await prepareSave();
     await runCoordinator(
       coordinator().prepareSave({
-        expiresAt: "2026-05-22T01:00:00.000Z",
+        expiresAt: futureExpiresAt(),
         producer,
         runId,
         target: otherTarget,

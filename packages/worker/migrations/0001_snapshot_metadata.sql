@@ -88,3 +88,5 @@ create index if not exists snapshots_workspace_id_idx on snapshots (workspace_id
 create index if not exists snapshot_objects_snapshot_id_idx on snapshot_objects (snapshot_id);
 create index if not exists audit_events_workspace_id_idx on audit_events (workspace_id);
 create index if not exists audit_events_run_id_idx on audit_events (run_id);
+create index if not exists audit_events_namespace_ref_created_id_idx
+  on audit_events (namespace, ref_name, created_at, id);

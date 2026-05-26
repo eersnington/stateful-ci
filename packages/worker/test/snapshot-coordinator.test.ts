@@ -93,20 +93,20 @@ const refFor = (snapshotId: SnapshotId) =>
     updatedByRunId: runId,
   }) satisfies RefRow;
 
+const testWorkspaceTarget = {
+  expiresAt,
+  namespace,
+  refName,
+  runId,
+  trustClass: "trusted",
+  workspaceId,
+} as const;
+
 describe("snapshot coordinator", () => {
   it.effect("commits once and replays identical idempotency keys", () =>
     Effect.gen(function* coordinatorReplaysIdempotencyEffect() {
       const metadata = createInMemoryMetadataBackend({
-        workspaceTargets: [
-          {
-            expiresAt,
-            namespace,
-            refName,
-            runId,
-            trustClass: "trusted",
-            workspaceId,
-          },
-        ],
+        workspaceTargets: [testWorkspaceTarget],
       });
       const coordinator = createMetadataSnapshotCoordinator();
       const first = yield* coordinator
@@ -129,16 +129,7 @@ describe("snapshot coordinator", () => {
   it.effect("rejects conflicting idempotency key reuse", () =>
     Effect.gen(function* coordinatorRejectsIdempotencyConflictEffect() {
       const metadata = createInMemoryMetadataBackend({
-        workspaceTargets: [
-          {
-            expiresAt,
-            namespace,
-            refName,
-            runId,
-            trustClass: "trusted",
-            workspaceId,
-          },
-        ],
+        workspaceTargets: [testWorkspaceTarget],
       });
       const coordinator = createMetadataSnapshotCoordinator();
       yield* coordinator
@@ -161,6 +152,31 @@ describe("snapshot coordinator", () => {
     })
   );
 
+  it.effect("rejects unresolved producer placeholders", () =>
+    Effect.gen(function* coordinatorRejectsProducerPlaceholdersEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [testWorkspaceTarget],
+      });
+      const coordinator = createMetadataSnapshotCoordinator();
+      const denied = yield* coordinator
+        .commitSave({
+          ...commitInput,
+          producer: {
+            ...commitInput.producer,
+            actor: "unknown",
+            event: "unknown",
+            sha: "unknown",
+          },
+        })
+        .pipe(Effect.provideService(MetadataBackend, metadata));
+
+      assert.deepStrictEqual(denied, {
+        decision: "denied",
+        reason: "invalid_protocol_payload",
+      });
+    })
+  );
+
   it.effect(
     "returns conflict for stale generation against a different head",
     () =>
@@ -169,16 +185,7 @@ describe("snapshot coordinator", () => {
         const metadata = createInMemoryMetadataBackend({
           refs: [refFor(otherSnapshotId)],
           snapshots: [{ ...committedHeader, snapshotId: otherSnapshotId }],
-          workspaceTargets: [
-            {
-              expiresAt,
-              namespace,
-              refName,
-              runId,
-              trustClass: "trusted",
-              workspaceId,
-            },
-          ],
+          workspaceTargets: [testWorkspaceTarget],
         });
         const coordinator = createMetadataSnapshotCoordinator();
         const conflict = yield* coordinator
@@ -200,16 +207,7 @@ describe("snapshot coordinator", () => {
         const metadata = createInMemoryMetadataBackend({
           refs: [refFor(commitInput.manifest.snapshotId)],
           snapshots: [committedHeader],
-          workspaceTargets: [
-            {
-              expiresAt,
-              namespace,
-              refName,
-              runId,
-              trustClass: "trusted",
-              workspaceId,
-            },
-          ],
+          workspaceTargets: [testWorkspaceTarget],
         });
         const coordinator = createMetadataSnapshotCoordinator();
         const recovered = yield* coordinator
@@ -226,6 +224,38 @@ describe("snapshot coordinator", () => {
           workspaceId,
         });
         assert.deepStrictEqual(replay, recovered);
+      })
+  );
+
+  it.effect(
+    "does not replay idempotent when ref CAS fails after idempotency claim",
+    () =>
+      Effect.gen(function* coordinatorRejectsStaleIdempotencyEffect() {
+        const backing = createInMemoryMetadataBackend({
+          workspaceTargets: [testWorkspaceTarget],
+        });
+        const metadata = MetadataBackend.of({
+          ...backing,
+          compareAndAdvanceRef: () => Effect.succeed(null),
+        });
+        const coordinator = createMetadataSnapshotCoordinator();
+        const first = yield* coordinator
+          .commitSave(commitInput)
+          .pipe(Effect.provideService(MetadataBackend, metadata));
+        const claimed = yield* metadata.getIdempotentCommit(
+          commitInput.idempotencyKey
+        );
+        const replay = yield* coordinator
+          .commitSave(commitInput)
+          .pipe(Effect.provideService(MetadataBackend, metadata));
+
+        assert.deepStrictEqual(first, {
+          actualHeadGeneration: Schema.decodeSync(HeadGeneration)(0),
+          decision: "conflict",
+          reason: "head_generation_mismatch",
+        });
+        assert.strictEqual(claimed, null);
+        assert.notStrictEqual(replay.decision, "idempotent");
       })
   );
 });

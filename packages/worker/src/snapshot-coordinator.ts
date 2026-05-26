@@ -276,6 +276,42 @@ const recoverIdempotentCommit = Effect.fn("recoverIdempotentCommit")(
   }
 );
 
+const replayIdempotentCommit = Effect.fn("replayIdempotentCommit")(
+  function* replayIdempotentCommit(
+    metadata: MetadataBackend["Service"],
+    input: CommitSaveInput,
+    commit: {
+      readonly headGeneration: HeadGeneration;
+      readonly snapshotId: SnapshotId;
+      readonly workspaceId: WorkspaceId;
+    }
+  ): Effect.fn.Return<CommitSaveResponse, MetadataBackendError> {
+    const ref = yield* metadata.getRef(
+      input.target.namespace,
+      input.target.refName
+    );
+    const actualHeadGeneration = refGeneration(ref);
+
+    if (
+      ref?.snapshotId !== commit.snapshotId ||
+      actualHeadGeneration !== commit.headGeneration
+    ) {
+      return Schema.decodeSync(CommitSaveConflictResponse)({
+        actualHeadGeneration,
+        decision: "conflict",
+        reason: "head_generation_mismatch",
+      });
+    }
+
+    return Schema.decodeSync(CommitSaveIdempotentResponse)({
+      decision: "idempotent",
+      headGeneration: commit.headGeneration,
+      snapshotId: commit.snapshotId,
+      workspaceId: commit.workspaceId,
+    });
+  }
+);
+
 const appendAudit = (
   event: Parameters<MetadataBackend["Service"]["appendAuditEvent"]>[0]
 ) =>
@@ -410,12 +446,7 @@ export const createMetadataSnapshotCoordinator =
 
           if (existing !== null) {
             if (idempotencyMatches(existing, input)) {
-              return Schema.decodeSync(CommitSaveIdempotentResponse)({
-                decision: "idempotent",
-                headGeneration: existing.headGeneration,
-                snapshotId: existing.snapshotId,
-                workspaceId: existing.workspaceId,
-              });
+              return yield* replayIdempotentCommit(metadata, input, existing);
             }
 
             return Schema.decodeSync(CommitSaveDeniedResponse)({
@@ -509,6 +540,16 @@ export const createMetadataSnapshotCoordinator =
 
           const createdAt = yield* currentIsoTimestamp;
           const producer = producerFromTarget(target, input.producer);
+
+          if (
+            [producer.actor, producer.event, producer.sha].includes("unknown")
+          ) {
+            return Schema.decodeSync(CommitSaveDeniedResponse)({
+              decision: "denied",
+              reason: "invalid_protocol_payload",
+            });
+          }
+
           const header = snapshotHeaderForCommit(
             { ...input, producer },
             target.trustClass,
@@ -523,8 +564,7 @@ export const createMetadataSnapshotCoordinator =
             snapshotId: input.manifest.snapshotId,
             workspaceId: input.workspaceId,
           });
-
-          const idempotencyClaimed = yield* metadata.rememberIdempotentCommit({
+          const idempotentCommit = {
             createdAt,
             headGeneration: committed.headGeneration,
             idempotencyKey: input.idempotencyKey,
@@ -534,19 +574,17 @@ export const createMetadataSnapshotCoordinator =
             runId: input.producer.runId,
             snapshotId: input.manifest.snapshotId,
             workspaceId: input.workspaceId,
-          });
+          };
+
+          const idempotencyClaimed =
+            yield* metadata.rememberIdempotentCommit(idempotentCommit);
 
           if (!idempotencyClaimed) {
             const reserved = yield* metadata.getIdempotentCommit(
               input.idempotencyKey
             );
             if (reserved !== null && idempotencyMatches(reserved, input)) {
-              return Schema.decodeSync(CommitSaveIdempotentResponse)({
-                decision: "idempotent",
-                headGeneration: reserved.headGeneration,
-                snapshotId: reserved.snapshotId,
-                workspaceId: reserved.workspaceId,
-              });
+              return yield* replayIdempotentCommit(metadata, input, reserved);
             }
 
             return Schema.decodeSync(CommitSaveDeniedResponse)({
@@ -568,12 +606,13 @@ export const createMetadataSnapshotCoordinator =
             {
               snapshotId: input.manifest.snapshotId,
               trustClass: target.trustClass,
-              updatedByActor: input.producer.actor,
+              updatedByActor: producer.actor,
               updatedByRunId: input.producer.runId,
             }
           );
 
           if (advanced === null) {
+            yield* metadata.releaseIdempotentCommit(idempotentCommit);
             const latestRef = yield* metadata.getRef(
               target.namespace,
               target.refName

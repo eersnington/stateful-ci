@@ -15,8 +15,6 @@ import {
 import type { SnapshotObjectKey } from "@stateful-ci/core";
 import { Effect, Schema } from "effect";
 
-import { BlobStore } from "../src/blob-store";
-import { BlobStoreError } from "../src/blob-store-error";
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
 import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
@@ -240,26 +238,8 @@ const seededBlobStore = () =>
     ])
   );
 
-const failingHeadBlobStore = () => {
-  const backing = createInMemoryBlobStore();
-
-  return BlobStore.of({
-    get: (key) => backing.get(key),
-    getRange: (key, offset, length) => backing.getRange(key, offset, length),
-    head: (key) =>
-      Effect.fail(
-        new BlobStoreError({
-          key,
-          message: `Could not inspect snapshot object ${key} in test storage.`,
-          reason: "io_failed",
-        })
-      ),
-    presignGet: (key, ttlSeconds) => backing.presignGet(key, ttlSeconds),
-    presignPut: (key, ttlSeconds, constraints) =>
-      backing.presignPut(key, ttlSeconds, constraints),
-    putIfAbsent: (input) => backing.putIfAbsent(input),
-  });
-};
+const failingHeadBlobStore = () =>
+  createInMemoryBlobStore(new Map(), { failHead: true });
 
 describe("worker API", () => {
   it("GET /health returns protocol health", async () => {
