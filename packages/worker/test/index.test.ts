@@ -6,6 +6,7 @@ import {
   RestoreAllowedResponse,
   PrepareSaveAllowedResponse,
   CommitSaveResponse,
+  HeadGeneration,
   RunId,
   Sha256Digest,
   SnapshotId,
@@ -14,8 +15,6 @@ import {
 import type { SnapshotObjectKey } from "@stateful-ci/core";
 import { Effect, Schema } from "effect";
 
-import { BlobStore } from "../src/blob-store";
-import { BlobStoreError } from "../src/blob-store-error";
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
 import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
@@ -120,6 +119,7 @@ const seededSnapshot = {
   manifestDigest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
   manifestKey: Schema.decodeSync(ManifestKey)(seededManifestKey),
   manifestSize: seededManifestBytes.byteLength,
+  namespace: seededNamespace,
   objects: [
     {
       digest: Schema.decodeSync(Sha256Digest)(seededManifestDigest),
@@ -141,20 +141,32 @@ const seededSnapshot = {
     },
   ],
   parentSnapshotId: null,
+  producerActor: "eersnington",
+  producerEvent: "push",
+  producerJob: "test",
+  producerRef: "refs/heads/main",
+  producerRepository: "eersnington/stateful-ci",
+  producerRunId: Schema.decodeSync(RunId)("123456788"),
+  producerSha: "abc123",
+  producerWorkflow: "ci.yml",
   runId: Schema.decodeSync(RunId)("123456788"),
+  safetyJson: "{}",
   snapshotId: seededSnapshotId,
+  statsJson: "{}",
   totalBytes: seededWorkspaceTotalBytes,
   trustClass: "trusted",
   workspaceId: seededWorkspaceId,
 } satisfies SnapshotHeader;
 
 const seededRef = {
+  generation: Schema.decodeSync(HeadGeneration)(1),
   namespace: seededNamespace,
   refName: seededRefName,
   snapshotId: seededSnapshotId,
   trustClass: "trusted",
   updatedAt: "2026-05-16T00:00:00.000Z",
-  version: 1,
+  updatedByActor: "eersnington",
+  updatedByRunId: Schema.decodeSync(RunId)("123456788"),
 } satisfies RefRow;
 
 const workspaceIdFor = (namespace: string, refName: string) =>
@@ -226,26 +238,8 @@ const seededBlobStore = () =>
     ])
   );
 
-const failingHeadBlobStore = () => {
-  const backing = createInMemoryBlobStore();
-
-  return BlobStore.of({
-    get: (key) => backing.get(key),
-    getRange: (key, offset, length) => backing.getRange(key, offset, length),
-    head: (key) =>
-      Effect.fail(
-        new BlobStoreError({
-          key,
-          message: `Could not inspect snapshot object ${key} in test storage.`,
-          reason: "io_failed",
-        })
-      ),
-    presignGet: (key, ttlSeconds) => backing.presignGet(key, ttlSeconds),
-    presignPut: (key, ttlSeconds, constraints) =>
-      backing.presignPut(key, ttlSeconds, constraints),
-    putIfAbsent: (input) => backing.putIfAbsent(input),
-  });
-};
+const failingHeadBlobStore = () =>
+  createInMemoryBlobStore(new Map(), { failHead: true });
 
 describe("worker API", () => {
   it("GET /health returns protocol health", async () => {
@@ -606,7 +600,7 @@ describe("worker API", () => {
           })
         );
         const body = yield* Effect.promise(() => response.json());
-        const auditEvents = yield* metadata.listAuditEvents;
+        const auditEvents = yield* metadata.listAuditEvents();
 
         assert.strictEqual(response.status, 200);
         assert.deepStrictEqual(body, {
@@ -906,8 +900,8 @@ describe("worker API", () => {
     });
   });
 
-  it.effect("POST /v1/save/commit checks context before objects", () =>
-    Effect.gen(function* commitChecksContextBeforeObjectsEffect() {
+  it.effect("POST /v1/save/commit validates objects before commit", () =>
+    Effect.gen(function* commitValidatesObjectsBeforeCommitEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
@@ -931,15 +925,10 @@ describe("worker API", () => {
           { blobStore: failingHeadBlobStore(), metadata }
         )
       );
-      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
-        yield* Effect.promise(() => response.json())
-      );
+      const body = yield* Effect.promise(() => response.json());
 
-      assert.strictEqual(response.status, 200);
-      assert.deepStrictEqual(body, {
-        decision: "denied",
-        reason: "restore_required_before_save",
-      });
+      assert.strictEqual(response.status, 500);
+      assert.deepInclude(body, { _tag: "BlobStoreError", reason: "io_failed" });
     })
   );
 
@@ -994,59 +983,59 @@ describe("worker API", () => {
     })
   );
 
-  it.effect(
-    "POST /v1/save/commit does not mutate refs without coordinator",
-    () =>
-      Effect.gen(function* commitDoesNotMutateWithoutCoordinatorEffect() {
-        const metadata = createInMemoryMetadataBackend({
-          workspaceTargets: [
-            {
-              namespace: seededNamespace,
-              refName: seededRefName,
-              runId: Schema.decodeSync(RunId)("123456789"),
-              trustClass: "trusted",
-              workspaceId: seededWorkspaceId,
+  it.effect("POST /v1/save/commit advances refs through coordinator", () =>
+    Effect.gen(function* commitDoesNotMutateWithoutCoordinatorEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            namespace: seededNamespace,
+            refName: seededRefName,
+            runId: Schema.decodeSync(RunId)("123456789"),
+            trustClass: "trusted",
+            workspaceId: seededWorkspaceId,
+          },
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save",
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_132",
             },
-          ],
-        });
-        const response = yield* Effect.promise(() =>
-          handleFetch(
-            jsonRequest("/v1/save/commit", {
-              baseSnapshotId: null,
-              expectedHeadGeneration: 0,
-              idempotencyKey: "run-123456789-save",
-              manifest: {
-                digest: seededManifestDigest,
-                key: seededManifestKey,
-                size: 8,
-                snapshotId: "snap_132",
-              },
-              objects: seededSnapshot.objects,
-              protocolVersion: 1,
-              runId: "123456789",
-              target: { namespace: seededNamespace, refName: seededRefName },
-              workspaceId: seededWorkspaceId,
-            }),
-            env,
-            { blobStore: seededBlobStore(), metadata }
-          )
-        );
-        const body = Schema.decodeUnknownSync(CommitSaveResponse)(
-          yield* Effect.promise(() => response.json())
-        );
-        const header = yield* metadata.getSnapshotHeader(
-          Schema.decodeSync(SnapshotId)("snap_132")
-        );
-        const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_132")
+      );
+      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
 
-        assert.strictEqual(response.status, 200);
-        assert.deepStrictEqual(body, {
-          decision: "denied",
-          reason: "backend_policy_not_configured",
-        });
-        assert.isNull(header);
-        assert.isNull(ref);
-      })
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "committed",
+        headGeneration: Schema.decodeSync(HeadGeneration)(1),
+        snapshotId: Schema.decodeSync(SnapshotId)("snap_132"),
+        workspaceId: seededWorkspaceId,
+      });
+      assert.isNotNull(header);
+      assert.strictEqual(ref?.snapshotId, "snap_132");
+    })
   );
 
   it("POST /v1/restore uses configured trusted refs for seed snapshots", async () => {

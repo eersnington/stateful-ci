@@ -1,14 +1,9 @@
-import type {
-  ApiErrorType,
-  CommitSaveResponse,
-  DenialReason,
-} from "@stateful-ci/core";
+import type { ApiErrorType, DenialReason } from "@stateful-ci/core";
 import {
-  CommitSaveConflictResponse,
   CommitSaveDeniedResponse,
   CommitSaveRequest,
+  CommitSaveResponse,
   Forbidden,
-  HeadGeneration,
   HealthResponse,
   InvalidJsonBody,
   InvalidProtocolPayload,
@@ -33,13 +28,15 @@ import { Effect, Exit, Schema } from "effect";
 import { BlobStore } from "./blob-store";
 import { BlobStoreError } from "./blob-store-error";
 import { createR2BlobStore } from "./blob-store-r2";
+import { createDurableObjectSnapshotCoordinator } from "./durable-object";
 import {
+  createD1MetadataBackend,
   createInMemoryMetadataBackend,
   currentIsoTimestamp,
-  manifestDescriptorFromSnapshotHeader,
   MetadataBackend,
 } from "./metadata";
-import type { RefRow, RefTarget, SnapshotHeader } from "./metadata";
+import type { RefTarget } from "./metadata";
+import { MetadataBackendError } from "./metadata-backend-error";
 import {
   downloadPlanForObjects,
   missingObjectPlans,
@@ -47,8 +44,13 @@ import {
   parseObjectRouteKey,
   validateObjectsPresent,
 } from "./object-data-plane";
-import { evaluateRestorePolicy, evaluateSavePolicy } from "./policy";
 import { classifyRunTrust, defaultTrustedRefs } from "./run-classification";
+import {
+  createMetadataSnapshotCoordinator,
+  SnapshotCoordinator,
+} from "./snapshot-coordinator";
+
+export { WorkspaceSnapshotCoordinatorDurableObject } from "./durable-object";
 
 /**
  * Maximum accepted size for JSON protocol request bodies.
@@ -61,6 +63,8 @@ import { classifyRunTrust, defaultTrustedRefs } from "./run-classification";
 export const maxProtocolBodyBytes = 64 * 1024;
 
 interface WorkerEnv {
+  readonly STATEFUL_CI_COORDINATORS?: DurableObjectNamespace;
+  readonly STATEFUL_CI_METADATA?: D1Database;
   readonly STATEFUL_CI_OBJECTS?: R2Bucket;
   readonly STATEFUL_CI_API_TOKEN?: string;
   readonly STATEFUL_CI_TRUSTED_REFS?: string;
@@ -68,6 +72,7 @@ interface WorkerEnv {
 
 export interface HandleFetchOptions {
   readonly blobStore?: BlobStore["Service"];
+  readonly coordinator?: SnapshotCoordinator["Service"];
   readonly metadata?: MetadataBackend["Service"];
 }
 
@@ -96,6 +101,34 @@ const unconfiguredBlobStore = BlobStore.of({
   putIfAbsent: (input) => Effect.fail(unconfiguredBlobStoreError(input.key)),
 });
 
+const unconfiguredCoordinatorError = (operation: string) =>
+  new MetadataBackendError({
+    message:
+      "The Worker has D1 metadata configured without a Durable Object coordinator binding, so production snapshot head decisions are disabled. Bind STATEFUL_CI_COORDINATORS before using restore/save flows.",
+    operation,
+  });
+
+const unconfiguredCoordinator = SnapshotCoordinator.of({
+  authorizeRestore: () =>
+    Effect.fail(unconfiguredCoordinatorError("authorizeRestore")),
+  commitSave: () => Effect.fail(unconfiguredCoordinatorError("commitSave")),
+  prepareSave: () => Effect.fail(unconfiguredCoordinatorError("prepareSave")),
+  recordRestoreAllowed: () =>
+    Effect.fail(unconfiguredCoordinatorError("recordRestoreAllowed")),
+  recordRestoreObjectDenial: () =>
+    Effect.fail(unconfiguredCoordinatorError("recordRestoreObjectDenial")),
+});
+
+const coordinatorForEnv = (env: WorkerEnv | undefined) => {
+  if (env?.STATEFUL_CI_COORDINATORS !== undefined) {
+    return createDurableObjectSnapshotCoordinator(env.STATEFUL_CI_COORDINATORS);
+  }
+
+  return env?.STATEFUL_CI_METADATA === undefined
+    ? createMetadataSnapshotCoordinator()
+    : unconfiguredCoordinator;
+};
+
 const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
   const configured = env?.STATEFUL_CI_TRUSTED_REFS?.split(",")
     .map((ref) => ref.trim())
@@ -123,6 +156,27 @@ const isBlobStoreError = (error: unknown): error is BlobStoreError =>
   error !== null &&
   "_tag" in error &&
   error._tag === "BlobStoreError";
+
+const isMetadataBackendError = (
+  error: unknown
+): error is MetadataBackendError =>
+  typeof error === "object" &&
+  error !== null &&
+  "_tag" in error &&
+  error._tag === "MetadataBackendError";
+
+const producerContextFor = (
+  request: Pick<PrepareSaveRequest, "git" | "github" | "workspace">
+) => ({
+  actor: request.github.actor,
+  event: request.github.event,
+  job: request.workspace.job,
+  ref: request.git.ref,
+  repository: request.workspace.repo,
+  runId: Schema.decodeSync(RunId)(request.github.runId),
+  sha: request.git.sha,
+  workflow: request.workspace.workflow,
+});
 
 const authorizeRequest = (request: Request, env: WorkerEnv | undefined) => {
   const expectedToken = env?.STATEFUL_CI_API_TOKEN;
@@ -266,9 +320,6 @@ const trustedSeedTargetsFor = (
     refName: `trusted/${refSegment(trustedRef)}/latest`,
   }));
 
-const scopeKeyForTarget = (target: RefTarget) =>
-  `${target.namespace}\n${target.refName}`;
-
 const restoreCandidateTargets = (
   target: RefTarget,
   trustClass: ReturnType<typeof classifyRunTrust>,
@@ -277,15 +328,6 @@ const restoreCandidateTargets = (
   trustClass === "trusted" || trustClass === "unknown"
     ? [target]
     : [target, ...trustedSeedTargetsFor(target, trustedRefs)];
-
-const candidateProducerScope = (
-  target: RefTarget,
-  ref: RefRow,
-  snapshot: SnapshotHeader
-) => ({
-  scopeKey: scopeKeyForTarget(target),
-  trustClass: snapshot.trustClass ?? ref.trustClass,
-});
 
 const workspaceIdForTarget = (target: RefTarget) =>
   Schema.decodeSync(WorkspaceId)(`ws:${target.namespace}:${target.refName}`);
@@ -461,7 +503,7 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   request: Request,
   env: WorkerEnv | undefined
 ) {
-  const metadata = yield* MetadataBackend;
+  const coordinator = yield* SnapshotCoordinator;
   yield* authorizeRequest(request, env);
   const restoreRequest = yield* readProtocolBody(request).pipe(
     Effect.flatMap(parseProtocolJson),
@@ -472,127 +514,30 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   const target = metadataTargetForRestore(restoreRequest, trustedRefs);
   const workspaceId = workspaceIdForTarget(target);
   const runId = runIdFromRestore(restoreRequest);
-
-  if (trustClass === "unknown") {
-    const createdAt = yield* currentIsoTimestamp;
-
-    yield* metadata.appendAuditEvent({
-      ...target,
-      createdAt,
-      decision: "denied",
-      eventType: "restore",
-      reason: "unable_to_classify_run_context",
-      runId,
-      snapshotId: null,
-      trustClass,
-      workspaceId,
-    });
-
-    return Response.json(
-      Schema.encodeUnknownSync(RestoreDeniedResponse)({
-        decision: "denied",
-        reason: "unable_to_classify_run_context",
-        save: { allowed: false },
-        trustClass,
-      })
-    );
-  }
-
-  const candidates = restoreCandidateTargets(target, trustClass, trustedRefs);
-  let deniedReason: DenialReason | null = null;
-  let deniedSnapshotId: SnapshotHeader["snapshotId"] | null = null;
-  let restored: {
-    readonly snapshot: SnapshotHeader;
-  } | null = null;
-
-  for (const candidateTarget of candidates) {
-    const ref = yield* metadata.getRef(
-      candidateTarget.namespace,
-      candidateTarget.refName
-    );
-    const snapshot =
-      ref === null ? null : yield* metadata.getSnapshotHeader(ref.snapshotId);
-
-    if (ref !== null && snapshot !== null) {
-      const decision =
-        snapshot.workspaceId === workspaceIdForTarget(candidateTarget)
-          ? evaluateRestorePolicy({
-              consumer: { scopeKey: scopeKeyForTarget(target), trustClass },
-              producer: candidateProducerScope(candidateTarget, ref, snapshot),
-            })
-          : ({ allowed: false, reason: "restore_policy_denied" } as const);
-
-      if (decision.allowed) {
-        restored = { snapshot };
-        break;
-      }
-
-      deniedReason = decision.reason;
-      deniedSnapshotId = snapshot.snapshotId;
-    }
-  }
-
-  if (restored === null) {
-    const savePolicy = evaluateSavePolicy({
-      scopeKey: scopeKeyForTarget(target),
-      trustClass,
-    });
-
-    if (savePolicy.allowed) {
-      yield* metadata.rememberWorkspaceTarget({
-        ...target,
-        runId,
-        trustClass,
-        workspaceId,
-      });
-    }
-
-    const createdAt = yield* currentIsoTimestamp;
-
-    yield* metadata.appendAuditEvent({
-      ...target,
-      createdAt,
-      decision: "denied",
-      eventType: "restore",
-      reason: deniedReason ?? "no_compatible_snapshot",
-      runId,
-      snapshotId: deniedSnapshotId,
-      trustClass,
-      workspaceId,
-    });
-
-    return Response.json(
-      Schema.encodeUnknownSync(RestoreDeniedResponse)({
-        decision: "denied",
-        reason: deniedReason ?? "no_compatible_snapshot",
-        save: savePolicy.allowed
-          ? { allowed: true, target: target.refName }
-          : { allowed: false },
-        trustClass,
-        ...(savePolicy.allowed ? { workspaceId } : {}),
-      })
-    );
-  }
-
-  const savePolicy = evaluateSavePolicy({
-    scopeKey: scopeKeyForTarget(target),
+  const restore = yield* coordinator.authorizeRestore({
+    candidates: restoreCandidateTargets(target, trustClass, trustedRefs),
+    runId,
+    target,
     trustClass,
+    workspaceId,
   });
 
-  if (savePolicy.allowed) {
-    yield* metadata.rememberWorkspaceTarget({
-      ...target,
-      runId,
-      trustClass,
-      workspaceId,
-    });
+  if (restore.decision === "denied") {
+    return Response.json(
+      Schema.encodeUnknownSync(RestoreDeniedResponse)({
+        decision: "denied",
+        reason: restore.reason,
+        save:
+          restore.saveTarget === null
+            ? { allowed: false }
+            : { allowed: true, target: restore.saveTarget.refName },
+        trustClass,
+        ...(restore.saveTarget === null ? {} : { workspaceId }),
+      })
+    );
   }
 
-  const createdAt = yield* currentIsoTimestamp;
-
-  const objectValidation = yield* validateObjectsPresent(
-    restored.snapshot.objects
-  ).pipe(
+  const objectValidation = yield* validateObjectsPresent(restore.objects).pipe(
     Effect.matchEffect({
       onFailure: (error) =>
         isBlobStoreError(error)
@@ -603,14 +548,11 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   );
 
   if (!objectValidation.ok) {
-    yield* metadata.appendAuditEvent({
-      ...target,
-      createdAt,
-      decision: "denied",
-      eventType: "restore",
+    yield* coordinator.recordRestoreObjectDenial({
       reason: objectValidation.reason,
       runId,
-      snapshotId: restored.snapshot.snapshotId,
+      snapshotId: restore.snapshot.snapshotId,
+      target,
       trustClass,
       workspaceId,
     });
@@ -619,23 +561,20 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
       Schema.encodeUnknownSync(RestoreDeniedResponse)({
         decision: "denied",
         reason: objectValidation.reason,
-        save: savePolicy.allowed
-          ? { allowed: true, target: target.refName }
-          : { allowed: false },
+        save:
+          restore.saveTarget === null
+            ? { allowed: false }
+            : { allowed: true, target: restore.saveTarget.refName },
         trustClass,
-        ...(savePolicy.allowed ? { workspaceId } : {}),
+        ...(restore.saveTarget === null ? {} : { workspaceId }),
       })
     );
   }
 
-  yield* metadata.appendAuditEvent({
-    ...target,
-    createdAt,
-    decision: "allowed",
-    eventType: "restore",
-    reason: null,
+  yield* coordinator.recordRestoreAllowed({
     runId,
-    snapshotId: restored.snapshot.snapshotId,
+    snapshotId: restore.snapshot.snapshotId,
+    target,
     trustClass,
     workspaceId,
   });
@@ -643,15 +582,16 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   return Response.json(
     Schema.encodeUnknownSync(RestoreAllowedResponse)({
       decision: "allowed",
-      downloadPlan: downloadPlanForObjects(restored.snapshot.objects),
-      manifest: manifestDescriptorFromSnapshotHeader(restored.snapshot),
-      save: savePolicy.allowed
-        ? { allowed: true, target: target.refName }
-        : { allowed: false },
+      downloadPlan: downloadPlanForObjects(restore.objects),
+      manifest: restore.manifest,
+      save:
+        restore.saveTarget === null
+          ? { allowed: false }
+          : { allowed: true, target: restore.saveTarget.refName },
       snapshot: {
-        id: restored.snapshot.snapshotId,
-        manifestKey: restored.snapshot.manifestKey,
-        parent: restored.snapshot.parentSnapshotId,
+        id: restore.snapshot.snapshotId,
+        manifestKey: restore.snapshot.manifestKey,
+        parent: restore.snapshot.parentSnapshotId,
       },
       trustClass,
       workspaceId,
@@ -664,7 +604,7 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
     request: Request,
     env: WorkerEnv | undefined
   ) {
-    const metadata = yield* MetadataBackend;
+    const coordinator = yield* SnapshotCoordinator;
     yield* authorizeRequest(request, env);
     const prepareRequest = yield* readProtocolBody(request).pipe(
       Effect.flatMap(parseProtocolJson),
@@ -675,13 +615,18 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
     const target = metadataTargetForRestore(prepareRequest, trustedRefs);
     const workspaceId = workspaceIdForTarget(target);
     const runId = Schema.decodeSync(RunId)(prepareRequest.github.runId);
-    const savePolicy = evaluateSavePolicy({
-      scopeKey: scopeKeyForTarget(target),
+    const expiresAt = yield* currentIsoTimestamp;
+    const saveAuthorization = yield* coordinator.prepareSave({
+      expiresAt,
+      producer: producerContextFor(prepareRequest),
+      runId,
+      target,
       trustClass,
+      workspaceId,
     });
 
-    if (!savePolicy.allowed) {
-      return denyPrepareSave(savePolicy.reason, trustClass, workspaceId);
+    if (saveAuthorization.decision === "denied") {
+      return denyPrepareSave(saveAuthorization.reason, trustClass, workspaceId);
     }
 
     const missing = yield* missingObjectPlans(prepareRequest.objects).pipe(
@@ -698,23 +643,12 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
       return denyPrepareSave(missing.reason, trustClass, workspaceId);
     }
 
-    const ref = yield* metadata.getRef(target.namespace, target.refName);
-
-    yield* metadata.rememberWorkspaceTarget({
-      ...target,
-      runId,
-      trustClass,
-      workspaceId,
-    });
-
     return Response.json(
       Schema.encodeUnknownSync(PrepareSaveAllowedResponse)({
-        baseSnapshotId: ref?.snapshotId ?? null,
+        baseSnapshotId: saveAuthorization.baseSnapshotId,
         commitTarget: target,
         decision: "allowed",
-        expectedHeadGeneration: Schema.decodeSync(HeadGeneration)(
-          ref?.version ?? 0
-        ),
+        expectedHeadGeneration: saveAuthorization.expectedHeadGeneration,
         missingObjects: missing.plans,
         trustClass,
         workspaceId,
@@ -728,80 +662,12 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
     request: Request,
     env: WorkerEnv | undefined
   ) {
-    const metadata = yield* MetadataBackend;
+    const coordinator = yield* SnapshotCoordinator;
     yield* authorizeRequest(request, env);
     const commitRequest = yield* readProtocolBody(request).pipe(
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(CommitSaveRequest))
     );
-    const target = yield* metadata.getWorkspaceTarget(
-      commitRequest.workspaceId
-    );
-
-    if (target === null) {
-      return Response.json(
-        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
-          decision: "denied",
-          reason: "restore_required_before_save",
-        })
-      );
-    }
-
-    if (
-      target.runId !== commitRequest.runId ||
-      target.namespace !== commitRequest.target.namespace ||
-      target.refName !== commitRequest.target.refName
-    ) {
-      return Response.json(
-        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
-          decision: "denied",
-          reason: "save_run_context_mismatch",
-        })
-      );
-    }
-
-    if (commitRequest.baseSnapshotId !== null) {
-      const baseSnapshot = yield* metadata.getSnapshotHeader(
-        commitRequest.baseSnapshotId
-      );
-
-      if (baseSnapshot === null) {
-        return Response.json(
-          Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
-            decision: "denied",
-            reason: "save_run_context_mismatch",
-          })
-        );
-      }
-    }
-
-    const savePolicy = evaluateSavePolicy({
-      scopeKey: scopeKeyForTarget(target),
-      trustClass: target.trustClass,
-    });
-
-    if (!savePolicy.allowed) {
-      return Response.json(
-        Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
-          decision: "denied",
-          reason: savePolicy.reason,
-        })
-      );
-    }
-
-    const ref = yield* metadata.getRef(target.namespace, target.refName);
-    const actualGeneration = ref?.version ?? 0;
-
-    if (actualGeneration !== commitRequest.expectedHeadGeneration) {
-      return Response.json(
-        Schema.encodeUnknownSync(CommitSaveConflictResponse)({
-          actualHeadGeneration:
-            Schema.decodeSync(HeadGeneration)(actualGeneration),
-          decision: "conflict",
-          reason: "head_generation_mismatch",
-        })
-      );
-    }
 
     const objectValidation = yield* validateObjectsPresent(
       commitRequest.objects
@@ -824,12 +690,27 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
       );
     }
 
-    return Response.json(
-      Schema.encodeUnknownSync(CommitSaveDeniedResponse)({
-        decision: "denied",
-        reason: "backend_policy_not_configured",
-      } satisfies CommitSaveResponse)
-    );
+    const result = yield* coordinator.commitSave({
+      baseSnapshotId: commitRequest.baseSnapshotId,
+      expectedHeadGeneration: commitRequest.expectedHeadGeneration,
+      idempotencyKey: commitRequest.idempotencyKey,
+      manifest: commitRequest.manifest,
+      objects: commitRequest.objects,
+      producer: {
+        actor: "unknown",
+        event: "unknown",
+        job: commitRequest.target.refName,
+        ref: commitRequest.target.refName,
+        repository: commitRequest.target.namespace,
+        runId: commitRequest.runId,
+        sha: "unknown",
+        workflow: commitRequest.target.namespace,
+      },
+      target: commitRequest.target,
+      workspaceId: commitRequest.workspaceId,
+    });
+
+    return Response.json(Schema.encodeUnknownSync(CommitSaveResponse)(result));
   }
 );
 
@@ -870,8 +751,8 @@ const handleRequest = (
   env?: WorkerEnv
 ): Effect.Effect<
   Response,
-  ApiErrorType | BlobStoreError,
-  BlobStore | MetadataBackend
+  ApiErrorType | BlobStoreError | MetadataBackendError,
+  BlobStore | MetadataBackend | SnapshotCoordinator
 > => {
   const path = new URL(request.url).pathname;
 
@@ -1006,6 +887,10 @@ const errorResponse = (error: unknown) => {
     return apiErrorResponse(error);
   }
 
+  if (isMetadataBackendError(error)) {
+    return Response.json(error, { status: 500 });
+  }
+
   return Response.json(
     new InvalidProtocolPayload({
       message:
@@ -1031,9 +916,14 @@ export const handleFetch = (
       ),
       Effect.provideService(
         MetadataBackend,
-        // Until D1/DO bindings exist, default Worker fetches are intentionally
-        // request-local. Tests and local dev can inject a shared backend.
-        options.metadata ?? defaultMetadata
+        options.metadata ??
+          (env?.STATEFUL_CI_METADATA === undefined
+            ? defaultMetadata
+            : createD1MetadataBackend(env.STATEFUL_CI_METADATA))
+      ),
+      Effect.provideService(
+        SnapshotCoordinator,
+        options.coordinator ?? coordinatorForEnv(env)
       ),
       Effect.match({
         onFailure: errorResponse,
