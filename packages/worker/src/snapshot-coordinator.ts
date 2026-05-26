@@ -253,6 +253,14 @@ const producerMatchesTarget = (
   (target.producerWorkflow === undefined ||
     target.producerWorkflow === producer.workflow);
 
+/**
+ * Validates that commit-save targets the same prepared run, namespace, and ref.
+ *
+ * When an OIDC audit payload is present, the commit carries verified producer
+ * context derived from signed identity claims. In that case, producer fields are
+ * also matched against the prepared target to prevent committing a manifest for
+ * a different actor/event/ref/repository/sha/workflow than the one prepared.
+ */
 const validateCommitTarget = (
   target: WorkspaceTarget,
   input: CommitSaveInput

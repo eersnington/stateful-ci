@@ -25,13 +25,20 @@ const isBranchRef = (ref: string) => ref.startsWith("refs/heads/");
 
 const isTagRef = (ref: string) => ref.startsWith("refs/tags/");
 
+/**
+ * Conservatively classifies verified GitHub `pull_request` identities.
+ *
+ * GitHub OIDC verifies `base_ref` and `head_ref`, but does not provide a
+ * documented claim for the pull request head repository. Without a separate
+ * trusted PR metadata source, same-repo and fork PRs cannot be distinguished
+ * safely, so verified PRs are treated as external.
+ */
 const classifyPullRequestTrust = (
   identity: VerifiedGitHubActionsIdentity
 ): TrustClass => {
   if (!isPresent(identity.baseRef) || !isPresent(identity.headRef)) {
     return "unknown";
   }
-
   return "external";
 };
 

@@ -215,6 +215,14 @@ const fetchJwks = (jwksUrl: string) =>
       : decoded.value.keys;
   });
 
+/**
+ * Returns GitHub OIDC signing keys using a bounded per-isolate cache.
+ *
+ * Cloudflare may reuse Worker isolates across requests, so the module-level
+ * JWKS cache can be reused by later requests in the same isolate. The cache
+ * stores only GitHub public signing keys, expires after a short TTL, and is
+ * refreshed when a token references an unknown `kid`.
+ */
 const jwksForVerification = Effect.fn("jwksForVerification")(
   function* jwksForVerificationEffect(jwksUrl: string, forceRefresh: boolean) {
     const now = yield* Clock.currentTimeMillis;
