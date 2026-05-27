@@ -14,4 +14,14 @@ runs:
       run: bun install --cwd "$GITHUB_ACTION_PATH" --frozen-lockfile
     - name: Run Stateful CI
       shell: bash
-      run: bun "$GITHUB_ACTION_PATH/packages/stateful-ci/src/cli.ts" "${{ inputs.command }}"
+      env:
+        STATEFUL_CI_COMMAND: ${{ inputs.command }}
+      run: |
+        case "$STATEFUL_CI_COMMAND" in
+          restore|save|init|deploy|dashboard) ;;
+          *)
+            printf 'Unsupported Stateful CI command: %s\n' "$STATEFUL_CI_COMMAND" >&2
+            exit 1
+            ;;
+        esac
+        bun "$GITHUB_ACTION_PATH/packages/stateful-ci/src/cli.ts" "$STATEFUL_CI_COMMAND"

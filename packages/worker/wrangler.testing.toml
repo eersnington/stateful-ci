@@ -3,6 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2026-05-22"
 
 [vars]
+ALLOWED_REPOSITORIES = "eersnington/stateful-ci"
 STATEFUL_CI_API_TOKEN = "test-token"
 STATEFUL_CI_DEV_AUTH_ENABLED = "true"
 STATEFUL_CI_TRANSFER_SECRET = "test-transfer-token"

@@ -90,8 +90,17 @@ const oidcIdentityFor = (token: () => string) => ({
 });
 
 const env = {
+  ALLOWED_REPOSITORIES: "eersnington/stateful-ci",
   STATEFUL_CI_API_TOKEN: "test-token",
   STATEFUL_CI_DEV_AUTH_ENABLED: "true",
+  get STATEFUL_CI_GITHUB_JWKS_JSON() {
+    return signedOidcJwksJson;
+  },
+  STATEFUL_CI_TRANSFER_SECRET: "test-transfer-token",
+};
+
+const productionEnv = {
+  ALLOWED_REPOSITORIES: "eersnington/stateful-ci",
   get STATEFUL_CI_GITHUB_JWKS_JSON() {
     return signedOidcJwksJson;
   },
@@ -575,7 +584,7 @@ describe("worker API", () => {
         snapshots: [seededSnapshot],
       });
       const response = yield* Effect.promise(() =>
-        handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
+        handleFetch(jsonRequest("/v1/restore", restoreRequest), productionEnv, {
           blobStore: seededBlobStore(),
           metadata,
         })
@@ -621,7 +630,7 @@ describe("worker API", () => {
         assert.isString(entry.headers?.["x-stateful-ci-transfer-token"]);
         assert.notStrictEqual(
           entry.headers?.["x-stateful-ci-transfer-token"],
-          env.STATEFUL_CI_TRANSFER_SECRET
+          productionEnv.STATEFUL_CI_TRANSFER_SECRET
         );
       }
     })
@@ -912,6 +921,45 @@ describe("worker API", () => {
       decision: "denied",
       eventType: "restore",
       reason: "oidc_missing",
+      trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/restore denies when repository allowlist is missing", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      {
+        STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+        STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET,
+      },
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "unknown_context_denied",
+      save: { allowed: false },
+      trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/restore denies repositories outside the allowlist", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      {
+        ALLOWED_REPOSITORIES: "other/repo",
+        STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+        STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET,
+      },
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "unknown_context_denied",
+      save: { allowed: false },
       trustClass: "unknown",
     });
   });
@@ -1475,7 +1523,7 @@ describe("worker API", () => {
         snapshots: [seededSnapshot],
       });
       const restoreResponse = yield* Effect.promise(() =>
-        handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
+        handleFetch(jsonRequest("/v1/restore", restoreRequest), productionEnv, {
           blobStore: seededBlobStore(),
           metadata,
         })
@@ -1495,7 +1543,10 @@ describe("worker API", () => {
             headers: plan.headers ?? {},
             method: "GET",
           }),
-          { STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET },
+          {
+            STATEFUL_CI_TRANSFER_SECRET:
+              productionEnv.STATEFUL_CI_TRANSFER_SECRET,
+          },
           { blobStore: seededBlobStore() }
         )
       );
@@ -1510,6 +1561,40 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("dev auth object plans do not require a transfer secret", () =>
+    Effect.gen(function* devAuthObjectPlansDoNotRequireTransferSecretEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        refs: [seededRef],
+        snapshots: [seededSnapshot],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/restore", restoreRequest),
+          {
+            ALLOWED_REPOSITORIES: env.ALLOWED_REPOSITORIES,
+            STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
+            STATEFUL_CI_DEV_AUTH_ENABLED: "true",
+            STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+          },
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(body.decision, "allowed");
+      for (const entry of body.downloadPlan) {
+        assert.isUndefined(entry.headers?.["x-stateful-ci-transfer-token"]);
+        assert.isUndefined(
+          entry.headers?.["x-stateful-ci-transfer-expires-at"]
+        );
+        assert.isString(entry.headers?.["x-stateful-ci-object-digest"]);
+      }
+    })
+  );
+
   it.effect(
     "object routes reject transfer authorization for another method",
     () =>
@@ -1520,10 +1605,14 @@ describe("worker API", () => {
             snapshots: [seededSnapshot],
           });
           const restoreResponse = yield* Effect.promise(() =>
-            handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
-              blobStore: seededBlobStore(),
-              metadata,
-            })
+            handleFetch(
+              jsonRequest("/v1/restore", restoreRequest),
+              productionEnv,
+              {
+                blobStore: seededBlobStore(),
+                metadata,
+              }
+            )
           );
           const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
             yield* Effect.promise(() => restoreResponse.json())
@@ -1543,7 +1632,10 @@ describe("worker API", () => {
                 },
                 method: "PUT",
               }),
-              { STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET },
+              {
+                STATEFUL_CI_TRANSFER_SECRET:
+                  productionEnv.STATEFUL_CI_TRANSFER_SECRET,
+              },
               { blobStore: seededBlobStore() }
             )
           );

@@ -57,6 +57,15 @@ interface CliFailure {
 }
 
 type RuntimeEnv = Readonly<Record<string, string | undefined>>;
+type DeployStepRunner = (input: {
+  readonly args: readonly string[];
+  readonly stdin?: string;
+}) => Effect.Effect<DeployStepOutput, CliFailure>;
+
+interface DeployStepOutput {
+  readonly stderr: string;
+  readonly stdout: string;
+}
 
 interface LoadedConfig {
   readonly config: StatefulCiConfigType;
@@ -200,6 +209,7 @@ const parseD1DatabaseId = (source: string, databaseName: string) => {
 };
 
 const deployConfigText = (input: {
+  readonly allowedRepositories: string;
   readonly bucket: string;
   readonly database: string;
   readonly databaseId: string;
@@ -208,6 +218,7 @@ const deployConfigText = (input: {
   readonly trustedRefs: string | null;
 }) => {
   const vars = [
+    `ALLOWED_REPOSITORIES = ${tomlString(input.allowedRepositories)}`,
     `OIDC_AUDIENCE = ${tomlString(input.oidcAudience)}`,
     ...(input.trustedRefs === null
       ? []
@@ -223,6 +234,37 @@ const deployConfigText = (input: {
 const optionalEnv = (env: RuntimeEnv, key: string) => {
   const value = env[key];
   return value === undefined || value.length === 0 ? null : value;
+};
+
+const requiredDeployEnv = (env: RuntimeEnv, key: string) => {
+  const value = optionalEnv(env, key);
+
+  return value === null
+    ? Effect.fail(
+        cliFailure(
+          `Missing ${key}. Set ${key} before running stateful-ci deploy so the generated Worker is secure and usable.`
+        )
+      )
+    : Effect.succeed(value);
+};
+
+const protocolUrl = (api: ApiConfig, route: string) =>
+  new URL(route, api.url.endsWith("/") ? api.url : `${api.url}/`).href;
+
+const relativeWorkerRouteUrl = (
+  api: ApiConfig,
+  route: string,
+  context: "restore" | "save"
+) => {
+  if (!route.startsWith("/") || route.startsWith("//")) {
+    return Effect.fail(
+      cliFailure(
+        `The backend returned an unsafe ${context} worker-route ${route}. Worker-route object plans must use a relative path beginning with /. ${context === "restore" ? "Restore did not mutate the workspace." : "Save did not upload or commit objects."}`
+      )
+    );
+  }
+
+  return Effect.succeed(protocolUrl(api, route));
 };
 
 const requiredEnv = (env: RuntimeEnv, key: string) => {
@@ -398,9 +440,6 @@ const restoreRequestFromEnv = (env: RuntimeEnv, loaded: LoadedConfig) =>
       : decoded.value;
   });
 
-const protocolUrl = (api: ApiConfig, route: string) =>
-  new URL(route, api.url.endsWith("/") ? api.url : `${api.url}/`).href;
-
 const restoreSessionPath = (directory: string) =>
   `${directory}/${restoreSessionFile}`;
 
@@ -528,7 +567,7 @@ const downloadPlannedObject = Effect.fn("downloadPlannedObject")(
 
     const url =
       plan.transport === "worker-route"
-        ? protocolUrl(api, plan.route)
+        ? yield* relativeWorkerRouteUrl(api, plan.route, "restore")
         : plan.url;
     const headers = new Headers(plan.headers ?? {});
 
@@ -598,7 +637,7 @@ const uploadPlannedObject = Effect.fn("uploadPlannedObject")(
     );
     const url =
       plan.transport === "worker-route"
-        ? protocolUrl(api, plan.route)
+        ? yield* relativeWorkerRouteUrl(api, plan.route, "save")
         : plan.url;
     const headers = new Headers(plan.headers ?? {});
 
@@ -895,30 +934,35 @@ export const saveCommand = Command.make("save", {}, () =>
   )
 );
 
-const runDeployStep = Effect.fn("runDeployStep")(function* runDeployStepEffect(
-  args: readonly string[]
-) {
-  return yield* Effect.tryPromise({
-    catch: (error) =>
-      cliFailure(
-        `Deploy step failed while running bunx ${args.join(" ")}. Stateful CI backend resources may be partially provisioned; fix the reported Cloudflare/Wrangler issue and rerun stateful-ci deploy.${commandOutputForError(error)}`
-      ),
-    try: async () => {
-      const result = await execFilePromise("bunx", [...args], {
-        cwd: repositoryRootDirectory,
-      });
+const runDeployStep: DeployStepRunner = Effect.fn("runDeployStep")(
+  function* runDeployStepEffect(input: {
+    readonly args: readonly string[];
+    readonly stdin?: string;
+  }) {
+    const result = yield* Effect.tryPromise({
+      catch: (error) =>
+        cliFailure(
+          `Deploy step failed while running bunx ${input.args.join(" ")}. Stateful CI backend resources may be partially provisioned; fix the reported Cloudflare/Wrangler issue and rerun stateful-ci deploy.${commandOutputForError(error)}`
+        ),
+      try: () =>
+        execFilePromise("bunx", [...input.args], {
+          cwd: repositoryRootDirectory,
+          ...(input.stdin === undefined ? {} : { input: input.stdin }),
+        }),
+    });
 
-      return {
-        stderr: textFromUnknown(result.stderr),
-        stdout: textFromUnknown(result.stdout),
-      };
-    },
-  });
-});
+    return {
+      stderr: textFromUnknown(result.stderr),
+      stdout: textFromUnknown(result.stdout),
+    };
+  }
+);
 
 const ensureR2Bucket = Effect.fn("ensureR2Bucket")(
-  function* ensureR2BucketEffect(bucket: string) {
-    yield* runDeployStep(["wrangler", "r2", "bucket", "create", bucket]).pipe(
+  function* ensureR2BucketEffect(bucket: string, runStep: DeployStepRunner) {
+    yield* runStep({
+      args: ["wrangler", "r2", "bucket", "create", bucket],
+    }).pipe(
       Effect.catchTag("CliFailure", (error) =>
         error.message.toLowerCase().includes("already exists")
           ? Console.log(`R2 bucket ${bucket} already exists; reusing it.`)
@@ -929,8 +973,13 @@ const ensureR2Bucket = Effect.fn("ensureR2Bucket")(
 );
 
 const findD1DatabaseId = Effect.fn("findD1DatabaseId")(
-  function* findD1DatabaseIdEffect(database: string) {
-    const list = yield* runDeployStep(["wrangler", "d1", "list", "--json"]);
+  function* findD1DatabaseIdEffect(
+    database: string,
+    runStep: DeployStepRunner
+  ) {
+    const list = yield* runStep({
+      args: ["wrangler", "d1", "list", "--json"],
+    });
     const databaseId = parseD1DatabaseId(list.stdout, database);
 
     return databaseId === null
@@ -944,32 +993,27 @@ const findD1DatabaseId = Effect.fn("findD1DatabaseId")(
 );
 
 const ensureD1Database = Effect.fn("ensureD1Database")(
-  function* ensureD1DatabaseEffect(database: string) {
-    const created = yield* runDeployStep([
-      "wrangler",
-      "d1",
-      "create",
-      database,
-      "--json",
-    ]).pipe(
+  function* ensureD1DatabaseEffect(
+    database: string,
+    runStep: DeployStepRunner
+  ) {
+    yield* runStep({ args: ["wrangler", "d1", "create", database] }).pipe(
       Effect.matchEffect({
         onFailure: (error) =>
           error.message.toLowerCase().includes("already exists")
-            ? Console.log(
-                `D1 database ${database} already exists; reusing it.`
-              ).pipe(Effect.flatMap(() => findD1DatabaseId(database)))
+            ? Console.log(`D1 database ${database} already exists; reusing it.`)
             : Effect.fail(error),
-        onSuccess: (result) =>
-          Effect.succeed(parseD1DatabaseId(result.stdout, database)),
+        onSuccess: () => Effect.void,
       })
     );
 
-    return created === null ? yield* findD1DatabaseId(database) : created;
+    return yield* findD1DatabaseId(database, runStep);
   }
 );
 
 const writeDeployWranglerConfig = Effect.fn("writeDeployWranglerConfig")(
   function* writeDeployWranglerConfigEffect(input: {
+    readonly allowedRepositories: string;
     readonly bucket: string;
     readonly database: string;
     readonly databaseId: string;
@@ -1007,14 +1051,26 @@ const writeDeployWranglerConfig = Effect.fn("writeDeployWranglerConfig")(
   }
 );
 
-export const deployProgram = (env: RuntimeEnv) =>
+export const deployProgramWithRunner = (
+  env: RuntimeEnv,
+  runStep: DeployStepRunner
+) =>
   Effect.gen(function* deployProgramEffect() {
     const bucket =
       optionalEnv(env, "STATEFUL_CI_R2_BUCKET") ?? "stateful-ci-objects";
     const database =
       optionalEnv(env, "STATEFUL_CI_D1_DATABASE") ?? "stateful-ci-metadata";
-    const databaseId = yield* ensureD1Database(database);
+    const allowedRepositories = yield* requiredDeployEnv(
+      env,
+      "STATEFUL_CI_ALLOWED_REPOSITORIES"
+    );
+    const transferSecret = yield* requiredDeployEnv(
+      env,
+      "STATEFUL_CI_TRANSFER_SECRET"
+    );
+    const databaseId = yield* ensureD1Database(database, runStep);
     const config = yield* writeDeployWranglerConfig({
+      allowedRepositories,
       bucket,
       database,
       databaseId,
@@ -1034,22 +1090,38 @@ export const deployProgram = (env: RuntimeEnv) =>
     yield* Console.log(
       `Deploying Stateful CI backend with R2 bucket ${bucket} and D1 database ${database}.`
     );
-    yield* ensureR2Bucket(bucket);
-    yield* runDeployStep([
-      "wrangler",
-      "d1",
-      "migrations",
-      "apply",
-      database,
-      "--remote",
-      "--config",
-      config,
-    ]);
-    yield* runDeployStep(["wrangler", "deploy", "--config", config]);
+    yield* ensureR2Bucket(bucket, runStep);
+    yield* runStep({
+      args: [
+        "wrangler",
+        "d1",
+        "migrations",
+        "apply",
+        database,
+        "--remote",
+        "--config",
+        config,
+      ],
+    });
+    yield* runStep({
+      args: [
+        "wrangler",
+        "secret",
+        "put",
+        "STATEFUL_CI_TRANSFER_SECRET",
+        "--config",
+        config,
+      ],
+      stdin: `${transferSecret}\n`,
+    });
+    yield* runStep({ args: ["wrangler", "deploy", "--config", config] });
     yield* Console.log(
       "Stateful CI backend deploy finished. Set STATEFUL_CI_API_URL in GitHub Actions to the deployed Worker URL."
     );
   }).pipe(Effect.catchTag("CliFailure", failCliFailure));
+
+export const deployProgram = (env: RuntimeEnv) =>
+  deployProgramWithRunner(env, runDeployStep);
 
 export const dashboardProgram = () =>
   Console.log(

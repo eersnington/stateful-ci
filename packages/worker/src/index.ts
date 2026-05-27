@@ -78,8 +78,10 @@ export { WorkspaceSnapshotCoordinatorDurableObject } from "./durable-object";
 export const maxProtocolBodyBytes = 64 * 1024;
 
 interface WorkerEnv {
+  readonly ALLOWED_REPOSITORIES?: string;
   readonly DEV_AUTH_ENABLED?: string;
   readonly OIDC_AUDIENCE?: string;
+  readonly STATEFUL_CI_ALLOWED_REPOSITORIES?: string;
   readonly STATEFUL_CI_COORDINATORS?: DurableObjectNamespace;
   readonly STATEFUL_CI_METADATA?: D1Database;
   readonly STATEFUL_CI_OBJECTS?: R2Bucket;
@@ -161,6 +163,17 @@ const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
     ? defaultTrustedRefs
     : configured;
 };
+
+const configuredList = (source: string | undefined) =>
+  source
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0) ?? [];
+
+const allowedRepositoriesForEnv = (env: WorkerEnv | undefined) =>
+  configuredList(
+    env?.ALLOWED_REPOSITORIES ?? env?.STATEFUL_CI_ALLOWED_REPOSITORIES
+  );
 
 const oidcAudienceForEnv = (env: WorkerEnv | undefined) => {
   const configured = (env?.OIDC_AUDIENCE ?? env?.STATEFUL_CI_OIDC_AUDIENCE)
@@ -276,6 +289,43 @@ const transferTokenTtlMillis = 15 * 60 * 1000;
 const bytesToHex = (bytes: Uint8Array) =>
   [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 
+const hexToBytes = (source: string) => {
+  if (source.length % 2 !== 0 || !/^[0-9a-f]+$/iu.test(source)) {
+    return null;
+  }
+
+  const bytes = new Uint8Array(source.length / 2);
+
+  for (let index = 0; index < source.length; index += 2) {
+    bytes[index / 2] = Number.parseInt(source.slice(index, index + 2), 16);
+  }
+
+  return bytes;
+};
+
+const constantTimeEqual = (actual: string, expected: string) => {
+  const actualBytes = hexToBytes(actual);
+  const expectedBytes = hexToBytes(expected);
+
+  if (actualBytes === null || expectedBytes === null) {
+    return false;
+  }
+
+  if (actualBytes.byteLength !== expectedBytes.byteLength) {
+    return false;
+  }
+
+  let difference = 0;
+
+  for (let index = 0; index < expectedBytes.byteLength; index += 1) {
+    difference += Math.abs(
+      (actualBytes[index] ?? 0) - (expectedBytes[index] ?? 0)
+    );
+  }
+
+  return difference === 0;
+};
+
 const transferTokenPayload = (input: {
   readonly digest: string;
   readonly expiresAt: string;
@@ -323,11 +373,25 @@ const signTransferPayload = Effect.fn("signTransferPayload")(
   }
 );
 
+const planWithObjectHeaders = (plan: ObjectTransferPlanEntry) => ({
+  ...plan,
+  headers: {
+    ...plan.headers,
+    "x-stateful-ci-object-digest": plan.object.digest,
+    "x-stateful-ci-object-kind": plan.object.kind,
+    "x-stateful-ci-object-size": String(plan.object.size),
+  },
+});
+
 const transferHeadersForPlan = Effect.fn("transferHeadersForPlan")(
   function* transferHeadersForPlanEffect(
     env: WorkerEnv | undefined,
     plan: ObjectTransferPlanEntry
   ) {
+    if (devAuthEnabled(env)) {
+      return planWithObjectHeaders(plan) satisfies ObjectTransferPlanEntry;
+    }
+
     const secret = transferSecretForEnv(env);
 
     if (secret === null) {
@@ -351,12 +415,9 @@ const transferHeadersForPlan = Effect.fn("transferHeadersForPlan")(
     );
 
     return {
-      ...plan,
+      ...planWithObjectHeaders(plan),
       headers: {
-        ...plan.headers,
-        "x-stateful-ci-object-digest": plan.object.digest,
-        "x-stateful-ci-object-kind": plan.object.kind,
-        "x-stateful-ci-object-size": String(plan.object.size),
+        ...planWithObjectHeaders(plan).headers,
         [transferExpiresAtHeader]: expiresAt,
         [transferTokenHeader]: token,
       },
@@ -462,7 +523,7 @@ const authorizeObjectTransfer = Effect.fn("authorizeObjectTransfer")(
       })
     );
 
-    if (actualToken !== expected) {
+    if (!constantTimeEqual(actualToken, expected)) {
       return yield* new Forbidden({
         message:
           "The object transfer authorization did not match this method, object, digest, size, and expiry. Restore/save object bytes were not served or stored.",
@@ -614,6 +675,22 @@ const verifyRequestIdentity = (
       audience,
       ...(jwks.status === "valid" ? { jwks: jwks.jwks } : {}),
     });
+    const allowedRepositories = allowedRepositoriesForEnv(env);
+
+    if (allowedRepositories.length === 0) {
+      return yield* new GitHubOidcVerificationError({
+        message:
+          "The Worker does not have ALLOWED_REPOSITORIES configured, so restore/save control-plane requests are disabled. Configure a comma-separated repository allowlist such as owner/repo before using Stateful CI.",
+        reason: "unknown_context_denied",
+      });
+    }
+
+    if (!allowedRepositories.includes(identity.repository)) {
+      return yield* new GitHubOidcVerificationError({
+        message: `GitHub repository ${identity.repository} is not allowed to use this Stateful CI backend. Add it to ALLOWED_REPOSITORIES or use the correct backend URL.`,
+        reason: "unknown_context_denied",
+      });
+    }
 
     return { identity } as const;
   });
