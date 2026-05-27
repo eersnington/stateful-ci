@@ -1,0 +1,17 @@
+name: Stateful CI
+description: "Restore or save Stateful CI workspace snapshots using GitHub OIDC. Workflows must grant id-token: write and contents: read."
+inputs:
+  command:
+    description: "Command to run: restore, save, init, deploy, or dashboard."
+    required: false
+    default: restore
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+    - name: Install Stateful CI action dependencies
+      shell: bash
+      run: bun install --cwd "$GITHUB_ACTION_PATH" --frozen-lockfile
+    - name: Run Stateful CI
+      shell: bash
+      run: bun "$GITHUB_ACTION_PATH/packages/stateful-ci/src/cli.ts" "${{ inputs.command }}"

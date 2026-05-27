@@ -131,7 +131,7 @@ const withProtocolServer = <A, E, R>(
             handlerResponse.status,
             Object.fromEntries(handlerResponse.headers.entries())
           );
-          response.end(await handlerResponse.text());
+          response.end(Buffer.from(await handlerResponse.arrayBuffer()));
         } catch (error) {
           response.writeHead(500, { "content-type": "text/plain" });
           response.end(String(error));
@@ -248,7 +248,6 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             (url) =>
               restoreProgram({
                 ...githubEnv,
-                STATEFUL_CI_API_TOKEN: "test-token",
                 STATEFUL_CI_API_URL: url,
               })
           );
@@ -266,10 +265,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           assert.strictEqual(requests.length, 1);
           assert.strictEqual(protocolRequest.method, "POST");
           assert.strictEqual(protocolRequest.url, "/v1/restore");
-          assert.strictEqual(
-            protocolRequest.authorization,
-            "Bearer test-token"
-          );
+          assert.strictEqual(protocolRequest.authorization, undefined);
           assert.deepStrictEqual(request.git, {
             baseRef: null,
             headRef: null,
@@ -1123,6 +1119,166 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           assert.strictEqual(requests[0]?.url, "/v1/save/prepare");
         })
       )
+    );
+
+    it.effect("saves to and restores from a remote test backend", () =>
+      withWorkspace(setupSaveWorkspace, ({ fs, path, root }) =>
+        Effect.gen(function* saveThenRestoreRemoteSnapshotEffect() {
+          const storedObjects = new Map<string, Uint8Array>();
+          let committedRequest: CommitSaveRequest | null = null;
+
+          yield* withProtocolServer(
+            (request) => {
+              if (request.url === "/v1/save/prepare") {
+                const prepareRequest = Schema.decodeUnknownSync(
+                  PrepareSaveRequest
+                )(request.body);
+
+                return Response.json(
+                  Schema.encodeUnknownSync(PrepareSaveResponse)({
+                    baseSnapshotId: null,
+                    commitTarget: {
+                      namespace:
+                        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                      refName: "trusted/main/latest",
+                    },
+                    decision: "allowed",
+                    expectedHeadGeneration: 0,
+                    missingObjects: prepareRequest.objects.map((object) => ({
+                      headers: {
+                        "x-stateful-ci-object-digest": object.digest,
+                        "x-stateful-ci-object-kind": object.kind,
+                        "x-stateful-ci-object-size": String(object.size),
+                        "x-stateful-ci-transfer-token": "test-transfer-token",
+                      },
+                      method: "PUT" as const,
+                      object,
+                      route: `/v1/objects/${object.key}`,
+                      transport: "worker-route" as const,
+                    })),
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.method === "PUT") {
+                const key = request.url?.slice("/v1/objects/".length);
+
+                if (key !== undefined) {
+                  storedObjects.set(key, request.bodyBytes);
+                }
+
+                return new Response(null, { status: 204 });
+              }
+
+              if (request.url === "/v1/save/commit") {
+                committedRequest = Schema.decodeUnknownSync(CommitSaveRequest)(
+                  request.body
+                );
+
+                return Response.json(
+                  Schema.encodeUnknownSync(CommitSaveResponse)({
+                    decision: "committed",
+                    headGeneration: 1,
+                    snapshotId: committedRequest.manifest.snapshotId,
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.url === "/v1/restore") {
+                if (committedRequest === null) {
+                  return Response.json(
+                    Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                      decision: "denied",
+                      reason: "no_compatible_snapshot",
+                      save: { allowed: false },
+                      trustClass: "trusted",
+                    })
+                  );
+                }
+
+                return Response.json(
+                  Schema.encodeUnknownSync(RestoreAllowedResponse)({
+                    decision: "allowed",
+                    downloadPlan: committedRequest.objects.map((object) => ({
+                      headers: {
+                        "x-stateful-ci-object-digest": object.digest,
+                        "x-stateful-ci-object-kind": object.kind,
+                        "x-stateful-ci-object-size": String(object.size),
+                        "x-stateful-ci-transfer-token": "test-transfer-token",
+                      },
+                      method: "GET" as const,
+                      object,
+                      route: `/v1/objects/${object.key}`,
+                      transport: "worker-route" as const,
+                    })),
+                    manifest: committedRequest.manifest,
+                    save: { allowed: true, target: "trusted/main/latest" },
+                    snapshot: {
+                      id: committedRequest.manifest.snapshotId,
+                      manifestKey: committedRequest.manifest.key,
+                      parent: null,
+                    },
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.method === "GET") {
+                const key = request.url?.slice("/v1/objects/".length);
+                const bytes =
+                  key === undefined ? undefined : storedObjects.get(key);
+
+                return bytes === undefined
+                  ? new Response(null, { status: 404 })
+                  : new Response(bytes);
+              }
+
+              return new Response(null, { status: 404 });
+            },
+            (url) =>
+              Effect.gen(function* runRemoteRoundTripEffect() {
+                const env = {
+                  ...githubEnv,
+                  STATEFUL_CI_API_URL: url,
+                };
+
+                yield* saveProgram(env);
+                yield* fs.writeFileString(
+                  path.join(root, ".turbo/cache/result.txt"),
+                  "stale output"
+                );
+                yield* fs.writeFileString(
+                  path.join(root, ".turbo/cache/stale.txt"),
+                  "stale"
+                );
+
+                yield* restoreProgram(env);
+
+                const restored = yield* fs.readFileString(
+                  path.join(root, ".turbo/cache/result.txt")
+                );
+                const stale = yield* Effect.flip(
+                  fs.readFileString(path.join(root, ".turbo/cache/stale.txt"))
+                );
+
+                assert.strictEqual(restored, "cached output");
+                assert.strictEqual(stale._tag, "PlatformError");
+              })
+          );
+        })
+      )
+    );
+  });
+
+  describe("dashboard", () => {
+    it.effect("is registered as a CLI command", () =>
+      Effect.gen(function* dashboardIsRegisteredEffect() {
+        yield* runCli(["dashboard"]);
+      })
     );
   });
 });

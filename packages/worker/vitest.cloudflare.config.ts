@@ -17,7 +17,7 @@ export default defineConfig(async () => {
         miniflare: {
           bindings: { TEST_MIGRATIONS: migrations },
         },
-        wrangler: { configPath: "./wrangler.toml" },
+        wrangler: { configPath: "./wrangler.testing.toml" },
       }),
     ],
     test: {

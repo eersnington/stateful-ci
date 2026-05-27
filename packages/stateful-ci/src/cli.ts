@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import type {
@@ -62,7 +64,7 @@ interface LoadedConfig {
 }
 
 interface ApiConfig {
-  readonly token: string;
+  readonly token: string | null;
   readonly url: string;
 }
 
@@ -71,7 +73,13 @@ interface PreparedLocalSave {
 }
 
 const restoreSessionFile = ".stateful-ci/restore-session.json";
+const deployWranglerConfigFile = ".stateful-ci/deploy/wrangler.toml";
 const defaultOidcAudience = "stateful-ci";
+
+const execFilePromise = promisify(execFile);
+const repositoryRootDirectory = fileURLToPath(
+  new URL("../../..", import.meta.url)
+);
 
 const RestoreSession = Schema.Struct({
   baseSnapshotId: Schema.NullOr(SnapshotId),
@@ -119,6 +127,98 @@ const failCliFailure = (error: CliFailure) =>
 
 const sha256 = (source: string) =>
   `sha256:${createHash("sha256").update(source).digest("hex")}`;
+
+const tomlString = (value: string) => JSON.stringify(value);
+
+const textFromUnknown = (value: unknown) => {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  return value instanceof Uint8Array ? String(value) : "";
+};
+
+const property = (value: unknown, key: string) =>
+  typeof value === "object" && value !== null
+    ? Reflect.get(value, key)
+    : undefined;
+
+const stringProperty = (value: unknown, key: string) => {
+  const result = property(value, key);
+
+  return typeof result === "string" && result.length > 0 ? result : null;
+};
+
+const commandOutputForError = (error: unknown) => {
+  const stdout = textFromUnknown(property(error, "stdout"));
+  const stderr = textFromUnknown(property(error, "stderr"));
+  const output = [stdout, stderr]
+    .map((text) => text.trim())
+    .filter((text) => text.length > 0)
+    .join("\n");
+
+  return output.length === 0 ? "" : `\nWrangler output:\n${output}`;
+};
+
+const jsonArray = (value: unknown) => (Array.isArray(value) ? value : null);
+
+const d1DatabaseEntriesFromJson = (source: string) => {
+  const decoded = Schema.decodeUnknownExit(Schema.UnknownFromJsonString)(
+    source
+  );
+
+  if (Exit.isFailure(decoded)) {
+    return [];
+  }
+
+  const parsed = decoded.value;
+  const result = property(parsed, "result");
+
+  if (jsonArray(result) !== null) {
+    return jsonArray(result) ?? [];
+  }
+
+  if (result !== undefined) {
+    return [result];
+  }
+
+  return jsonArray(parsed) ?? [parsed];
+};
+
+const d1DatabaseIdFromEntry = (entry: unknown) =>
+  stringProperty(entry, "uuid") ??
+  stringProperty(entry, "database_id") ??
+  stringProperty(entry, "id");
+
+const parseD1DatabaseId = (source: string, databaseName: string) => {
+  const entries = d1DatabaseEntriesFromJson(source);
+  const matching = entries.find(
+    (entry) => stringProperty(entry, "name") === databaseName
+  );
+
+  return matching === undefined ? null : d1DatabaseIdFromEntry(matching);
+};
+
+const deployConfigText = (input: {
+  readonly bucket: string;
+  readonly database: string;
+  readonly databaseId: string;
+  readonly devAuthEnabled: string | null;
+  readonly oidcAudience: string;
+  readonly trustedRefs: string | null;
+}) => {
+  const vars = [
+    `OIDC_AUDIENCE = ${tomlString(input.oidcAudience)}`,
+    ...(input.trustedRefs === null
+      ? []
+      : [`TRUSTED_REFS = ${tomlString(input.trustedRefs)}`]),
+    ...(input.devAuthEnabled === null
+      ? []
+      : [`DEV_AUTH_ENABLED = ${tomlString(input.devAuthEnabled)}`]),
+  ].join("\n");
+
+  return `name = "stateful-ci-worker"\nmain = "../../packages/worker/src/index.ts"\ncompatibility_date = "2026-05-22"\n\n[vars]\n${vars}\n\n[[d1_databases]]\nbinding = "STATEFUL_CI_METADATA"\ndatabase_name = ${tomlString(input.database)}\ndatabase_id = ${tomlString(input.databaseId)}\nmigrations_dir = "../../packages/worker/migrations"\n\n[[r2_buckets]]\nbinding = "STATEFUL_CI_OBJECTS"\nbucket_name = ${tomlString(input.bucket)}\n\n[[durable_objects.bindings]]\nname = "STATEFUL_CI_COORDINATORS"\nclass_name = "WorkspaceSnapshotCoordinatorDurableObject"\n\n[[migrations]]\ntag = "v1"\nnew_sqlite_classes = ["WorkspaceSnapshotCoordinatorDurableObject"]\n`;
+};
 
 const optionalEnv = (env: RuntimeEnv, key: string) => {
   const value = env[key];
@@ -169,7 +269,7 @@ const loadConfig = (directory: string) =>
 const apiConfigFromEnv = (env: RuntimeEnv) =>
   Effect.gen(function* apiConfigFromEnvEffect() {
     return {
-      token: yield* requiredEnv(env, "STATEFUL_CI_API_TOKEN"),
+      token: optionalEnv(env, "STATEFUL_CI_API_TOKEN"),
       url: yield* requiredEnv(env, "STATEFUL_CI_API_URL"),
     } satisfies ApiConfig;
   });
@@ -378,6 +478,12 @@ const readRestoreSession = (directory: string) =>
 
 const postProtocol = (api: ApiConfig, route: string, body: string) =>
   Effect.gen(function* postProtocolEffect() {
+    const headers = new Headers({ "content-type": "application/json" });
+
+    if (api.token !== null) {
+      headers.set("authorization", `Bearer ${api.token}`);
+    }
+
     const response = yield* Effect.tryPromise({
       catch: () =>
         cliFailure(
@@ -386,10 +492,7 @@ const postProtocol = (api: ApiConfig, route: string, body: string) =>
       try: () =>
         fetch(protocolUrl(api, route), {
           body,
-          headers: {
-            authorization: `Bearer ${api.token}`,
-            "content-type": "application/json",
-          },
+          headers,
           method: "POST",
         }),
     });
@@ -429,7 +532,7 @@ const downloadPlannedObject = Effect.fn("downloadPlannedObject")(
         : plan.url;
     const headers = new Headers(plan.headers ?? {});
 
-    if (plan.transport === "worker-route") {
+    if (plan.transport === "worker-route" && api.token !== null) {
       headers.set("authorization", `Bearer ${api.token}`);
     }
 
@@ -499,7 +602,7 @@ const uploadPlannedObject = Effect.fn("uploadPlannedObject")(
         : plan.url;
     const headers = new Headers(plan.headers ?? {});
 
-    if (plan.transport === "worker-route") {
+    if (plan.transport === "worker-route" && api.token !== null) {
       headers.set("authorization", `Bearer ${api.token}`);
     }
 
@@ -792,9 +895,190 @@ export const saveCommand = Command.make("save", {}, () =>
   )
 );
 
+const runDeployStep = Effect.fn("runDeployStep")(function* runDeployStepEffect(
+  args: readonly string[]
+) {
+  return yield* Effect.tryPromise({
+    catch: (error) =>
+      cliFailure(
+        `Deploy step failed while running bunx ${args.join(" ")}. Stateful CI backend resources may be partially provisioned; fix the reported Cloudflare/Wrangler issue and rerun stateful-ci deploy.${commandOutputForError(error)}`
+      ),
+    try: async () => {
+      const result = await execFilePromise("bunx", [...args], {
+        cwd: repositoryRootDirectory,
+      });
+
+      return {
+        stderr: textFromUnknown(result.stderr),
+        stdout: textFromUnknown(result.stdout),
+      };
+    },
+  });
+});
+
+const ensureR2Bucket = Effect.fn("ensureR2Bucket")(
+  function* ensureR2BucketEffect(bucket: string) {
+    yield* runDeployStep(["wrangler", "r2", "bucket", "create", bucket]).pipe(
+      Effect.catchTag("CliFailure", (error) =>
+        error.message.toLowerCase().includes("already exists")
+          ? Console.log(`R2 bucket ${bucket} already exists; reusing it.`)
+          : Effect.fail(error)
+      )
+    );
+  }
+);
+
+const findD1DatabaseId = Effect.fn("findD1DatabaseId")(
+  function* findD1DatabaseIdEffect(database: string) {
+    const list = yield* runDeployStep(["wrangler", "d1", "list", "--json"]);
+    const databaseId = parseD1DatabaseId(list.stdout, database);
+
+    return databaseId === null
+      ? yield* Effect.fail(
+          cliFailure(
+            `Cloudflare D1 database ${database} already exists or was created, but Wrangler did not return its database id. Run bunx wrangler d1 list --json and retry stateful-ci deploy after confirming the database exists.`
+          )
+        )
+      : databaseId;
+  }
+);
+
+const ensureD1Database = Effect.fn("ensureD1Database")(
+  function* ensureD1DatabaseEffect(database: string) {
+    const created = yield* runDeployStep([
+      "wrangler",
+      "d1",
+      "create",
+      database,
+      "--json",
+    ]).pipe(
+      Effect.matchEffect({
+        onFailure: (error) =>
+          error.message.toLowerCase().includes("already exists")
+            ? Console.log(
+                `D1 database ${database} already exists; reusing it.`
+              ).pipe(Effect.flatMap(() => findD1DatabaseId(database)))
+            : Effect.fail(error),
+        onSuccess: (result) =>
+          Effect.succeed(parseD1DatabaseId(result.stdout, database)),
+      })
+    );
+
+    return created === null ? yield* findD1DatabaseId(database) : created;
+  }
+);
+
+const writeDeployWranglerConfig = Effect.fn("writeDeployWranglerConfig")(
+  function* writeDeployWranglerConfigEffect(input: {
+    readonly bucket: string;
+    readonly database: string;
+    readonly databaseId: string;
+    readonly devAuthEnabled: string | null;
+    readonly oidcAudience: string;
+    readonly trustedRefs: string | null;
+  }) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const configPath = path.join(
+      repositoryRootDirectory,
+      deployWranglerConfigFile
+    );
+
+    yield* fs
+      .makeDirectory(path.dirname(configPath), { recursive: true })
+      .pipe(
+        Effect.mapError(() =>
+          cliFailure(
+            `Could not create ${path.dirname(configPath)} for generated Wrangler deploy config. Check filesystem permissions and retry stateful-ci deploy.`
+          )
+        )
+      );
+    yield* fs
+      .writeFileString(configPath, deployConfigText(input))
+      .pipe(
+        Effect.mapError(() =>
+          cliFailure(
+            `Could not write generated Wrangler deploy config at ${configPath}. Check filesystem permissions and retry stateful-ci deploy.`
+          )
+        )
+      );
+
+    return configPath;
+  }
+);
+
+export const deployProgram = (env: RuntimeEnv) =>
+  Effect.gen(function* deployProgramEffect() {
+    const bucket =
+      optionalEnv(env, "STATEFUL_CI_R2_BUCKET") ?? "stateful-ci-objects";
+    const database =
+      optionalEnv(env, "STATEFUL_CI_D1_DATABASE") ?? "stateful-ci-metadata";
+    const databaseId = yield* ensureD1Database(database);
+    const config = yield* writeDeployWranglerConfig({
+      bucket,
+      database,
+      databaseId,
+      devAuthEnabled:
+        optionalEnv(env, "DEV_AUTH_ENABLED") ??
+        optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED") ??
+        optionalEnv(env, "STATEFUL_CI_DEV_AUTH"),
+      oidcAudience:
+        optionalEnv(env, "OIDC_AUDIENCE") ??
+        optionalEnv(env, "STATEFUL_CI_OIDC_AUDIENCE") ??
+        defaultOidcAudience,
+      trustedRefs:
+        optionalEnv(env, "TRUSTED_REFS") ??
+        optionalEnv(env, "STATEFUL_CI_TRUSTED_REFS"),
+    });
+
+    yield* Console.log(
+      `Deploying Stateful CI backend with R2 bucket ${bucket} and D1 database ${database}.`
+    );
+    yield* ensureR2Bucket(bucket);
+    yield* runDeployStep([
+      "wrangler",
+      "d1",
+      "migrations",
+      "apply",
+      database,
+      "--remote",
+      "--config",
+      config,
+    ]);
+    yield* runDeployStep(["wrangler", "deploy", "--config", config]);
+    yield* Console.log(
+      "Stateful CI backend deploy finished. Set STATEFUL_CI_API_URL in GitHub Actions to the deployed Worker URL."
+    );
+  }).pipe(Effect.catchTag("CliFailure", failCliFailure));
+
+export const dashboardProgram = () =>
+  Console.log(
+    "Stateful CI dashboard UI is not implemented yet. Restore/save audit metadata is recorded in backend D1 for the future dashboard."
+  );
+
+export const deployCommand = Command.make("deploy", {}, () =>
+  deployProgram(process.env)
+).pipe(
+  Command.withDescription(
+    "Provision and deploy the user-owned Cloudflare backend"
+  )
+);
+
+export const dashboardCommand = Command.make(
+  "dashboard",
+  {},
+  dashboardProgram
+).pipe(Command.withDescription("Open the Stateful CI dashboard"));
+
 export const command = Command.make("stateful-ci").pipe(
   Command.withDescription("Persistent, trust-aware CI workspace snapshots"),
-  Command.withSubcommands([initCommand, restoreCommand, saveCommand])
+  Command.withSubcommands([
+    initCommand,
+    deployCommand,
+    restoreCommand,
+    saveCommand,
+    dashboardCommand,
+  ])
 );
 
 export const runCli = Command.runWith(command, {
