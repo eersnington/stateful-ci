@@ -102,6 +102,11 @@ const testWorkspaceTarget = {
   workspaceId,
 } as const;
 
+const internalRefName = "internal/feature/latest";
+const internalWorkspaceId = Schema.decodeSync(WorkspaceId)(
+  `ws:${namespace}:${internalRefName}`
+);
+
 describe("snapshot coordinator", () => {
   it.effect("commits once and replays identical idempotency keys", () =>
     Effect.gen(function* coordinatorReplaysIdempotencyEffect() {
@@ -123,6 +128,46 @@ describe("snapshot coordinator", () => {
         snapshotId: commitInput.manifest.snapshotId,
         workspaceId,
       });
+    })
+  );
+
+  it.effect("advances internal heads only inside their isolated target", () =>
+    Effect.gen(function* coordinatorAdvancesInternalHeadEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            ...testWorkspaceTarget,
+            refName: internalRefName,
+            trustClass: "internal",
+            workspaceId: internalWorkspaceId,
+          },
+        ],
+      });
+      const coordinator = createMetadataSnapshotCoordinator();
+      const result = yield* coordinator
+        .commitSave({
+          ...commitInput,
+          idempotencyKey: Schema.decodeSync(IdempotencyKey)(
+            "run-123456789-save-internal"
+          ),
+          producer: {
+            ...commitInput.producer,
+            ref: "refs/heads/feature",
+          },
+          target: { namespace, refName: internalRefName },
+          workspaceId: internalWorkspaceId,
+        })
+        .pipe(Effect.provideService(MetadataBackend, metadata));
+      const trustedRef = yield* metadata.getRef(namespace, refName);
+      const internalRef = yield* metadata.getRef(namespace, internalRefName);
+
+      assert.strictEqual(result.decision, "committed");
+      assert.isNull(trustedRef);
+      assert.strictEqual(
+        internalRef?.snapshotId,
+        commitInput.manifest.snapshotId
+      );
+      assert.strictEqual(internalRef?.trustClass, "internal");
     })
   );
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   chmod,
   lstat,
@@ -10,6 +11,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -21,6 +23,7 @@ import {
   SnapshotManifest,
   StatefulCiConfig,
 } from "@stateful-ci/core";
+import type { SnapshotFileEntry } from "@stateful-ci/core";
 import { Effect, Exit, Schema } from "effect";
 
 import {
@@ -59,6 +62,28 @@ const createSnapshotEffect = (workspaceRoot: string) =>
 
 const objectPath = (workspaceRoot: string, key: string) =>
   path.join(workspaceRoot, ".stateful-ci/store", key);
+
+const withUnixSocket = <A, E, R>(
+  socketPath: string,
+  run: Effect.Effect<A, E, R>
+) =>
+  Effect.acquireUseRelease(
+    Effect.promise(async () => {
+      const server = createServer();
+
+      server.listen(socketPath);
+      await once(server, "listening");
+      return server;
+    }),
+    () => run,
+    (server) =>
+      Effect.promise(async () => {
+        const closed = once(server, "close");
+
+        server.close();
+        await closed;
+      }).pipe(Effect.ignore)
+  );
 
 const writeManifestObject = async (
   workspaceRoot: string,
@@ -128,6 +153,22 @@ describe("local snapshot engine", () => {
         assert.isTrue(
           snapshot.objects.some((object) => object.kind === "chunk")
         );
+        assert.isTrue(
+          snapshot.manifest.entries.some((entry) => entry.type === "directory")
+        );
+        assert.isTrue(
+          snapshot.manifest.entries.some(
+            (entry) => entry.type === "file" && entry.content.kind === "pack"
+          )
+        );
+        assert.isTrue(
+          snapshot.manifest.entries.some(
+            (entry) => entry.type === "file" && entry.content.kind === "chunks"
+          )
+        );
+        assert.isTrue(
+          snapshot.manifest.entries.some((entry) => entry.type === "symlink")
+        );
         assert.deepStrictEqual(snapshot.saveManifest.safety, {
           skippedByBuiltInDenylist: 1,
           skippedByUserExclude: 1,
@@ -141,6 +182,145 @@ describe("local snapshot engine", () => {
           assert.strictEqual(bytes.byteLength, size);
         }
       })
+  );
+
+  it.effect(
+    "unsupported filesystem entries are skipped with safety counts",
+    () =>
+      withUnixSocket(
+        path.join(tempDir, ".turbo/cache/socket.sock"),
+        Effect.gen(function* unsupportedEntriesAreSkippedEffect() {
+          const snapshot = yield* createSnapshotEffect(tempDir);
+
+          assert.strictEqual(
+            snapshot.manifest.safety.skippedUnsupportedType,
+            1
+          );
+          assert.isFalse(
+            snapshot.manifest.entries.some(
+              (entry) => entry.path === ".turbo/cache/socket.sock"
+            )
+          );
+        })
+      )
+  );
+
+  it.effect(
+    "dedupes repeated small files and reuses unchanged packs across snapshots",
+    () =>
+      Effect.gen(function* smallFileDedupesAcrossSnapshotsEffect() {
+        yield* Effect.promise(() =>
+          writeFile(
+            path.join(tempDir, ".turbo/cache/copy.txt"),
+            "cached output"
+          )
+        );
+
+        const first = yield* createSnapshotEffect(tempDir);
+        const second = yield* createSnapshotEffect(tempDir);
+        const repeated = first.manifest.entries.filter(
+          (entry): entry is SnapshotFileEntry =>
+            entry.type === "file" &&
+            (entry.path === ".turbo/cache/result.txt" ||
+              entry.path === ".turbo/cache/copy.txt")
+        );
+        const [firstRepeat, secondRepeat] = repeated;
+
+        assert.strictEqual(repeated.length, 2);
+        if (firstRepeat === undefined || secondRepeat === undefined) {
+          return yield* Effect.die("test setup expected two duplicate files");
+        }
+        if (
+          firstRepeat.content.kind !== "pack" ||
+          secondRepeat.content.kind !== "pack"
+        ) {
+          return yield* Effect.die("test setup expected packed duplicates");
+        }
+        assert.strictEqual(firstRepeat.sha256, secondRepeat.sha256);
+        assert.strictEqual(
+          firstRepeat.content.packKey,
+          secondRepeat.content.packKey
+        );
+        assert.deepStrictEqual(
+          second.manifest.objects
+            .filter((object) => object.kind === "pack")
+            .map((object) => object.key)
+            .toSorted(),
+          first.manifest.objects
+            .filter((object) => object.kind === "pack")
+            .map((object) => object.key)
+            .toSorted()
+        );
+      })
+  );
+
+  it.effect("one changed small file does not rewrite every pack", () =>
+    Effect.gen(function* changedSmallFileDoesNotRewriteEveryPackEffect() {
+      yield* Effect.promise(() =>
+        mkdir(path.join(tempDir, ".turbo/many"), { recursive: true })
+      );
+      for (let index = 0; index < 80; index += 1) {
+        const filePath = path.join(tempDir, `.turbo/many/file-${index}.txt`);
+        const contents = `small payload ${index}`;
+
+        yield* Effect.promise(() => writeFile(filePath, contents));
+      }
+
+      const first = yield* createSnapshotEffect(tempDir);
+
+      yield* Effect.promise(() =>
+        writeFile(path.join(tempDir, ".turbo/many/file-7.txt"), "changed")
+      );
+
+      const second = yield* createSnapshotEffect(tempDir);
+      const firstPacks = new Set(
+        first.manifest.objects
+          .filter((object) => object.kind === "pack")
+          .map((object) => object.key)
+      );
+      const secondPacks = new Set(
+        second.manifest.objects
+          .filter((object) => object.kind === "pack")
+          .map((object) => object.key)
+      );
+      const reused = [...firstPacks].filter((key) => secondPacks.has(key));
+
+      assert.isTrue(firstPacks.size > 1);
+      assert.isTrue(reused.length > 0);
+      assert.notStrictEqual(
+        JSON.stringify([...secondPacks].toSorted()),
+        JSON.stringify([...firstPacks].toSorted())
+      );
+    })
+  );
+
+  it.effect("large-file chunks are reused when only one chunk changes", () =>
+    Effect.gen(function* largeFileChunksAreReusedEffect() {
+      const first = yield* createSnapshotEffect(tempDir);
+      const updated = Buffer.alloc(largeChunkSizeBytes + 7, 7);
+
+      updated[0] = 8;
+      yield* Effect.promise(() =>
+        writeFile(path.join(tempDir, "target/large.bin"), updated)
+      );
+
+      const second = yield* createSnapshotEffect(tempDir);
+      const firstChunks = new Set(
+        first.manifest.objects
+          .filter((object) => object.kind === "chunk")
+          .map((object) => object.key)
+      );
+      const secondChunks = new Set(
+        second.manifest.objects
+          .filter((object) => object.kind === "chunk")
+          .map((object) => object.key)
+      );
+      const reused = [...firstChunks].filter((key) => secondChunks.has(key));
+
+      assert.strictEqual(firstChunks.size, 2);
+      assert.strictEqual(secondChunks.size, 2);
+      assert.strictEqual(reused.length, 1);
+    })
   );
 
   it.effect(
@@ -251,6 +431,66 @@ describe("local snapshot engine", () => {
       })
   );
 
+  it.effect("corrupted manifest objects reject before mutating roots", () =>
+    Effect.gen(function* corruptedManifestRejectsBeforeMutationEffect() {
+      const snapshot = yield* createSnapshotEffect(tempDir);
+
+      yield* Effect.promise(() =>
+        writeFile(
+          objectPath(tempDir, snapshot.manifestDescriptor.key),
+          "corrupt"
+        )
+      );
+      yield* Effect.promise(() =>
+        writeFile(path.join(tempDir, ".turbo/cache/current.txt"), "still here")
+      );
+
+      const error = yield* Effect.flip(
+        restoreWorkspaceSnapshot({
+          manifest: snapshot.manifestDescriptor,
+          workspaceRoot: tempDir,
+        })
+      );
+      const current = yield* Effect.promise(() =>
+        readFile(path.join(tempDir, ".turbo/cache/current.txt"), "utf-8")
+      );
+
+      assert.strictEqual(error.reason, "corrupt_object");
+      assert.strictEqual(current, "still here");
+    })
+  );
+
+  it.effect("corrupted chunk objects reject before mutating roots", () =>
+    Effect.gen(function* corruptedChunkRejectsBeforeMutationEffect() {
+      const snapshot = yield* createSnapshotEffect(tempDir);
+      const chunk = snapshot.objects.find((object) => object.kind === "chunk");
+
+      if (chunk === undefined) {
+        return yield* Effect.die("test setup expected a chunk object");
+      }
+
+      yield* Effect.promise(() =>
+        writeFile(objectPath(tempDir, chunk.key), Buffer.alloc(chunk.size, 9))
+      );
+      yield* Effect.promise(() =>
+        writeFile(path.join(tempDir, ".turbo/cache/current.txt"), "still here")
+      );
+
+      const error = yield* Effect.flip(
+        restoreWorkspaceSnapshot({
+          manifest: snapshot.manifestDescriptor,
+          workspaceRoot: tempDir,
+        })
+      );
+      const current = yield* Effect.promise(() =>
+        readFile(path.join(tempDir, ".turbo/cache/current.txt"), "utf-8")
+      );
+
+      assert.strictEqual(error.reason, "corrupt_object");
+      assert.strictEqual(current, "still here");
+    })
+  );
+
   it.effect("restore rejects entries below symlink paths", () =>
     Effect.gen(function* restoreRejectsEntriesBelowSymlinksEffect() {
       const snapshot = yield* createSnapshotEffect(tempDir);
@@ -283,6 +523,63 @@ describe("local snapshot engine", () => {
       };
       const manifest =
         Schema.decodeUnknownSync(SnapshotManifest)(unsafeManifest);
+      const descriptor = yield* Effect.promise(() =>
+        writeManifestObject(tempDir, manifest)
+      );
+      const error = yield* Effect.flip(
+        restoreWorkspaceSnapshot({
+          manifest: descriptor,
+          workspaceRoot: tempDir,
+        })
+      );
+
+      assert.strictEqual(error.reason, "invalid_symlink");
+    })
+  );
+
+  it.effect("restore rejects duplicate normalized manifest paths", () =>
+    Effect.gen(function* restoreRejectsDuplicatePathsEffect() {
+      const snapshot = yield* createSnapshotEffect(tempDir);
+      const duplicate = snapshot.manifest.entries.find(
+        (entry) => entry.type === "file"
+      );
+
+      if (duplicate === undefined) {
+        return yield* Effect.die("test setup expected a file entry");
+      }
+
+      const manifest = Schema.decodeUnknownSync(SnapshotManifest)({
+        ...snapshot.manifest,
+        entries: [...snapshot.manifest.entries, duplicate],
+      });
+      const descriptor = yield* Effect.promise(() =>
+        writeManifestObject(tempDir, manifest)
+      );
+      const error = yield* Effect.flip(
+        restoreWorkspaceSnapshot({
+          manifest: descriptor,
+          workspaceRoot: tempDir,
+        })
+      );
+
+      assert.strictEqual(error.reason, "duplicate_path");
+    })
+  );
+
+  it.effect("restore rejects symlink targets that escape managed roots", () =>
+    Effect.gen(function* restoreRejectsEscapingSymlinkTargetEffect() {
+      const snapshot = yield* createSnapshotEffect(tempDir);
+      const manifest = Schema.decodeUnknownSync(SnapshotManifest)({
+        ...snapshot.manifest,
+        entries: [
+          ...snapshot.manifest.entries,
+          {
+            path: ".turbo/out-link",
+            target: "../outside",
+            type: "symlink",
+          },
+        ],
+      });
       const descriptor = yield* Effect.promise(() =>
         writeManifestObject(tempDir, manifest)
       );

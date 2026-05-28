@@ -1,6 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
-import { sha256DigestFromHex } from "@stateful-ci/core";
-import { Effect } from "effect";
+import {
+  PackIndex,
+  packHeaderLength,
+  sha256DigestFromHex,
+} from "@stateful-ci/core";
+import { Effect, Schema } from "effect";
 
 import {
   decodePack,
@@ -15,6 +19,44 @@ const digestWithPrefix = (prefix: string, suffix: number) =>
   sha256DigestFromHex(
     `${prefix}${suffix.toString(16).padStart(64 - prefix.length, "0")}`
   );
+
+const replacePackIndex = (
+  bytes: Uint8Array,
+  update: (index: PackIndex) => PackIndex
+) => {
+  const headerView = new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength
+  );
+  const indexLength = headerView.getUint32(12);
+  const indexSource = Buffer.from(
+    bytes.slice(packHeaderLength, packHeaderLength + indexLength)
+  ).toString("utf-8");
+  const updatedIndex = update(
+    Schema.decodeUnknownSync(PackIndex)(JSON.parse(indexSource))
+  );
+  const updatedIndexBytes = Buffer.from(JSON.stringify(updatedIndex), "utf-8");
+  const updated = new Uint8Array(
+    packHeaderLength +
+      updatedIndexBytes.byteLength +
+      bytes.byteLength -
+      packHeaderLength -
+      indexLength
+  );
+  const updatedHeader = new Uint8Array(bytes.slice(0, packHeaderLength));
+  const updatedHeaderView = new DataView(updatedHeader.buffer);
+
+  updatedHeaderView.setUint32(12, updatedIndexBytes.byteLength);
+  updated.set(updatedHeader, 0);
+  updated.set(updatedIndexBytes, packHeaderLength);
+  updated.set(
+    bytes.slice(packHeaderLength + indexLength),
+    packHeaderLength + updatedIndexBytes.byteLength
+  );
+
+  return updated;
+};
 
 describe("SCIPACK container", () => {
   it.effect(
@@ -38,6 +80,22 @@ describe("SCIPACK container", () => {
         assert.deepStrictEqual(
           decoded.entries.map((entry) => entry.entryDigest),
           encoded.index.entries.map((entry) => entry.entryDigest)
+        );
+        assert.deepStrictEqual(
+          decoded.entries.map((entry) => ({
+            bytes: Buffer.from(entry.bytes).toString("utf-8"),
+            compression: entry.compression,
+          })),
+          [
+            { bytes: "hello", compression: "gzip" },
+            { bytes: "goodbye", compression: "gzip" },
+          ]
+        );
+        assert.isTrue(
+          encoded.index.entries.every(
+            (entry) =>
+              entry.compressedLength > 0 && entry.compression === "gzip"
+          )
         );
       })
   );
@@ -114,6 +172,38 @@ describe("SCIPACK container", () => {
     })
   );
 
+  it.effect("rejects invalid index ordering and ranges", () =>
+    Effect.gen(function* rejectInvalidPackIndexesEffect() {
+      const first = textBytes("first");
+      const second = textBytes("second");
+      const encoded = yield* encodePack([
+        { bytes: first, digest: sha256Bytes(first) },
+        { bytes: second, digest: sha256Bytes(second) },
+      ]);
+      const unsorted = replacePackIndex(encoded.bytes, (index) => ({
+        ...index,
+        entries: [...index.entries].toReversed(),
+      }));
+      const outOfRange = replacePackIndex(encoded.bytes, (index) => ({
+        ...index,
+        entries: index.entries.map((entry, entryIndex) =>
+          entryIndex === 0
+            ? {
+                ...entry,
+                compressedOffset: encoded.bytes.byteLength,
+              }
+            : entry
+        ),
+      }));
+
+      const unsortedError = yield* Effect.flip(decodePack(unsorted));
+      const outOfRangeError = yield* Effect.flip(decodePack(outOfRange));
+
+      assert.strictEqual(unsortedError.reason, "invalid_index");
+      assert.strictEqual(outOfRangeError.reason, "invalid_index");
+    })
+  );
+
   it.effect(
     "rejects tampered pack bytes before workspace materialization",
     () =>
@@ -129,6 +219,49 @@ describe("SCIPACK container", () => {
 
         assert.strictEqual(error.reason, "digest_mismatch");
       })
+  );
+
+  it.effect(
+    "rejects decoded entries whose digest does not match the index",
+    () =>
+      Effect.gen(function* rejectEntryDigestMismatchEffect() {
+        const input = textBytes("payload");
+        const encoded = yield* encodePack([
+          { bytes: input, digest: sha256Bytes(input) },
+        ]);
+        const tampered = replacePackIndex(encoded.bytes, (index) => ({
+          ...index,
+          entries: index.entries.map((entry) => ({
+            ...entry,
+            entryDigest: digestWithPrefix("ff", 1),
+          })),
+        }));
+        const error = yield* Effect.flip(decodePack(tampered));
+
+        assert.strictEqual(error.reason, "entry_digest_mismatch");
+      })
+  );
+
+  it.effect("rejects tampered compressed payloads", () =>
+    Effect.gen(function* rejectTamperedCompressedPayloadEffect() {
+      const input = textBytes("payload");
+      const encoded = yield* encodePack([
+        { bytes: input, digest: sha256Bytes(input) },
+      ]);
+      const tampered = new Uint8Array(encoded.bytes);
+      const indexLength = new DataView(
+        tampered.buffer,
+        tampered.byteOffset,
+        tampered.byteLength
+      ).getUint32(12);
+      const payloadOffset = packHeaderLength + indexLength;
+
+      tampered[payloadOffset] = tampered[payloadOffset] === 0 ? 1 : 0;
+
+      const error = yield* Effect.flip(decodePack(tampered));
+
+      assert.strictEqual(error.reason, "malformed_payload");
+    })
   );
 
   it.effect("reports missing entry lookup as a value error", () =>

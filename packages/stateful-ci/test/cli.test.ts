@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { rm } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 
@@ -7,6 +7,7 @@ import { NodeServices } from "@effect/platform-node";
 import { assert, describe, layer } from "@effect/vitest";
 import {
   configFileName,
+  largeChunkSizeBytes,
   RestoreAllowedResponse,
   RestoreDeniedResponse,
   RestoreRequest,
@@ -1033,6 +1034,317 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             String(missingObject.size)
           );
           assert.deepStrictEqual(uploadRequest.bodyBytes, localObjectBytes);
+        })
+      )
+    );
+
+    it.effect(
+      "uploads manifest, pack, and chunk objects through prepare plans",
+      () =>
+        withWorkspace(
+          ({ fs, path, root }) =>
+            Effect.gen(function* setupChunkedSaveWorkspaceEffect() {
+              yield* fs.makeDirectory(path.join(root, ".turbo/cache"), {
+                recursive: true,
+              });
+              yield* fs.makeDirectory(path.join(root, "target"), {
+                recursive: true,
+              });
+              yield* fs.writeFileString(
+                configFileName,
+                '{"paths":[".turbo","target"]}\n'
+              );
+              yield* fs.writeFileString(
+                path.join(root, ".turbo/cache/result.txt"),
+                "cached output"
+              );
+              yield* Effect.promise(() =>
+                writeFile(
+                  path.join(root, "target/large.bin"),
+                  Buffer.alloc(largeChunkSizeBytes + 1, 4)
+                )
+              );
+              yield* fs.makeDirectory(path.join(root, ".stateful-ci"), {
+                recursive: true,
+              });
+              yield* fs.writeFileString(
+                path.join(root, ".stateful-ci/restore-session.json"),
+                '{"baseSnapshotId":null,"runId":"123456789","workspaceId":"ws_123"}\n'
+              );
+            }),
+          () =>
+            Effect.gen(function* saveUploadsPackAndChunkObjectsEffect() {
+              const uploadedKinds: string[] = [];
+              const preparedRequests: PrepareSaveRequest[] = [];
+              const committedRequests: CommitSaveRequest[] = [];
+
+              yield* withProtocolServer(
+                (request) => {
+                  if (request.url === "/v1/save/prepare") {
+                    const preparedRequest = Schema.decodeUnknownSync(
+                      PrepareSaveRequest
+                    )(request.body);
+                    preparedRequests.push(preparedRequest);
+
+                    return Response.json(
+                      Schema.encodeUnknownSync(PrepareSaveResponse)({
+                        baseSnapshotId: null,
+                        commitTarget: {
+                          namespace:
+                            "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                          refName: "trusted/main/latest",
+                        },
+                        decision: "allowed",
+                        expectedHeadGeneration: 0,
+                        missingObjects: preparedRequest.objects.map(
+                          (object) => ({
+                            headers: {
+                              "x-stateful-ci-object-digest": object.digest,
+                              "x-stateful-ci-object-kind": object.kind,
+                              "x-stateful-ci-object-size": String(object.size),
+                            },
+                            method: "PUT" as const,
+                            object,
+                            route: `/v1/objects/${object.key}`,
+                            transport: "worker-route" as const,
+                          })
+                        ),
+                        trustClass: "trusted",
+                        workspaceId: "ws_123",
+                      })
+                    );
+                  }
+
+                  if (request.method === "PUT") {
+                    const key = request.url?.slice("/v1/objects/".length);
+                    const object = preparedRequests
+                      .at(-1)
+                      ?.objects.find((candidate) => candidate.key === key);
+
+                    if (object !== undefined) {
+                      uploadedKinds.push(object.kind);
+                    }
+
+                    return new Response(null, { status: 204 });
+                  }
+
+                  if (request.url === "/v1/save/commit") {
+                    const committedRequest = Schema.decodeUnknownSync(
+                      CommitSaveRequest
+                    )(request.body);
+                    committedRequests.push(committedRequest);
+
+                    return Response.json(
+                      Schema.encodeUnknownSync(CommitSaveResponse)({
+                        decision: "committed",
+                        headGeneration: 1,
+                        snapshotId: committedRequest.manifest.snapshotId,
+                        workspaceId: "ws_123",
+                      })
+                    );
+                  }
+
+                  return new Response(null, { status: 404 });
+                },
+                (url) =>
+                  saveProgram({
+                    ...githubEnv,
+                    STATEFUL_CI_API_URL: url,
+                  })
+              );
+
+              const [preparedRequest] = preparedRequests;
+              const [committedRequest] = committedRequests;
+
+              if (
+                preparedRequest === undefined ||
+                committedRequest === undefined
+              ) {
+                return yield* Effect.die(
+                  "Expected prepare and commit requests."
+                );
+              }
+
+              assert.deepStrictEqual([...new Set(uploadedKinds)].toSorted(), [
+                "chunk",
+                "manifest",
+                "pack",
+              ]);
+              assert.deepStrictEqual(
+                committedRequest.objects,
+                preparedRequest.objects
+              );
+            })
+        )
+    );
+
+    it.effect(
+      "reports stale generation conflicts without retrying commit",
+      () =>
+        withWorkspace(setupSaveWorkspace, () =>
+          Effect.gen(function* saveReportsGenerationConflictEffect() {
+            const { requests } = yield* withProtocolServer(
+              (request) => {
+                if (request.url === "/v1/save/prepare") {
+                  return Response.json(
+                    Schema.encodeUnknownSync(PrepareSaveResponse)({
+                      baseSnapshotId: null,
+                      commitTarget: {
+                        namespace:
+                          "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                        refName: "trusted/main/latest",
+                      },
+                      decision: "allowed",
+                      expectedHeadGeneration: 0,
+                      missingObjects: [],
+                      trustClass: "trusted",
+                      workspaceId: "ws_123",
+                    })
+                  );
+                }
+
+                if (request.url === "/v1/save/commit") {
+                  return Response.json(
+                    Schema.encodeUnknownSync(CommitSaveResponse)({
+                      actualHeadGeneration: 1,
+                      decision: "conflict",
+                      reason: "head_generation_mismatch",
+                    })
+                  );
+                }
+
+                return new Response(null, { status: 404 });
+              },
+              (url) =>
+                saveProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_URL: url,
+                })
+            );
+            const logs = yield* TestConsole.logLines;
+
+            assert.strictEqual(
+              requests.filter((request) => request.url === "/v1/save/commit")
+                .length,
+              1
+            );
+            assert.strictEqual(
+              requests.some((request) => request.method === "PUT"),
+              false
+            );
+            assert.strictEqual(
+              logs.at(-1),
+              "Save conflicted: expected head changed to generation 1."
+            );
+          })
+        )
+    );
+
+    it.effect("accepts idempotent commit replay responses", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* saveAcceptsIdempotentCommitReplayEffect() {
+          const committedRequests: CommitSaveRequest[] = [];
+
+          yield* withProtocolServer(
+            (request) => {
+              if (request.url === "/v1/save/prepare") {
+                return Response.json(
+                  Schema.encodeUnknownSync(PrepareSaveResponse)({
+                    baseSnapshotId: null,
+                    commitTarget: {
+                      namespace:
+                        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                      refName: "trusted/main/latest",
+                    },
+                    decision: "allowed",
+                    expectedHeadGeneration: 0,
+                    missingObjects: [],
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.url === "/v1/save/commit") {
+                const committedRequest = Schema.decodeUnknownSync(
+                  CommitSaveRequest
+                )(request.body);
+                committedRequests.push(committedRequest);
+
+                return Response.json(
+                  Schema.encodeUnknownSync(CommitSaveResponse)({
+                    decision: "idempotent",
+                    headGeneration: 1,
+                    snapshotId: committedRequest.manifest.snapshotId,
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              return new Response(null, { status: 404 });
+            },
+            (url) =>
+              saveProgram({
+                ...githubEnv,
+                STATEFUL_CI_API_URL: url,
+              })
+          );
+          const [committedRequest] = committedRequests;
+
+          if (committedRequest === undefined) {
+            return yield* Effect.die("Expected commit request.");
+          }
+
+          const logs = yield* TestConsole.logLines;
+
+          assert.strictEqual(
+            logs.at(-1),
+            `Save already committed: snapshot ${committedRequest.manifest.snapshotId} for workspace ws_123. Head generation: 1.`
+          );
+        })
+      )
+    );
+
+    it.effect("leaves fork pull request save policy to the backend", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* forkPullRequestSaveUsesBackendPolicyEffect() {
+          const { requests } = yield* withProtocolServer(
+            (request) => {
+              const prepareRequest = Schema.decodeUnknownSync(
+                PrepareSaveRequest
+              )(request.body);
+
+              assert.deepStrictEqual(prepareRequest.git, {
+                baseRef: "main",
+                headRef: "feature",
+                headRepo: "contributor/stateful-ci",
+                ref: "refs/pull/12/merge",
+                sha: "abc123",
+              });
+
+              return Response.json(
+                Schema.encodeUnknownSync(PrepareSaveResponse)({
+                  decision: "denied",
+                  reason: "external_save_disabled",
+                  trustClass: "external",
+                  workspaceId: "ws_123",
+                })
+              );
+            },
+            (url) =>
+              saveProgram({
+                ...githubEnv,
+                GITHUB_BASE_REF: "main",
+                GITHUB_EVENT_NAME: "pull_request",
+                GITHUB_HEAD_REF: "feature",
+                GITHUB_HEAD_REPOSITORY: "contributor/stateful-ci",
+                GITHUB_REF: "refs/pull/12/merge",
+                STATEFUL_CI_API_URL: url,
+              })
+          );
+
+          assert.strictEqual(requests.length, 1);
+          assert.strictEqual(requests[0]?.url, "/v1/save/prepare");
         })
       )
     );

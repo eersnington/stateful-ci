@@ -4,6 +4,7 @@ import { Result, Schema } from "effect";
 import {
   CommitSaveRequest,
   CommitSaveResponse,
+  DenialReason,
   ManifestKey,
   ObjectTransferPlanEntry,
   PackKey,
@@ -159,6 +160,7 @@ const decodePrepareSaveRequest = Schema.decodeUnknownResult(PrepareSaveRequest);
 const decodeCommitSaveRequest = Schema.decodeUnknownResult(CommitSaveRequest);
 const decodeSha256Digest = Schema.decodeUnknownResult(Sha256Digest);
 const decodeTrustClass = Schema.decodeUnknownResult(TrustClass);
+const decodeDenialReason = Schema.decodeUnknownResult(DenialReason);
 const decodeManifestKey = Schema.decodeUnknownResult(ManifestKey);
 const decodePackKey = Schema.decodeUnknownResult(PackKey);
 const decodeInventoryEntry = Schema.decodeUnknownResult(
@@ -445,9 +447,55 @@ describe("protocol schemas", () => {
     ).toBeTruthy();
   });
 
-  it("TrustClass rejects unknown trust classes", () => {
+  it("TrustClass accepts known trust classes and rejects unknown classes", () => {
+    for (const trustClass of [
+      "external",
+      "internal",
+      "trusted",
+      "privileged",
+      "unknown",
+    ]) {
+      expect(Schema.decodeUnknownSync(TrustClass)(trustClass)).toBe(trustClass);
+    }
+
     expect(
       Result.isFailure(decodeTrustClass("release-candidate"))
+    ).toBeTruthy();
+  });
+
+  it("DenialReason accepts known reasons and rejects unknown reasons", () => {
+    for (const reason of [
+      "backend_policy_not_configured",
+      "external_save_disabled",
+      "head_generation_mismatch",
+      "idempotency_conflict",
+      "invalid_protocol_payload",
+      "manifest_digest_mismatch",
+      "manifest_schema_invalid",
+      "no_compatible_snapshot",
+      "oidc_audience_mismatch",
+      "oidc_invalid",
+      "oidc_issuer_mismatch",
+      "oidc_missing",
+      "privileged_save_disabled",
+      "pull_request_target_denied",
+      "restore_policy_denied",
+      "restore_required_before_save",
+      "save_policy_denied",
+      "save_run_context_mismatch",
+      "snapshot_object_mismatch",
+      "snapshot_object_missing",
+      "unable_to_classify_identity",
+      "unable_to_classify_run_context",
+      "unknown_context_denied",
+      "unsafe_manifest_path",
+      "external_snapshot_cannot_update_trusted_workspace",
+    ]) {
+      expect(Schema.decodeUnknownSync(DenialReason)(reason)).toBe(reason);
+    }
+
+    expect(
+      Result.isFailure(decodeDenialReason("temporary_backend_error"))
     ).toBeTruthy();
   });
 

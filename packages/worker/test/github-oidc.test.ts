@@ -105,6 +105,24 @@ describe("GitHub OIDC verification", () => {
       })
   );
 
+  it.effect("classifies unknown signed events as unknown", () =>
+    Effect.gen(function* classifiesUnknownSignedEventsEffect() {
+      const nowSeconds = Math.floor((yield* Clock.currentTimeMillis) / 1000);
+      const { jwks, token } = yield* createSignedGitHubOidcToken(
+        githubOidcClaims(nowSeconds, {
+          event_name: "workflow_dispatch",
+          sub: "repo:eersnington/stateful-ci:ref:refs/heads/main",
+        })
+      );
+      const identity = yield* verifyGitHubOidcToken(token, {
+        audience: "stateful-ci",
+        jwks: jwks.keys,
+      });
+
+      assert.strictEqual(classifyVerifiedGitHubTrust(identity), "unknown");
+    })
+  );
+
   it.effect("accepts environment subject form", () =>
     Effect.gen(function* acceptsEnvironmentSubjectEffect() {
       const nowSeconds = Math.floor((yield* Clock.currentTimeMillis) / 1000);
