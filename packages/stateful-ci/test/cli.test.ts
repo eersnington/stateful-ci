@@ -1,5 +1,7 @@
 import { once } from "node:events";
+import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { fileURLToPath } from "node:url";
 
 import { NodeServices } from "@effect/platform-node";
 import { assert, describe, layer } from "@effect/vitest";
@@ -16,7 +18,12 @@ import {
 import { Effect, Exit, FileSystem, Layer, Path, Schema } from "effect";
 import { TestConsole } from "effect/testing";
 
-import { restoreProgram, runCli, saveProgram } from "../src/cli";
+import {
+  deployProgramWithRunner,
+  restoreProgram,
+  runCli,
+  saveProgram,
+} from "../src/cli";
 
 const githubEnv = {
   GITHUB_ACTOR: "eersnington",
@@ -46,6 +53,27 @@ interface ProtocolRequest {
   readonly method: string | undefined;
   readonly url: string | undefined;
 }
+
+interface DeployStepCall {
+  readonly args: readonly string[];
+  readonly stdin?: string;
+}
+
+const deployConfigPath = new URL(
+  "../../../.stateful-ci/deploy/wrangler.toml",
+  import.meta.url
+);
+const deployConfigFsPath = fileURLToPath(deployConfigPath);
+
+const cleanupDeployConfig = () =>
+  Effect.tryPromise({
+    catch: () => null,
+    try: () =>
+      rm(new URL("../../../.stateful-ci", import.meta.url), {
+        force: true,
+        recursive: true,
+      }),
+  }).pipe(Effect.ignore);
 
 const withWorkspace = <A, SetupError, SetupContext, RunError, RunContext>(
   setup: (
@@ -131,7 +159,7 @@ const withProtocolServer = <A, E, R>(
             handlerResponse.status,
             Object.fromEntries(handlerResponse.headers.entries())
           );
-          response.end(await handlerResponse.text());
+          response.end(Buffer.from(await handlerResponse.arrayBuffer()));
         } catch (error) {
           response.writeHead(500, { "content-type": "text/plain" });
           response.end(String(error));
@@ -248,7 +276,6 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             (url) =>
               restoreProgram({
                 ...githubEnv,
-                STATEFUL_CI_API_TOKEN: "test-token",
                 STATEFUL_CI_API_URL: url,
               })
           );
@@ -266,10 +293,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           assert.strictEqual(requests.length, 1);
           assert.strictEqual(protocolRequest.method, "POST");
           assert.strictEqual(protocolRequest.url, "/v1/restore");
-          assert.strictEqual(
-            protocolRequest.authorization,
-            "Bearer test-token"
-          );
+          assert.strictEqual(protocolRequest.authorization, undefined);
           assert.deepStrictEqual(request.git, {
             baseRef: null,
             headRef: null,
@@ -696,41 +720,44 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
       () =>
         withWorkspace(setupRestoreWorkspace, () =>
           Effect.gen(function* restoreRejectsUnsafeWorkerRouteEffect() {
-            const { requests } = yield* withProtocolServer(
+            const { requests, value: error } = yield* withProtocolServer(
               () =>
-                Response.json({
-                  decision: "allowed",
-                  downloadPlan: [
-                    {
-                      method: "GET",
-                      object: {
-                        digest:
-                          "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
-                        key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
-                        kind: "manifest",
-                        size: 8,
+                Response.json(
+                  Schema.encodeUnknownSync(RestoreAllowedResponse)({
+                    decision: "allowed",
+                    downloadPlan: [
+                      {
+                        headers: {},
+                        method: "GET",
+                        object: {
+                          digest:
+                            "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                          key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                          kind: "manifest",
+                          size: 8,
+                        },
+                        route: "https://example.test/leak-token",
+                        transport: "worker-route",
                       },
-                      route: "https://example.test/leak-token",
-                      transport: "worker-route",
+                    ],
+                    manifest: {
+                      digest:
+                        "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                      key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                      size: 8,
+                      snapshotId: "snap_123",
                     },
-                  ],
-                  manifest: {
-                    digest:
-                      "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
-                    key: "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
-                    size: 8,
-                    snapshotId: "snap_123",
-                  },
-                  save: { allowed: false },
-                  snapshot: {
-                    id: "snap_123",
-                    manifestKey:
-                      "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
-                    parent: null,
-                  },
-                  trustClass: "trusted",
-                  workspaceId: "ws_123",
-                }),
+                    save: { allowed: false },
+                    snapshot: {
+                      id: "snap_123",
+                      manifestKey:
+                        "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json",
+                      parent: null,
+                    },
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                ),
               (url) =>
                 Effect.flip(
                   restoreProgram({
@@ -741,6 +768,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                 )
             );
 
+            assert.strictEqual(error._tag, "CliFailure");
             assert.strictEqual(requests.length, 1);
             assert.strictEqual(requests[0]?.url, "/v1/restore");
           })
@@ -1076,38 +1104,40 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
     it.effect("rejects unsafe worker-route upload plans before upload", () =>
       withWorkspace(setupSaveWorkspace, () =>
         Effect.gen(function* saveRejectsUnsafeWorkerRouteEffect() {
-          const { requests } = yield* withProtocolServer(
+          const { requests, value: error } = yield* withProtocolServer(
             (request) => {
               const prepareRequest = Schema.decodeUnknownSync(
                 PrepareSaveRequest
               )(request.body);
               const [missingObject] = prepareRequest.objects;
 
-              return Response.json({
-                baseSnapshotId: null,
-                commitTarget: {
-                  namespace:
-                    "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
-                  refName: "trusted/main/latest",
-                },
-                decision: "allowed",
-                expectedHeadGeneration: 0,
-                missingObjects: [
-                  {
-                    headers: {
-                      "x-stateful-ci-object-digest": missingObject.digest,
-                      "x-stateful-ci-object-kind": missingObject.kind,
-                      "x-stateful-ci-object-size": String(missingObject.size),
-                    },
-                    method: "PUT",
-                    object: missingObject,
-                    route: "https://example.test/leak-token",
-                    transport: "worker-route",
+              return Response.json(
+                Schema.encodeUnknownSync(PrepareSaveResponse)({
+                  baseSnapshotId: null,
+                  commitTarget: {
+                    namespace:
+                      "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                    refName: "trusted/main/latest",
                   },
-                ],
-                trustClass: "trusted",
-                workspaceId: "ws_123",
-              });
+                  decision: "allowed",
+                  expectedHeadGeneration: 0,
+                  missingObjects: [
+                    {
+                      headers: {
+                        "x-stateful-ci-object-digest": missingObject.digest,
+                        "x-stateful-ci-object-kind": missingObject.kind,
+                        "x-stateful-ci-object-size": String(missingObject.size),
+                      },
+                      method: "PUT",
+                      object: missingObject,
+                      route: "https://example.test/leak-token",
+                      transport: "worker-route",
+                    },
+                  ],
+                  trustClass: "trusted",
+                  workspaceId: "ws_123",
+                })
+              );
             },
             (url) =>
               Effect.flip(
@@ -1119,10 +1149,320 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
               )
           );
 
+          assert.strictEqual(error._tag, "CliFailure");
           assert.strictEqual(requests.length, 1);
           assert.strictEqual(requests[0]?.url, "/v1/save/prepare");
         })
       )
+    );
+
+    it.effect("saves to and restores from a remote test backend", () =>
+      withWorkspace(setupSaveWorkspace, ({ fs, path, root }) =>
+        Effect.gen(function* saveThenRestoreRemoteSnapshotEffect() {
+          const storedObjects = new Map<string, Uint8Array>();
+          let committedRequest: CommitSaveRequest | null = null;
+
+          yield* withProtocolServer(
+            (request) => {
+              if (request.url === "/v1/save/prepare") {
+                const prepareRequest = Schema.decodeUnknownSync(
+                  PrepareSaveRequest
+                )(request.body);
+
+                return Response.json(
+                  Schema.encodeUnknownSync(PrepareSaveResponse)({
+                    baseSnapshotId: null,
+                    commitTarget: {
+                      namespace:
+                        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
+                      refName: "trusted/main/latest",
+                    },
+                    decision: "allowed",
+                    expectedHeadGeneration: 0,
+                    missingObjects: prepareRequest.objects.map((object) => ({
+                      headers: {
+                        "x-stateful-ci-object-digest": object.digest,
+                        "x-stateful-ci-object-kind": object.kind,
+                        "x-stateful-ci-object-size": String(object.size),
+                        "x-stateful-ci-transfer-token": "test-transfer-token",
+                      },
+                      method: "PUT" as const,
+                      object,
+                      route: `/v1/objects/${object.key}`,
+                      transport: "worker-route" as const,
+                    })),
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.method === "PUT") {
+                const key = request.url?.slice("/v1/objects/".length);
+
+                if (key !== undefined) {
+                  storedObjects.set(key, request.bodyBytes);
+                }
+
+                return new Response(null, { status: 204 });
+              }
+
+              if (request.url === "/v1/save/commit") {
+                committedRequest = Schema.decodeUnknownSync(CommitSaveRequest)(
+                  request.body
+                );
+
+                return Response.json(
+                  Schema.encodeUnknownSync(CommitSaveResponse)({
+                    decision: "committed",
+                    headGeneration: 1,
+                    snapshotId: committedRequest.manifest.snapshotId,
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.url === "/v1/restore") {
+                if (committedRequest === null) {
+                  return Response.json(
+                    Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                      decision: "denied",
+                      reason: "no_compatible_snapshot",
+                      save: { allowed: false },
+                      trustClass: "trusted",
+                    })
+                  );
+                }
+
+                return Response.json(
+                  Schema.encodeUnknownSync(RestoreAllowedResponse)({
+                    decision: "allowed",
+                    downloadPlan: committedRequest.objects.map((object) => ({
+                      headers: {
+                        "x-stateful-ci-object-digest": object.digest,
+                        "x-stateful-ci-object-kind": object.kind,
+                        "x-stateful-ci-object-size": String(object.size),
+                        "x-stateful-ci-transfer-token": "test-transfer-token",
+                      },
+                      method: "GET" as const,
+                      object,
+                      route: `/v1/objects/${object.key}`,
+                      transport: "worker-route" as const,
+                    })),
+                    manifest: committedRequest.manifest,
+                    save: { allowed: true, target: "trusted/main/latest" },
+                    snapshot: {
+                      id: committedRequest.manifest.snapshotId,
+                      manifestKey: committedRequest.manifest.key,
+                      parent: null,
+                    },
+                    trustClass: "trusted",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              if (request.method === "GET") {
+                const key = request.url?.slice("/v1/objects/".length);
+                const bytes =
+                  key === undefined ? undefined : storedObjects.get(key);
+
+                return bytes === undefined
+                  ? new Response(null, { status: 404 })
+                  : new Response(bytes);
+              }
+
+              return new Response(null, { status: 404 });
+            },
+            (url) =>
+              Effect.gen(function* runRemoteRoundTripEffect() {
+                const env = {
+                  ...githubEnv,
+                  STATEFUL_CI_API_URL: url,
+                };
+
+                yield* saveProgram(env);
+                yield* fs.writeFileString(
+                  path.join(root, ".turbo/cache/result.txt"),
+                  "stale output"
+                );
+                yield* fs.writeFileString(
+                  path.join(root, ".turbo/cache/stale.txt"),
+                  "stale"
+                );
+
+                yield* restoreProgram(env);
+
+                const restored = yield* fs.readFileString(
+                  path.join(root, ".turbo/cache/result.txt")
+                );
+                const stale = yield* Effect.flip(
+                  fs.readFileString(path.join(root, ".turbo/cache/stale.txt"))
+                );
+
+                assert.strictEqual(restored, "cached output");
+                assert.strictEqual(stale._tag, "PlatformError");
+              })
+          );
+        })
+      )
+    );
+  });
+
+  describe("deploy", () => {
+    const deployEnv = {
+      STATEFUL_CI_ALLOWED_REPOSITORIES: "eersnington/stateful-ci",
+      STATEFUL_CI_TRANSFER_SECRET: "test-transfer-secret",
+    };
+
+    it.effect("generates deploy config and wires secrets", () =>
+      Effect.gen(function* deployGeneratesConfigAndWiresSecretsEffect() {
+        yield* Effect.addFinalizer(cleanupDeployConfig);
+        const calls: DeployStepCall[] = [];
+        const runner = ({ args, stdin }: DeployStepCall) => {
+          calls.push(stdin === undefined ? { args } : { args, stdin });
+
+          return Effect.succeed({
+            stderr: "",
+            stdout:
+              args.join(" ") === "wrangler d1 list --json"
+                ? JSON.stringify([
+                    {
+                      name: "stateful-ci-metadata",
+                      uuid: "11111111-1111-1111-1111-111111111111",
+                    },
+                  ])
+                : "",
+          });
+        };
+
+        yield* deployProgramWithRunner(deployEnv, runner);
+
+        const fs = yield* FileSystem.FileSystem;
+        const config = yield* fs.readFileString(deployConfigFsPath);
+
+        assert.deepStrictEqual(
+          calls.map((call) => call.args),
+          [
+            ["wrangler", "d1", "create", "stateful-ci-metadata"],
+            ["wrangler", "d1", "list", "--json"],
+            ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+            [
+              "wrangler",
+              "d1",
+              "migrations",
+              "apply",
+              "stateful-ci-metadata",
+              "--remote",
+              "--config",
+              deployConfigFsPath,
+            ],
+            [
+              "wrangler",
+              "secret",
+              "put",
+              "STATEFUL_CI_TRANSFER_SECRET",
+              "--config",
+              deployConfigFsPath,
+            ],
+            ["wrangler", "deploy", "--config", deployConfigFsPath],
+          ]
+        );
+        assert.strictEqual(calls[4]?.stdin, "test-transfer-secret\n");
+        assert.include(
+          config,
+          'ALLOWED_REPOSITORIES = "eersnington/stateful-ci"'
+        );
+        assert.include(config, 'OIDC_AUDIENCE = "stateful-ci"');
+        assert.include(config, 'bucket_name = "stateful-ci-objects"');
+        assert.include(
+          config,
+          'database_id = "11111111-1111-1111-1111-111111111111"'
+        );
+        assert.notInclude(config, "STATEFUL_CI_TRANSFER_SECRET");
+      })
+    );
+
+    it.effect("fails before provisioning when deploy secrets are missing", () =>
+      Effect.gen(function* deployFailsBeforeProvisioningWithoutSecretsEffect() {
+        const calls: DeployStepCall[] = [];
+        const error = yield* Effect.flip(
+          deployProgramWithRunner(
+            { STATEFUL_CI_ALLOWED_REPOSITORIES: "eersnington/stateful-ci" },
+            (call) => {
+              calls.push(call);
+              return Effect.succeed({ stderr: "", stdout: "" });
+            }
+          )
+        );
+
+        assert.strictEqual(error._tag, "CliFailure");
+        assert.include(error.message, "Missing STATEFUL_CI_TRANSFER_SECRET");
+        assert.deepStrictEqual(calls, []);
+      })
+    );
+
+    it.effect("requires an allowed repository list", () =>
+      Effect.gen(function* deployRequiresAllowedRepositoryListEffect() {
+        const error = yield* Effect.flip(
+          deployProgramWithRunner(
+            { STATEFUL_CI_TRANSFER_SECRET: "test-transfer-secret" },
+            () => Effect.succeed({ stderr: "", stdout: "" })
+          )
+        );
+
+        assert.strictEqual(error._tag, "CliFailure");
+        assert.include(
+          error.message,
+          "Missing STATEFUL_CI_ALLOWED_REPOSITORIES"
+        );
+      })
+    );
+
+    it.effect("rejects invalid R2 bucket names before provisioning", () =>
+      Effect.gen(function* deployRejectsInvalidBucketNamesEffect() {
+        const calls: DeployStepCall[] = [];
+        const error = yield* Effect.flip(
+          deployProgramWithRunner(
+            { ...deployEnv, STATEFUL_CI_R2_BUCKET: "--bad-bucket" },
+            (call) => {
+              calls.push(call);
+              return Effect.succeed({ stderr: "", stdout: "" });
+            }
+          )
+        );
+
+        assert.strictEqual(error._tag, "CliFailure");
+        assert.include(error.message, "STATEFUL_CI_R2_BUCKET must use");
+        assert.deepStrictEqual(calls, []);
+      })
+    );
+
+    it.effect("rejects invalid D1 database names before provisioning", () =>
+      Effect.gen(function* deployRejectsInvalidDatabaseNamesEffect() {
+        const calls: DeployStepCall[] = [];
+        const error = yield* Effect.flip(
+          deployProgramWithRunner(
+            { ...deployEnv, STATEFUL_CI_D1_DATABASE: "bad database" },
+            (call) => {
+              calls.push(call);
+              return Effect.succeed({ stderr: "", stdout: "" });
+            }
+          )
+        );
+
+        assert.strictEqual(error._tag, "CliFailure");
+        assert.include(error.message, "STATEFUL_CI_D1_DATABASE must use");
+        assert.deepStrictEqual(calls, []);
+      })
+    );
+  });
+
+  describe("dashboard", () => {
+    it.effect("is registered as a CLI command", () =>
+      Effect.gen(function* dashboardIsRegisteredEffect() {
+        yield* runCli(["dashboard"]);
+      })
     );
   });
 });

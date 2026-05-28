@@ -242,6 +242,7 @@ describe("Worker Cloudflare runtime bindings", () => {
     const response = await handleFetch(
       jsonRequest(routes.prepareSave.path, prepareRequest),
       {
+        ALLOWED_REPOSITORIES: env.ALLOWED_REPOSITORIES,
         STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
         STATEFUL_CI_GITHUB_JWKS_JSON: signedOidcJwksJson,
         STATEFUL_CI_METADATA: env.STATEFUL_CI_METADATA,

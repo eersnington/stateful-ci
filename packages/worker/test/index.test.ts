@@ -90,10 +90,21 @@ const oidcIdentityFor = (token: () => string) => ({
 });
 
 const env = {
+  ALLOWED_REPOSITORIES: "eersnington/stateful-ci",
   STATEFUL_CI_API_TOKEN: "test-token",
+  STATEFUL_CI_DEV_AUTH_ENABLED: "true",
   get STATEFUL_CI_GITHUB_JWKS_JSON() {
     return signedOidcJwksJson;
   },
+  STATEFUL_CI_TRANSFER_SECRET: "test-transfer-token",
+};
+
+const productionEnv = {
+  ALLOWED_REPOSITORIES: "eersnington/stateful-ci",
+  get STATEFUL_CI_GITHUB_JWKS_JSON() {
+    return signedOidcJwksJson;
+  },
+  STATEFUL_CI_TRANSFER_SECRET: "test-transfer-token",
 };
 
 const restoreRequest = {
@@ -316,7 +327,7 @@ describe("worker API", () => {
   beforeAll(setupOidcTokens);
 
   it("GET /health returns protocol health", async () => {
-    const response = await worker.fetch(
+    const response = await handleFetch(
       new Request("https://stateful-ci.test/health"),
       env
     );
@@ -573,7 +584,7 @@ describe("worker API", () => {
         snapshots: [seededSnapshot],
       });
       const response = yield* Effect.promise(() =>
-        handleFetch(jsonRequest("/v1/restore", restoreRequest), env, {
+        handleFetch(jsonRequest("/v1/restore", restoreRequest), productionEnv, {
           blobStore: seededBlobStore(),
           metadata,
         })
@@ -596,6 +607,32 @@ describe("worker API", () => {
           route: `/v1/objects/${object.key}`,
         }))
       );
+      for (const [index, entry] of body.downloadPlan.entries()) {
+        const object = seededSnapshot.objects[index];
+
+        if (object === undefined) {
+          return yield* Effect.die("Expected matching seeded object.");
+        }
+
+        assert.strictEqual(
+          entry.headers?.["x-stateful-ci-object-digest"],
+          object.digest
+        );
+        assert.strictEqual(
+          entry.headers?.["x-stateful-ci-object-kind"],
+          object.kind
+        );
+        assert.strictEqual(
+          entry.headers?.["x-stateful-ci-object-size"],
+          String(object.size)
+        );
+        assert.isString(entry.headers?.["x-stateful-ci-transfer-expires-at"]);
+        assert.isString(entry.headers?.["x-stateful-ci-transfer-token"]);
+        assert.notStrictEqual(
+          entry.headers?.["x-stateful-ci-transfer-token"],
+          productionEnv.STATEFUL_CI_TRANSFER_SECRET
+        );
+      }
     })
   );
 
@@ -885,6 +922,65 @@ describe("worker API", () => {
       eventType: "restore",
       reason: "oidc_missing",
       trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/restore denies when repository allowlist is missing", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      {
+        STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+        STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET,
+      },
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "unknown_context_denied",
+      save: { allowed: false },
+      trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/restore denies repositories outside the allowlist", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      {
+        ALLOWED_REPOSITORIES: "other/repo",
+        STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+        STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET,
+      },
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toStrictEqual({
+      decision: "denied",
+      reason: "unknown_context_denied",
+      save: { allowed: false },
+      trustClass: "unknown",
+    });
+  });
+
+  it("POST /v1/restore accepts mixed-case repository allowlist entries", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      {
+        ALLOWED_REPOSITORIES: "Eersnington/Stateful-CI",
+        STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+        STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET,
+      },
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "no_compatible_snapshot",
+      save: { allowed: true, target: seededRefName },
+      trustClass: "trusted",
     });
   });
 
@@ -1408,7 +1504,7 @@ describe("worker API", () => {
     });
   });
 
-  it("restore without an authorization token returns structured 401", async () => {
+  it("restore authenticates production requests with OIDC instead of a static token", async () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/v1/restore", {
         body: JSON.stringify(restoreRequest),
@@ -1418,23 +1514,20 @@ describe("worker API", () => {
       env
     );
 
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      _tag: "Unauthorized",
+      decision: "denied",
+      trustClass: "trusted",
     });
   });
 
-  it("restore with the wrong authorization token returns structured 403", async () => {
-    const response = await worker.fetch(
-      new Request("https://stateful-ci.test/v1/restore", {
-        body: JSON.stringify(restoreRequest),
-        headers: {
-          authorization: "Bearer wrong-token",
-          "content-type": "application/json",
-        },
-        method: "POST",
+  it("object routes reject missing transfer authorization in production", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        method: "GET",
       }),
-      env
+      { STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET },
+      { blobStore: seededBlobStore() }
     );
 
     expect(response.status).toBe(403);
@@ -1442,4 +1535,138 @@ describe("worker API", () => {
       _tag: "Forbidden",
     });
   });
+
+  it.effect("object routes accept scoped backend transfer authorization", () =>
+    Effect.gen(function* objectRoutesAcceptScopedTransferAuthorizationEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        refs: [seededRef],
+        snapshots: [seededSnapshot],
+      });
+      const restoreResponse = yield* Effect.promise(() =>
+        handleFetch(jsonRequest("/v1/restore", restoreRequest), productionEnv, {
+          blobStore: seededBlobStore(),
+          metadata,
+        })
+      );
+      const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+        yield* Effect.promise(() => restoreResponse.json())
+      );
+      const [plan] = body.downloadPlan;
+
+      if (plan === undefined || plan.transport !== "worker-route") {
+        return yield* Effect.die("Expected worker-route download plan.");
+      }
+
+      const objectResponse = yield* Effect.promise(() =>
+        handleFetch(
+          new Request(`https://stateful-ci.test${plan.route}`, {
+            headers: plan.headers ?? {},
+            method: "GET",
+          }),
+          {
+            STATEFUL_CI_TRANSFER_SECRET:
+              productionEnv.STATEFUL_CI_TRANSFER_SECRET,
+          },
+          { blobStore: seededBlobStore() }
+        )
+      );
+
+      assert.strictEqual(objectResponse.status, 200);
+      assert.deepStrictEqual(
+        new Uint8Array(
+          yield* Effect.promise(() => objectResponse.arrayBuffer())
+        ),
+        seededManifestBytes
+      );
+    })
+  );
+
+  it.effect("dev auth object plans do not require a transfer secret", () =>
+    Effect.gen(function* devAuthObjectPlansDoNotRequireTransferSecretEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        refs: [seededRef],
+        snapshots: [seededSnapshot],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/restore", restoreRequest),
+          {
+            ALLOWED_REPOSITORIES: env.ALLOWED_REPOSITORIES,
+            STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
+            STATEFUL_CI_DEV_AUTH_ENABLED: "true",
+            STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+          },
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(body.decision, "allowed");
+      for (const entry of body.downloadPlan) {
+        assert.isUndefined(entry.headers?.["x-stateful-ci-transfer-token"]);
+        assert.isUndefined(
+          entry.headers?.["x-stateful-ci-transfer-expires-at"]
+        );
+        assert.isString(entry.headers?.["x-stateful-ci-object-digest"]);
+      }
+    })
+  );
+
+  it.effect(
+    "object routes reject transfer authorization for another method",
+    () =>
+      Effect.gen(
+        function* objectRoutesRejectWrongMethodTransferAuthorizationEffect() {
+          const metadata = createInMemoryMetadataBackend({
+            refs: [seededRef],
+            snapshots: [seededSnapshot],
+          });
+          const restoreResponse = yield* Effect.promise(() =>
+            handleFetch(
+              jsonRequest("/v1/restore", restoreRequest),
+              productionEnv,
+              {
+                blobStore: seededBlobStore(),
+                metadata,
+              }
+            )
+          );
+          const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+            yield* Effect.promise(() => restoreResponse.json())
+          );
+          const [plan] = body.downloadPlan;
+
+          if (plan === undefined || plan.transport !== "worker-route") {
+            return yield* Effect.die("Expected worker-route download plan.");
+          }
+
+          const response = yield* Effect.promise(() =>
+            handleFetch(
+              new Request(`https://stateful-ci.test${plan.route}`, {
+                headers: {
+                  ...plan.headers,
+                  "content-length": String(plan.object.size),
+                },
+                method: "PUT",
+              }),
+              {
+                STATEFUL_CI_TRANSFER_SECRET:
+                  productionEnv.STATEFUL_CI_TRANSFER_SECRET,
+              },
+              { blobStore: seededBlobStore() }
+            )
+          );
+
+          assert.strictEqual(response.status, 403);
+          assert.deepStrictEqual(yield* Effect.promise(() => response.json()), {
+            _tag: "Forbidden",
+            message:
+              "The object transfer authorization did not match this method, object, digest, size, and expiry. Restore/save object bytes were not served or stored.",
+          });
+        }
+      )
+  );
 });

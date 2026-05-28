@@ -1,0 +1,27 @@
+name = "stateful-ci-worker-test"
+main = "src/index.ts"
+compatibility_date = "2026-05-22"
+
+[vars]
+ALLOWED_REPOSITORIES = "eersnington/stateful-ci"
+STATEFUL_CI_API_TOKEN = "test-token"
+STATEFUL_CI_DEV_AUTH_ENABLED = "true"
+STATEFUL_CI_TRANSFER_SECRET = "test-transfer-token"
+
+[[d1_databases]]
+binding = "STATEFUL_CI_METADATA"
+database_name = "stateful-ci-metadata-test"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "STATEFUL_CI_OBJECTS"
+bucket_name = "stateful-ci-objects-test"
+
+[[durable_objects.bindings]]
+name = "STATEFUL_CI_COORDINATORS"
+class_name = "WorkspaceSnapshotCoordinatorDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkspaceSnapshotCoordinatorDurableObject"]

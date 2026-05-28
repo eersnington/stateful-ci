@@ -1,6 +1,7 @@
 import type {
   ApiErrorType,
   DenialReason,
+  ObjectTransferPlanEntry,
   VerifiedGitHubActionsIdentity,
 } from "@stateful-ci/core";
 import {
@@ -77,13 +78,20 @@ export { WorkspaceSnapshotCoordinatorDurableObject } from "./durable-object";
 export const maxProtocolBodyBytes = 64 * 1024;
 
 interface WorkerEnv {
+  readonly ALLOWED_REPOSITORIES?: string;
+  readonly DEV_AUTH_ENABLED?: string;
+  readonly OIDC_AUDIENCE?: string;
+  readonly STATEFUL_CI_ALLOWED_REPOSITORIES?: string;
   readonly STATEFUL_CI_COORDINATORS?: DurableObjectNamespace;
   readonly STATEFUL_CI_METADATA?: D1Database;
   readonly STATEFUL_CI_OBJECTS?: R2Bucket;
   readonly STATEFUL_CI_API_TOKEN?: string;
+  readonly STATEFUL_CI_DEV_AUTH_ENABLED?: string;
   readonly STATEFUL_CI_GITHUB_JWKS_JSON?: string;
   readonly STATEFUL_CI_OIDC_AUDIENCE?: string;
   readonly STATEFUL_CI_TRUSTED_REFS?: string;
+  readonly STATEFUL_CI_TRANSFER_SECRET?: string;
+  readonly TRUSTED_REFS?: string;
 }
 
 export interface HandleFetchOptions {
@@ -146,7 +154,8 @@ const coordinatorForEnv = (env: WorkerEnv | undefined) => {
 };
 
 const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
-  const configured = env?.STATEFUL_CI_TRUSTED_REFS?.split(",")
+  const configured = (env?.TRUSTED_REFS ?? env?.STATEFUL_CI_TRUSTED_REFS)
+    ?.split(",")
     .map((ref) => ref.trim())
     .filter((ref) => ref.length > 0);
 
@@ -155,11 +164,32 @@ const trustedRefsForEnv = (env: WorkerEnv | undefined) => {
     : configured;
 };
 
-const oidcAudienceForEnv = (env: WorkerEnv | undefined) =>
-  env?.STATEFUL_CI_OIDC_AUDIENCE === undefined ||
-  env.STATEFUL_CI_OIDC_AUDIENCE.trim().length === 0
+const configuredList = (source: string | undefined) =>
+  source
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0) ?? [];
+
+const canonicalRepository = (repository: string) => repository.toLowerCase();
+
+const allowedRepositoriesForEnv = (env: WorkerEnv | undefined) =>
+  configuredList(
+    env?.ALLOWED_REPOSITORIES ?? env?.STATEFUL_CI_ALLOWED_REPOSITORIES
+  ).map(canonicalRepository);
+
+const oidcAudienceForEnv = (env: WorkerEnv | undefined) => {
+  const configured = (env?.OIDC_AUDIENCE ?? env?.STATEFUL_CI_OIDC_AUDIENCE)
+    ?.trim()
+    .replaceAll("\n", "");
+
+  return configured === undefined || configured.length === 0
     ? defaultGitHubOidcAudience
-    : env.STATEFUL_CI_OIDC_AUDIENCE.trim();
+    : configured;
+};
+
+const devAuthEnabled = (env: WorkerEnv | undefined) =>
+  (env?.DEV_AUTH_ENABLED ?? env?.STATEFUL_CI_DEV_AUTH_ENABLED) === "1" ||
+  (env?.DEV_AUTH_ENABLED ?? env?.STATEFUL_CI_DEV_AUTH_ENABLED) === "true";
 
 const oidcJwksForEnv = (env: WorkerEnv | undefined) => {
   if (env?.STATEFUL_CI_GITHUB_JWKS_JSON === undefined) {
@@ -214,7 +244,7 @@ const producerContextForIdentity = (
   workflow: identity.workflow,
 });
 
-const authorizeRequest = (request: Request, env: WorkerEnv | undefined) => {
+const authorizeDevToken = (request: Request, env: WorkerEnv | undefined) => {
   const expectedToken = env?.STATEFUL_CI_API_TOKEN;
   const authorization = request.headers.get("authorization");
 
@@ -247,6 +277,264 @@ const authorizeRequest = (request: Request, env: WorkerEnv | undefined) => {
 
   return Effect.void;
 };
+
+const transferSecretForEnv = (env: WorkerEnv | undefined) => {
+  const secret = env?.STATEFUL_CI_TRANSFER_SECRET;
+
+  return secret === undefined || secret.length === 0 ? null : secret;
+};
+
+const transferTokenHeader = "x-stateful-ci-transfer-token";
+const transferExpiresAtHeader = "x-stateful-ci-transfer-expires-at";
+const transferTokenTtlMillis = 15 * 60 * 1000;
+
+const bytesToHex = (bytes: Uint8Array) =>
+  [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+
+const hexToBytes = (source: string) => {
+  if (source.length % 2 !== 0 || !/^[0-9a-f]+$/iu.test(source)) {
+    return null;
+  }
+
+  const bytes = new Uint8Array(source.length / 2);
+
+  for (let index = 0; index < source.length; index += 2) {
+    bytes[index / 2] = Number.parseInt(source.slice(index, index + 2), 16);
+  }
+
+  return bytes;
+};
+
+const constantTimeEqual = (actual: string, expected: string) => {
+  const actualBytes = hexToBytes(actual);
+  const expectedBytes = hexToBytes(expected);
+
+  if (actualBytes === null || expectedBytes === null) {
+    return false;
+  }
+
+  if (actualBytes.byteLength !== expectedBytes.byteLength) {
+    return false;
+  }
+
+  let difference = 0;
+
+  for (let index = 0; index < expectedBytes.byteLength; index += 1) {
+    difference += Math.abs(
+      (actualBytes[index] ?? 0) - (expectedBytes[index] ?? 0)
+    );
+  }
+
+  return difference === 0;
+};
+
+const transferTokenPayload = (input: {
+  readonly digest: string;
+  readonly expiresAt: string;
+  readonly key: string;
+  readonly method: string;
+  readonly size: number;
+}) =>
+  [
+    "v1",
+    input.method,
+    input.key,
+    input.digest,
+    String(input.size),
+    input.expiresAt,
+  ].join("\n");
+
+const signTransferPayload = Effect.fn("signTransferPayload")(
+  function* signTransferPayloadEffect(secret: string, payload: string) {
+    const key = yield* Effect.tryPromise({
+      catch: () =>
+        new Forbidden({
+          message:
+            "The Worker could not prepare object transfer authorization. Check STATEFUL_CI_TRANSFER_SECRET and retry.",
+        }),
+      try: () =>
+        crypto.subtle.importKey(
+          "raw",
+          new TextEncoder().encode(secret),
+          { hash: "SHA-256", name: "HMAC" },
+          false,
+          ["sign"]
+        ),
+    });
+    const signature = yield* Effect.tryPromise({
+      catch: () =>
+        new Forbidden({
+          message:
+            "The Worker could not sign object transfer authorization. Check backend crypto support and retry.",
+        }),
+      try: () =>
+        crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)),
+    });
+
+    return bytesToHex(new Uint8Array(signature));
+  }
+);
+
+const planWithObjectHeaders = (plan: ObjectTransferPlanEntry) => ({
+  ...plan,
+  headers: {
+    ...plan.headers,
+    "x-stateful-ci-object-digest": plan.object.digest,
+    "x-stateful-ci-object-kind": plan.object.kind,
+    "x-stateful-ci-object-size": String(plan.object.size),
+  },
+});
+
+const transferHeadersForPlan = Effect.fn("transferHeadersForPlan")(
+  function* transferHeadersForPlanEffect(
+    env: WorkerEnv | undefined,
+    plan: ObjectTransferPlanEntry
+  ) {
+    if (devAuthEnabled(env)) {
+      return planWithObjectHeaders(plan) satisfies ObjectTransferPlanEntry;
+    }
+
+    const secret = transferSecretForEnv(env);
+
+    if (secret === null) {
+      return yield* new Forbidden({
+        message:
+          "The Worker does not have STATEFUL_CI_TRANSFER_SECRET configured, so backend-authorized object transfer plans cannot be issued. Configure the transfer secret before using restore/save object downloads or uploads.",
+      });
+    }
+
+    const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const expiresAt = String(now + transferTokenTtlMillis);
+    const token = yield* signTransferPayload(
+      secret,
+      transferTokenPayload({
+        digest: plan.object.digest,
+        expiresAt,
+        key: plan.object.key,
+        method: plan.method,
+        size: plan.object.size,
+      })
+    );
+
+    return {
+      ...planWithObjectHeaders(plan),
+      headers: {
+        ...planWithObjectHeaders(plan).headers,
+        [transferExpiresAtHeader]: expiresAt,
+        [transferTokenHeader]: token,
+      },
+    } satisfies ObjectTransferPlanEntry;
+  }
+);
+
+const withTransferHeaders = (
+  env: WorkerEnv | undefined,
+  plans: readonly ObjectTransferPlanEntry[]
+) =>
+  Effect.gen(function* withTransferHeadersEffect() {
+    const authorizedPlans: ObjectTransferPlanEntry[] = [];
+
+    for (const plan of plans) {
+      authorizedPlans.push(yield* transferHeadersForPlan(env, plan));
+    }
+
+    return authorizedPlans;
+  });
+
+const expectedObjectFromHeaders = (
+  key: SnapshotObjectInventoryEntry["key"],
+  headers: Headers
+) => {
+  const expectedDigest = headers.get("x-stateful-ci-object-digest");
+  const expectedKind = headers.get("x-stateful-ci-object-kind");
+  const expectedSize = headers.get("x-stateful-ci-object-size");
+
+  if (
+    expectedDigest === null ||
+    expectedKind === null ||
+    expectedSize === null
+  ) {
+    return null;
+  }
+
+  const decoded = Schema.decodeUnknownExit(SnapshotObjectInventoryEntry)({
+    digest: expectedDigest,
+    key,
+    kind: expectedKind,
+    size: Number(expectedSize),
+  });
+
+  return Exit.isFailure(decoded) ? null : decoded.value;
+};
+
+const authorizeObjectTransfer = Effect.fn("authorizeObjectTransfer")(
+  function* authorizeObjectTransferEffect(
+    request: Request,
+    env: WorkerEnv | undefined,
+    key: SnapshotObjectInventoryEntry["key"]
+  ) {
+    if (devAuthEnabled(env)) {
+      return yield* authorizeDevToken(request, env);
+    }
+
+    const expectedToken = transferSecretForEnv(env);
+    const actualToken = request.headers.get(transferTokenHeader);
+    const expiresAt = request.headers.get(transferExpiresAtHeader);
+    const object = expectedObjectFromHeaders(key, request.headers);
+
+    if (expectedToken === null) {
+      return yield* new Forbidden({
+        message:
+          "The Worker does not have STATEFUL_CI_TRANSFER_SECRET configured, so object downloads and uploads are disabled. Configure the transfer secret and retry.",
+      });
+    }
+
+    if (actualToken === null || expiresAt === null || object === null) {
+      return yield* new Forbidden({
+        message:
+          "The object transfer request did not include complete backend-issued transfer authorization. Restore/save object bytes were not served or stored.",
+      });
+    }
+
+    const expiresAtMillis = Number(expiresAt);
+
+    if (!Number.isSafeInteger(expiresAtMillis)) {
+      return yield* new Forbidden({
+        message:
+          "The object transfer request included an invalid transfer expiration. Restore/save object bytes were not served or stored.",
+      });
+    }
+
+    const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+
+    if (expiresAtMillis <= now) {
+      return yield* new Forbidden({
+        message:
+          "The object transfer authorization expired. Retry restore/save so the backend can issue a fresh object plan.",
+      });
+    }
+
+    const expected = yield* signTransferPayload(
+      expectedToken,
+      transferTokenPayload({
+        digest: object.digest,
+        expiresAt,
+        key,
+        method: request.method,
+        size: object.size,
+      })
+    );
+
+    if (!constantTimeEqual(actualToken, expected)) {
+      return yield* new Forbidden({
+        message:
+          "The object transfer authorization did not match this method, object, digest, size, and expiry. Restore/save object bytes were not served or stored.",
+      });
+    }
+
+    return yield* Effect.void;
+  }
+);
 
 const concatChunks = (chunks: readonly Uint8Array[]) => {
   const bytes = new Uint8Array(
@@ -389,6 +677,24 @@ const verifyRequestIdentity = (
       audience,
       ...(jwks.status === "valid" ? { jwks: jwks.jwks } : {}),
     });
+    const allowedRepositories = allowedRepositoriesForEnv(env);
+
+    if (allowedRepositories.length === 0) {
+      return yield* new GitHubOidcVerificationError({
+        message:
+          "The Worker does not have ALLOWED_REPOSITORIES configured, so restore/save control-plane requests are disabled. Configure a comma-separated repository allowlist such as owner/repo before using Stateful CI.",
+        reason: "unknown_context_denied",
+      });
+    }
+
+    if (
+      !allowedRepositories.includes(canonicalRepository(identity.repository))
+    ) {
+      return yield* new GitHubOidcVerificationError({
+        message: `GitHub repository ${identity.repository} is not allowed to use this Stateful CI backend. Add it to ALLOWED_REPOSITORIES or use the correct backend URL.`,
+        reason: "unknown_context_denied",
+      });
+    }
 
     return { identity } as const;
   });
@@ -537,32 +843,6 @@ const invalidObjectUploadPlanResponse = (path: string) =>
     { status: 400 }
   );
 
-const expectedObjectFromHeaders = (
-  key: SnapshotObjectInventoryEntry["key"],
-  headers: Headers
-) => {
-  const expectedDigest = headers.get("x-stateful-ci-object-digest");
-  const expectedKind = headers.get("x-stateful-ci-object-kind");
-  const expectedSize = headers.get("x-stateful-ci-object-size");
-
-  if (
-    expectedDigest === null ||
-    expectedKind === null ||
-    expectedSize === null
-  ) {
-    return null;
-  }
-
-  const decoded = Schema.decodeUnknownExit(SnapshotObjectInventoryEntry)({
-    digest: expectedDigest,
-    key,
-    kind: expectedKind,
-    size: Number(expectedSize),
-  });
-
-  return Exit.isFailure(decoded) ? null : decoded.value;
-};
-
 const readObjectBody = (request: Request) =>
   Effect.tryPromise({
     catch: () =>
@@ -581,7 +861,7 @@ const handleObjectRoute = Effect.fn("handleObjectRoute")(
     key: SnapshotObjectInventoryEntry["key"]
   ) {
     const blobStore = yield* BlobStore;
-    yield* authorizeRequest(request, env);
+    yield* authorizeObjectTransfer(request, env, key);
 
     if (request.method === "HEAD") {
       const head = yield* blobStore.head(key);
@@ -598,6 +878,13 @@ const handleObjectRoute = Effect.fn("handleObjectRoute")(
     }
 
     if (request.method === "GET") {
+      if (
+        !devAuthEnabled(env) &&
+        expectedObjectFromHeaders(key, request.headers) === null
+      ) {
+        return invalidObjectUploadPlanResponse(new URL(request.url).pathname);
+      }
+
       const bytes = yield* blobStore.get(key);
 
       return new Response(bytes, {
@@ -676,7 +963,6 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   env: WorkerEnv | undefined
 ) {
   const coordinator = yield* SnapshotCoordinator;
-  yield* authorizeRequest(request, env);
   const restoreRequest = yield* readProtocolBody(request).pipe(
     Effect.flatMap(parseProtocolJson),
     Effect.flatMap(decodeProtocolPayload(RestoreRequest))
@@ -785,7 +1071,10 @@ const handleRestore = Effect.fn("handleRestore")(function* handleRestoreEffect(
   return Response.json(
     Schema.encodeUnknownSync(RestoreAllowedResponse)({
       decision: "allowed",
-      downloadPlan: downloadPlanForObjects(restore.objects),
+      downloadPlan: yield* withTransferHeaders(
+        env,
+        downloadPlanForObjects(restore.objects)
+      ),
       manifest: restore.manifest,
       save:
         restore.saveTarget === null
@@ -808,7 +1097,6 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
     env: WorkerEnv | undefined
   ) {
     const coordinator = yield* SnapshotCoordinator;
-    yield* authorizeRequest(request, env);
     const prepareRequest = yield* readProtocolBody(request).pipe(
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(PrepareSaveRequest))
@@ -890,7 +1178,7 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
         commitTarget: target,
         decision: "allowed",
         expectedHeadGeneration: saveAuthorization.expectedHeadGeneration,
-        missingObjects: missing.plans,
+        missingObjects: yield* withTransferHeaders(env, missing.plans),
         trustClass,
         workspaceId,
       })
@@ -904,7 +1192,6 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
     env: WorkerEnv | undefined
   ) {
     const coordinator = yield* SnapshotCoordinator;
-    yield* authorizeRequest(request, env);
     const commitRequest = yield* readProtocolBody(request).pipe(
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(CommitSaveRequest))
@@ -991,9 +1278,8 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
 const handleLegacySave = Effect.fn("handleLegacySave")(
   function* handleLegacySaveEffect(
     request: Request,
-    env: WorkerEnv | undefined
+    _env: WorkerEnv | undefined
   ) {
-    yield* authorizeRequest(request, env);
     yield* readProtocolBody(request).pipe(
       Effect.flatMap(parseProtocolJson),
       Effect.flatMap(decodeProtocolPayload(Schema.Unknown))

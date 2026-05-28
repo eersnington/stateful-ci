@@ -1,0 +1,27 @@
+name: Stateful CI
+description: "Restore or save Stateful CI workspace snapshots using GitHub OIDC. Workflows must grant id-token: write and contents: read."
+inputs:
+  command:
+    description: "Command to run: restore or save."
+    required: false
+    default: restore
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+    - name: Install Stateful CI action dependencies
+      shell: bash
+      run: bun install --cwd "$GITHUB_ACTION_PATH" --frozen-lockfile
+    - name: Run Stateful CI
+      shell: bash
+      env:
+        STATEFUL_CI_COMMAND: ${{ inputs.command }}
+      run: |
+        case "$STATEFUL_CI_COMMAND" in
+          restore|save) ;;
+          *)
+            printf 'Unsupported Stateful CI command. Expected one of: restore, save.\n' >&2
+            exit 1
+            ;;
+        esac
+        bun "$GITHUB_ACTION_PATH/packages/stateful-ci/src/cli.ts" "$STATEFUL_CI_COMMAND"
