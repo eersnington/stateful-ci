@@ -5,6 +5,7 @@ import {
   PackKey,
   RestoreAllowedResponse,
   PrepareSaveAllowedResponse,
+  PrepareSaveDeniedResponse,
   CommitSaveResponse,
   HeadGeneration,
   RunId,
@@ -29,47 +30,56 @@ let signedOidcToken = "";
 let signedOidcJwksJson = "";
 let featureOidcToken = "";
 let pullRequestOidcToken = "";
+let pullRequestTargetOidcToken = "";
 let releaseOidcToken = "";
 
-const setupOidcTokens = async () => {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const signed = await Effect.runPromise(
-    createSignedGitHubOidcToken(githubOidcClaims(nowSeconds), "main-key")
+const setupOidcTokens = Effect.gen(function* setupOidcTokensEffect() {
+  const nowSeconds = Math.floor(
+    (yield* Effect.clockWith((clock) => clock.currentTimeMillis)) / 1000
+  );
+  const signed = yield* createSignedGitHubOidcToken(
+    githubOidcClaims(nowSeconds),
+    "main-key"
   );
   signedOidcToken = signed.token;
-  const featureSigned = await Effect.runPromise(
-    createSignedGitHubOidcToken(
-      githubOidcClaims(nowSeconds, {
-        ref: "refs/heads/feature",
-        sub: "repo:eersnington/stateful-ci:ref:refs/heads/feature",
-      }),
-      "feature-key"
-    )
+  const featureSigned = yield* createSignedGitHubOidcToken(
+    githubOidcClaims(nowSeconds, {
+      ref: "refs/heads/feature",
+      sub: "repo:eersnington/stateful-ci:ref:refs/heads/feature",
+    }),
+    "feature-key"
   );
   featureOidcToken = featureSigned.token;
-  const pullRequestSigned = await Effect.runPromise(
-    createSignedGitHubOidcToken(
-      githubOidcClaims(nowSeconds, {
-        base_ref: "main",
-        event_name: "pull_request",
-        head_ref: "feature",
-        ref: "refs/pull/12/merge",
-        sub: "repo:eersnington/stateful-ci:pull_request",
-      }),
-      "pull-request-key"
-    )
+  const pullRequestSigned = yield* createSignedGitHubOidcToken(
+    githubOidcClaims(nowSeconds, {
+      base_ref: "main",
+      event_name: "pull_request",
+      head_ref: "feature",
+      ref: "refs/pull/12/merge",
+      sub: "repo:eersnington/stateful-ci:pull_request",
+    }),
+    "pull-request-key"
   );
   pullRequestOidcToken = pullRequestSigned.token;
-  const releaseSigned = await Effect.runPromise(
-    createSignedGitHubOidcToken(
-      githubOidcClaims(nowSeconds, {
-        event_name: "release",
-        ref: "refs/tags/v1.0.0",
-        ref_type: "tag",
-        sub: "repo:eersnington/stateful-ci:ref:refs/tags/v1.0.0",
-      }),
-      "release-key"
-    )
+  const pullRequestTargetSigned = yield* createSignedGitHubOidcToken(
+    githubOidcClaims(nowSeconds, {
+      base_ref: "main",
+      event_name: "pull_request_target",
+      head_ref: "feature",
+      ref: "refs/heads/main",
+      sub: "repo:eersnington/stateful-ci:pull_request",
+    }),
+    "pull-request-target-key"
+  );
+  pullRequestTargetOidcToken = pullRequestTargetSigned.token;
+  const releaseSigned = yield* createSignedGitHubOidcToken(
+    githubOidcClaims(nowSeconds, {
+      event_name: "release",
+      ref: "refs/tags/v1.0.0",
+      ref_type: "tag",
+      sub: "repo:eersnington/stateful-ci:ref:refs/tags/v1.0.0",
+    }),
+    "release-key"
   );
   releaseOidcToken = releaseSigned.token;
   signedOidcJwksJson = JSON.stringify({
@@ -77,10 +87,11 @@ const setupOidcTokens = async () => {
       ...signed.jwks.keys,
       ...featureSigned.jwks.keys,
       ...pullRequestSigned.jwks.keys,
+      ...pullRequestTargetSigned.jwks.keys,
       ...releaseSigned.jwks.keys,
     ],
   });
-};
+});
 
 const oidcIdentityFor = (token: () => string) => ({
   provider: "github-actions" as const,
@@ -311,20 +322,20 @@ const jsonRequest = (path: string, body: unknown) =>
     method: "POST",
   });
 
-const seededBlobStore = () =>
-  createInMemoryBlobStore(
-    new Map<SnapshotObjectKey, Uint8Array>([
-      [Schema.decodeSync(ManifestKey)(seededManifestKey), seededManifestBytes],
-      [Schema.decodeSync(PackKey)(seededPackKey), seededPackBytes],
-      [Schema.decodeSync(ChunkKey)(seededChunkKey), seededChunkBytes],
-    ])
-  );
+const seededObjectBytes = () =>
+  new Map<SnapshotObjectKey, Uint8Array>([
+    [Schema.decodeSync(ManifestKey)(seededManifestKey), seededManifestBytes],
+    [Schema.decodeSync(PackKey)(seededPackKey), seededPackBytes],
+    [Schema.decodeSync(ChunkKey)(seededChunkKey), seededChunkBytes],
+  ]);
+
+const seededBlobStore = () => createInMemoryBlobStore(seededObjectBytes());
 
 const failingHeadBlobStore = () =>
   createInMemoryBlobStore(new Map(), { failHead: true });
 
 describe("worker API", () => {
-  beforeAll(setupOidcTokens);
+  beforeAll(() => Effect.runPromise(setupOidcTokens));
 
   it("GET /health returns protocol health", async () => {
     const response = await handleFetch(
@@ -398,6 +409,49 @@ describe("worker API", () => {
         bytes
       );
     })
+  );
+
+  it.effect(
+    "PUT /v1/objects rejects overwriting existing different bytes",
+    () =>
+      Effect.gen(function* objectRouteRejectsImmutableConflictsEffect() {
+        const blobStore = createInMemoryBlobStore(
+          new Map([
+            [
+              Schema.decodeSync(ManifestKey)(seededManifestKey),
+              new TextEncoder().encode("corrupt!"),
+            ],
+          ])
+        );
+        const response = yield* Effect.promise(() =>
+          handleFetch(
+            new Request(
+              `https://stateful-ci.test/v1/objects/${seededManifestKey}`,
+              {
+                body: seededManifestBytes,
+                headers: {
+                  authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+                  "content-length": String(seededManifestBytes.byteLength),
+                  "x-stateful-ci-object-digest": seededManifestDigest,
+                  "x-stateful-ci-object-kind": "manifest",
+                  "x-stateful-ci-object-size": String(
+                    seededManifestBytes.byteLength
+                  ),
+                },
+                method: "PUT",
+              }
+            ),
+            env,
+            { blobStore }
+          )
+        );
+
+        assert.strictEqual(response.status, 409);
+        assert.deepInclude(yield* Effect.promise(() => response.json()), {
+          _tag: "BlobStoreError",
+          reason: "conflict",
+        });
+      })
   );
 
   it("PUT /v1/objects rejects non-canonical keys and digest mismatches", async () => {
@@ -1081,6 +1135,107 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("POST /v1/save/prepare denies fork pull request writes", () =>
+    Effect.gen(function* prepareDeniesForkPullRequestWritesEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/prepare", {
+            client: externalPullRequest.client,
+            git: externalPullRequest.git,
+            github: externalPullRequest.github,
+            idempotencyKey: "run-123456789-save",
+            identity: externalPullRequest.identity,
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_external_prepare",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            workspace: externalPullRequest.workspace,
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(PrepareSaveDeniedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const audit = yield* metadata.listAuditEvents();
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "external_save_disabled",
+        trustClass: "external",
+        workspaceId: workspaceIdFor(
+          seededNamespace,
+          "external/refs-pull-12-merge/latest"
+        ),
+      });
+      assert.deepInclude(audit.at(-1), {
+        decision: "denied",
+        eventType: "prepare-save",
+        reason: "external_save_disabled",
+        trustClass: "external",
+      });
+    })
+  );
+
+  it.effect("POST /v1/save/prepare denies pull_request_target writes", () =>
+    Effect.gen(function* prepareDeniesPullRequestTargetWritesEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/prepare", {
+            client: restoreRequest.client,
+            git: {
+              ...restoreRequest.git,
+              baseRef: "main",
+              headRef: "feature",
+              headRepo: "eersnington/stateful-ci",
+            },
+            github: { ...restoreRequest.github, event: "pull_request_target" },
+            idempotencyKey: "run-123456789-save",
+            identity: oidcIdentityFor(() => pullRequestTargetOidcToken),
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_pull_request_target_prepare",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            workspace: restoreRequest.workspace,
+          }),
+          env,
+          { blobStore: createInMemoryBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(PrepareSaveDeniedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const audit = yield* metadata.listAuditEvents();
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "pull_request_target_denied",
+        trustClass: "unknown",
+        workspaceId: workspaceIdFor(seededNamespace, "unknown/main/latest"),
+      });
+      assert.strictEqual(audit.length, 1);
+      assert.deepInclude(audit[0], {
+        decision: "denied",
+        eventType: "prepare-save",
+        reason: "pull_request_target_denied",
+        trustClass: "unknown",
+      });
+    })
+  );
+
   it("POST /v1/save/prepare returns backend failure when object HEAD fails", async () => {
     const response = await handleFetch(
       jsonRequest("/v1/save/prepare", {
@@ -1221,6 +1376,57 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("POST /v1/save/commit denies pull_request_target writes", () =>
+    Effect.gen(function* commitDeniesPullRequestTargetWritesEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save-pull-request-target",
+            identity: oidcIdentityFor(() => pullRequestTargetOidcToken),
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: seededManifestBytes.byteLength,
+              snapshotId: "snap_pull_request_target_commit",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          env,
+          { blobStore: failingHeadBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_pull_request_target_commit")
+      );
+      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+      const audit = yield* metadata.listAuditEvents();
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "pull_request_target_denied",
+      });
+      assert.isNull(header);
+      assert.isNull(ref);
+      assert.deepInclude(audit.at(-1), {
+        decision: "denied",
+        eventType: "commit",
+        reason: "pull_request_target_denied",
+        trustClass: "unknown",
+      });
+    })
+  );
+
   it.effect("POST /v1/save/commit validates object presence", () =>
     Effect.gen(function* commitValidatesObjectsEffect() {
       const metadata = createInMemoryMetadataBackend({
@@ -1268,6 +1474,127 @@ describe("worker API", () => {
       assert.deepStrictEqual(body, {
         decision: "denied",
         reason: "snapshot_object_missing",
+      });
+      assert.isNull(header);
+    })
+  );
+
+  it.effect("POST /v1/save/commit rejects each missing object kind", () =>
+    Effect.gen(function* commitRejectsEachMissingObjectKindEffect() {
+      for (const missingKind of ["manifest", "pack", "chunk"] as const) {
+        const metadata = createInMemoryMetadataBackend({
+          workspaceTargets: [
+            {
+              namespace: seededNamespace,
+              refName: seededRefName,
+              runId: Schema.decodeSync(RunId)("123456789"),
+              trustClass: "trusted",
+              workspaceId: seededWorkspaceId,
+            },
+          ],
+        });
+        const bytes = seededObjectBytes();
+
+        for (const object of seededSnapshot.objects) {
+          if (object.kind === missingKind) {
+            bytes.delete(object.key);
+          }
+        }
+
+        const response = yield* Effect.promise(() =>
+          handleFetch(
+            jsonRequest("/v1/save/commit", {
+              baseSnapshotId: null,
+              expectedHeadGeneration: 0,
+              idempotencyKey: `run-123456789-save-${missingKind}`,
+              identity: restoreRequest.identity,
+              manifest: {
+                digest: seededManifestDigest,
+                key: seededManifestKey,
+                size: 8,
+                snapshotId: `snap_missing_${missingKind}`,
+              },
+              objects: seededSnapshot.objects,
+              protocolVersion: 1,
+              runId: "123456789",
+              target: { namespace: seededNamespace, refName: seededRefName },
+              workspaceId: seededWorkspaceId,
+            }),
+            env,
+            { blobStore: createInMemoryBlobStore(bytes), metadata }
+          )
+        );
+        const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+          yield* Effect.promise(() => response.json())
+        );
+        const header = yield* metadata.getSnapshotHeader(
+          Schema.decodeSync(SnapshotId)(`snap_missing_${missingKind}`)
+        );
+
+        assert.strictEqual(response.status, 200);
+        assert.deepStrictEqual(body, {
+          decision: "denied",
+          reason: "snapshot_object_missing",
+        });
+        assert.isNull(header);
+      }
+    })
+  );
+
+  it.effect("POST /v1/save/commit rejects stored object size mismatches", () =>
+    Effect.gen(function* commitRejectsStoredObjectSizeMismatchEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        workspaceTargets: [
+          {
+            namespace: seededNamespace,
+            refName: seededRefName,
+            runId: Schema.decodeSync(RunId)("123456789"),
+            trustClass: "trusted",
+            workspaceId: seededWorkspaceId,
+          },
+        ],
+      });
+      const bytes = seededObjectBytes();
+
+      bytes.set(
+        Schema.decodeSync(PackKey)(seededPackKey),
+        new TextEncoder().encode("pack-too-large")
+      );
+
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: null,
+            expectedHeadGeneration: 0,
+            idempotencyKey: "run-123456789-save-size-mismatch",
+            identity: restoreRequest.identity,
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: "snap_size_mismatch",
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            runId: "123456789",
+            target: { namespace: seededNamespace, refName: seededRefName },
+            workspaceId: seededWorkspaceId,
+          }),
+          env,
+          { blobStore: createInMemoryBlobStore(bytes), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_size_mismatch")
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(body, {
+        decision: "denied",
+        reason: "snapshot_object_mismatch",
       });
       assert.isNull(header);
     })

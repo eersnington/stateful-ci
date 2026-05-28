@@ -1136,6 +1136,23 @@ const handlePrepareSave = Effect.fn("handlePrepareSave")(
     const runId = Schema.decodeSync(RunId)(verified.identity.runId);
     const expiresAt = yield* currentIsoTimestamp;
     const auditPayloadJson = identityAuditPayload(verified.identity, null);
+
+    if (verified.identity.event === "pull_request_target") {
+      yield* recordPrepareDeniedAudit({
+        auditPayloadJson,
+        reason: "pull_request_target_denied",
+        runId,
+        target,
+        trustClass,
+        workspaceId,
+      });
+      return denyPrepareSave(
+        "pull_request_target_denied",
+        trustClass,
+        workspaceId
+      );
+    }
+
     const missing = yield* missingObjectPlans(prepareRequest.objects).pipe(
       Effect.matchEffect({
         onFailure: (error) =>
@@ -1220,6 +1237,10 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
     }
 
     if (verified.identity.runId !== commitRequest.runId) {
+      const trustClass = classifyVerifiedGitHubTrust(verified.identity, {
+        trustedRefs: trustedRefsForEnv(env),
+      });
+
       yield* recordCommitDeniedAudit({
         payloadJson: identityAuditPayload(
           verified.identity,
@@ -1227,11 +1248,26 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
         ),
         reason: "save_run_context_mismatch",
         request: commitRequest,
-        trustClass: classifyVerifiedGitHubTrust(verified.identity, {
-          trustedRefs: trustedRefsForEnv(env),
-        }),
+        trustClass,
       });
       return commitDeniedResponse("save_run_context_mismatch");
+    }
+
+    const trustClass = classifyVerifiedGitHubTrust(verified.identity, {
+      trustedRefs: trustedRefsForEnv(env),
+    });
+
+    if (verified.identity.event === "pull_request_target") {
+      yield* recordCommitDeniedAudit({
+        payloadJson: identityAuditPayload(
+          verified.identity,
+          "pull_request_target_denied"
+        ),
+        reason: "pull_request_target_denied",
+        request: commitRequest,
+        trustClass,
+      });
+      return commitDeniedResponse("pull_request_target_denied");
     }
 
     const objectValidation = yield* validateObjectsPresent(
@@ -1251,9 +1287,7 @@ const handleCommitSave = Effect.fn("handleCommitSave")(
         payloadJson: identityAuditPayload(verified.identity, null),
         reason: objectValidation.reason,
         request: commitRequest,
-        trustClass: classifyVerifiedGitHubTrust(verified.identity, {
-          trustedRefs: trustedRefsForEnv(env),
-        }),
+        trustClass,
       });
       return commitDeniedResponse(objectValidation.reason);
     }

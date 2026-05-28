@@ -1,8 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
+import { Result, Schema } from "effect";
 
 import {
   largeChunkSizeBytes,
   maxPackInputBytes,
+  PackIndex,
   packFormatVersion,
   packHeaderLength,
   packMagic,
@@ -84,5 +86,43 @@ describe("snapshot pack and chunk planning", () => {
       largeChunkSizeBytes * 2,
     ]);
     expect(first).toStrictEqual(second);
+  });
+
+  it("PackIndex validates indexed gzip entries", () => {
+    const entry = {
+      compressedLength: 24,
+      compressedOffset: 0,
+      compression: "gzip",
+      entryDigest: digestWithPrefix("aa", 1),
+      uncompressedSize: 7,
+    };
+    const index = {
+      compression: "gzip",
+      entries: [entry],
+      formatVersion: 1,
+    };
+
+    expect(Schema.decodeUnknownSync(PackIndex)(index)).toStrictEqual(index);
+    expect(
+      Result.isFailure(
+        Schema.decodeUnknownResult(PackIndex)({
+          ...index,
+          entries: [
+            {
+              ...entry,
+              compressedOffset: -1,
+            },
+          ],
+        })
+      )
+    ).toBeTruthy();
+    expect(
+      Result.isFailure(
+        Schema.decodeUnknownResult(PackIndex)({
+          ...index,
+          compression: "none",
+        })
+      )
+    ).toBeTruthy();
   });
 });
