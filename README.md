@@ -87,17 +87,24 @@ bunx stateful-ci deploy
 Use it in GitHub Actions:
 
 ```yaml
-- uses: eersnington/stateful-ci@v1
-  with:
-    command: restore
+permissions:
+  contents: read
+  id-token: write
 
-- run: bun install
-- run: bun test
+steps:
+  - uses: actions/checkout@v4
 
-- uses: eersnington/stateful-ci@v1
-  if: always()
-  with:
-    command: save
+  - uses: eersnington/stateful-ci@v1
+    with:
+      command: restore
+
+  - run: bun install
+  - run: bun test
+
+  - uses: eersnington/stateful-ci@v1
+    if: always()
+    with:
+      command: save
 ```
 
 Inspect local state and published CI runs with TUI (OpenTUI):

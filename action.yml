@@ -2,7 +2,7 @@ name: Stateful CI
 description: "Restore or save Stateful CI workspace snapshots using GitHub OIDC. Workflows must grant id-token: write and contents: read."
 inputs:
   command:
-    description: "Command to run: restore, save, init, deploy, or dashboard."
+    description: "Command to run: restore or save."
     required: false
     default: restore
 runs:
@@ -18,9 +18,9 @@ runs:
         STATEFUL_CI_COMMAND: ${{ inputs.command }}
       run: |
         case "$STATEFUL_CI_COMMAND" in
-          restore|save|init|deploy|dashboard) ;;
+          restore|save) ;;
           *)
-            printf 'Unsupported Stateful CI command: %s\n' "$STATEFUL_CI_COMMAND" >&2
+            printf 'Unsupported Stateful CI command. Expected one of: restore, save.\n' >&2
             exit 1
             ;;
         esac

@@ -83,6 +83,7 @@ interface PreparedLocalSave {
 
 const restoreSessionFile = ".stateful-ci/restore-session.json";
 const deployWranglerConfigFile = ".stateful-ci/deploy/wrangler.toml";
+const deployResourceNamePattern = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u;
 const defaultOidcAudience = "stateful-ci";
 
 const execFilePromise = promisify(execFile);
@@ -246,6 +247,22 @@ const requiredDeployEnv = (env: RuntimeEnv, key: string) => {
         )
       )
     : Effect.succeed(value);
+};
+
+const deployResourceNameFromEnv = (
+  env: RuntimeEnv,
+  key: string,
+  fallback: string
+) => {
+  const value = optionalEnv(env, key) ?? fallback;
+
+  return deployResourceNamePattern.test(value)
+    ? Effect.succeed(value)
+    : Effect.fail(
+        cliFailure(
+          `${key} must use 3-63 lowercase letters, numbers, dots, or hyphens, and must start and end with a letter or number. Refusing to pass an invalid resource name to Wrangler.`
+        )
+      );
 };
 
 const protocolUrl = (api: ApiConfig, route: string) =>
@@ -1056,10 +1073,16 @@ export const deployProgramWithRunner = (
   runStep: DeployStepRunner
 ) =>
   Effect.gen(function* deployProgramEffect() {
-    const bucket =
-      optionalEnv(env, "STATEFUL_CI_R2_BUCKET") ?? "stateful-ci-objects";
-    const database =
-      optionalEnv(env, "STATEFUL_CI_D1_DATABASE") ?? "stateful-ci-metadata";
+    const bucket = yield* deployResourceNameFromEnv(
+      env,
+      "STATEFUL_CI_R2_BUCKET",
+      "stateful-ci-objects"
+    );
+    const database = yield* deployResourceNameFromEnv(
+      env,
+      "STATEFUL_CI_D1_DATABASE",
+      "stateful-ci-metadata"
+    );
     const allowedRepositories = yield* requiredDeployEnv(
       env,
       "STATEFUL_CI_ALLOWED_REPOSITORIES"

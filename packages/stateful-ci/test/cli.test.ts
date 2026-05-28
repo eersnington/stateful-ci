@@ -1416,6 +1416,44 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         );
       })
     );
+
+    it.effect("rejects invalid R2 bucket names before provisioning", () =>
+      Effect.gen(function* deployRejectsInvalidBucketNamesEffect() {
+        const calls: DeployStepCall[] = [];
+        const error = yield* Effect.flip(
+          deployProgramWithRunner(
+            { ...deployEnv, STATEFUL_CI_R2_BUCKET: "--bad-bucket" },
+            (call) => {
+              calls.push(call);
+              return Effect.succeed({ stderr: "", stdout: "" });
+            }
+          )
+        );
+
+        assert.strictEqual(error._tag, "CliFailure");
+        assert.include(error.message, "STATEFUL_CI_R2_BUCKET must use");
+        assert.deepStrictEqual(calls, []);
+      })
+    );
+
+    it.effect("rejects invalid D1 database names before provisioning", () =>
+      Effect.gen(function* deployRejectsInvalidDatabaseNamesEffect() {
+        const calls: DeployStepCall[] = [];
+        const error = yield* Effect.flip(
+          deployProgramWithRunner(
+            { ...deployEnv, STATEFUL_CI_D1_DATABASE: "bad database" },
+            (call) => {
+              calls.push(call);
+              return Effect.succeed({ stderr: "", stdout: "" });
+            }
+          )
+        );
+
+        assert.strictEqual(error._tag, "CliFailure");
+        assert.include(error.message, "STATEFUL_CI_D1_DATABASE must use");
+        assert.deepStrictEqual(calls, []);
+      })
+    );
   });
 
   describe("dashboard", () => {
