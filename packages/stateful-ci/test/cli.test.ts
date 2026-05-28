@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { fileURLToPath } from "node:url";
 
 import { NodeServices } from "@effect/platform-node";
 import { assert, describe, layer } from "@effect/vitest";
@@ -62,6 +63,7 @@ const deployConfigPath = new URL(
   "../../../.stateful-ci/deploy/wrangler.toml",
   import.meta.url
 );
+const deployConfigFsPath = fileURLToPath(deployConfigPath);
 
 const cleanupDeployConfig = () =>
   Effect.tryPromise({
@@ -1337,7 +1339,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         yield* deployProgramWithRunner(deployEnv, runner);
 
         const fs = yield* FileSystem.FileSystem;
-        const config = yield* fs.readFileString(deployConfigPath.pathname);
+        const config = yield* fs.readFileString(deployConfigFsPath);
 
         assert.deepStrictEqual(
           calls.map((call) => call.args),
@@ -1353,7 +1355,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
               "stateful-ci-metadata",
               "--remote",
               "--config",
-              deployConfigPath.pathname,
+              deployConfigFsPath,
             ],
             [
               "wrangler",
@@ -1361,9 +1363,9 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
               "put",
               "STATEFUL_CI_TRANSFER_SECRET",
               "--config",
-              deployConfigPath.pathname,
+              deployConfigFsPath,
             ],
-            ["wrangler", "deploy", "--config", deployConfigPath.pathname],
+            ["wrangler", "deploy", "--config", deployConfigFsPath],
           ]
         );
         assert.strictEqual(calls[4]?.stdin, "test-transfer-secret\n");

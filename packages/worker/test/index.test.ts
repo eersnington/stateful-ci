@@ -964,6 +964,26 @@ describe("worker API", () => {
     });
   });
 
+  it("POST /v1/restore accepts mixed-case repository allowlist entries", async () => {
+    const response = await handleFetch(
+      jsonRequest("/v1/restore", restoreRequest),
+      {
+        ALLOWED_REPOSITORIES: "Eersnington/Stateful-CI",
+        STATEFUL_CI_GITHUB_JWKS_JSON: env.STATEFUL_CI_GITHUB_JWKS_JSON,
+        STATEFUL_CI_TRANSFER_SECRET: env.STATEFUL_CI_TRANSFER_SECRET,
+      },
+      { metadata: createInMemoryMetadataBackend() }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      decision: "denied",
+      reason: "no_compatible_snapshot",
+      save: { allowed: true, target: seededRefName },
+      trustClass: "trusted",
+    });
+  });
+
   it("POST /v1/save/prepare fails closed with malformed configured JWKS", async () => {
     const response = await worker.fetch(
       jsonRequest("/v1/save/prepare", {

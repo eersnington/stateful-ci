@@ -170,10 +170,12 @@ const configuredList = (source: string | undefined) =>
     .map((value) => value.trim())
     .filter((value) => value.length > 0) ?? [];
 
+const canonicalRepository = (repository: string) => repository.toLowerCase();
+
 const allowedRepositoriesForEnv = (env: WorkerEnv | undefined) =>
   configuredList(
     env?.ALLOWED_REPOSITORIES ?? env?.STATEFUL_CI_ALLOWED_REPOSITORIES
-  );
+  ).map(canonicalRepository);
 
 const oidcAudienceForEnv = (env: WorkerEnv | undefined) => {
   const configured = (env?.OIDC_AUDIENCE ?? env?.STATEFUL_CI_OIDC_AUDIENCE)
@@ -685,7 +687,9 @@ const verifyRequestIdentity = (
       });
     }
 
-    if (!allowedRepositories.includes(identity.repository)) {
+    if (
+      !allowedRepositories.includes(canonicalRepository(identity.repository))
+    ) {
       return yield* new GitHubOidcVerificationError({
         message: `GitHub repository ${identity.repository} is not allowed to use this Stateful CI backend. Add it to ALLOWED_REPOSITORIES or use the correct backend URL.`,
         reason: "unknown_context_denied",

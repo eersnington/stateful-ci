@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { rm } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 
 import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import type {
@@ -86,7 +86,6 @@ const deployWranglerConfigFile = ".stateful-ci/deploy/wrangler.toml";
 const deployResourceNamePattern = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u;
 const defaultOidcAudience = "stateful-ci";
 
-const execFilePromise = promisify(execFile);
 const repositoryRootDirectory = fileURLToPath(
   new URL("../../..", import.meta.url)
 );
@@ -169,6 +168,9 @@ const commandOutputForError = (error: unknown) => {
 
   return output.length === 0 ? "" : `\nWrangler output:\n${output}`;
 };
+
+const textFromChunks = (chunks: readonly Uint8Array[]) =>
+  Buffer.concat(chunks).toString("utf-8");
 
 const jsonArray = (value: unknown) => (Array.isArray(value) ? value : null);
 
@@ -956,22 +958,54 @@ const runDeployStep: DeployStepRunner = Effect.fn("runDeployStep")(
     readonly args: readonly string[];
     readonly stdin?: string;
   }) {
-    const result = yield* Effect.tryPromise({
+    return yield* Effect.tryPromise({
       catch: (error) =>
         cliFailure(
           `Deploy step failed while running bunx ${input.args.join(" ")}. Stateful CI backend resources may be partially provisioned; fix the reported Cloudflare/Wrangler issue and rerun stateful-ci deploy.${commandOutputForError(error)}`
         ),
-      try: () =>
-        execFilePromise("bunx", [...input.args], {
+      try: async () => {
+        const stdoutChunks: Uint8Array[] = [];
+        const stderrChunks: Uint8Array[] = [];
+        const child = spawn("bunx", [...input.args], {
           cwd: repositoryRootDirectory,
-          ...(input.stdin === undefined ? {} : { input: input.stdin }),
-        }),
-    });
+          stdio: "pipe",
+        });
 
-    return {
-      stderr: textFromUnknown(result.stderr),
-      stdout: textFromUnknown(result.stdout),
-    };
+        child.stdout.on("data", (chunk: Uint8Array) => {
+          stdoutChunks.push(chunk);
+        });
+        child.stderr.on("data", (chunk: Uint8Array) => {
+          stderrChunks.push(chunk);
+        });
+        child.stdin.end(input.stdin ?? "");
+
+        const result = await Promise.race([
+          once(child, "close").then(([code]) => ({
+            _tag: "close" as const,
+            code: typeof code === "number" ? code : null,
+          })),
+          once(child, "error").then(([error]) => ({
+            _tag: "error" as const,
+            error: error instanceof Error ? error : new Error(String(error)),
+          })),
+        ]);
+        const stderr = textFromChunks(stderrChunks);
+        const stdout = textFromChunks(stdoutChunks);
+
+        if (result._tag === "error") {
+          throw Object.assign(result.error, { stderr, stdout });
+        }
+
+        if (result.code === 0) {
+          return { stderr, stdout };
+        }
+
+        throw Object.assign(new Error(`bunx exited with code ${result.code}`), {
+          stderr,
+          stdout,
+        });
+      },
+    });
   }
 );
 
