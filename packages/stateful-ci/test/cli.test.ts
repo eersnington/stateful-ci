@@ -455,6 +455,46 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         )
     );
 
+    it.effect(
+      "fails when denied restore allows save without a workspace target",
+      () =>
+        withWorkspace(setupRestoreWorkspace, ({ fs, path, root }) =>
+          Effect.gen(
+            function* restoreRejectsSaveWithoutWorkspaceTargetEffect() {
+              const error = yield* Effect.flip(
+                withProtocolServer(
+                  () =>
+                    Response.json(
+                      Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                        decision: "denied",
+                        reason: "backend_policy_not_configured",
+                        save: { allowed: true, target: "trusted/main/latest" },
+                        trustClass: "trusted",
+                      })
+                    ),
+                  (url) =>
+                    restoreProgram({
+                      ...githubEnv,
+                      STATEFUL_CI_API_TOKEN: "test-token",
+                      STATEFUL_CI_API_URL: url,
+                    })
+                )
+              );
+              const missingSession = yield* Effect.flip(
+                fs.readFileString(
+                  path.join(root, ".stateful-ci/restore-session.json")
+                )
+              );
+
+              assert.strictEqual(error._tag, "CliFailure");
+              assert.include(error.message, "allowed save");
+              assert.include(error.message, "workspaceId");
+              assert.strictEqual(missingSession._tag, "PlatformError");
+            }
+          )
+        )
+    );
+
     it.effect("fails before network calls when API URL is missing", () =>
       withWorkspace(setupRestoreWorkspace, () =>
         Effect.gen(function* restoreFailsWithoutApiUrlEffect() {

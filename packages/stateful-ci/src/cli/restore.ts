@@ -52,6 +52,18 @@ const restoreProgramEffect = Effect.fn("restoreProgram")(
       responseText
     );
 
+    if (
+      response.decision === "denied" &&
+      response.save.allowed &&
+      response.workspaceId === undefined
+    ) {
+      return yield* Effect.fail(
+        cliFailure(
+          "The backend allowed save, but did not return a workspace target. Save cannot proceed without a workspaceId; retry stateful-ci restore or check that client and backend versions match."
+        )
+      );
+    }
+
     if (response.decision === "allowed") {
       if (response.downloadPlan.length === 0) {
         return yield* Effect.fail(
