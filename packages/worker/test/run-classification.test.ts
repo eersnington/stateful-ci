@@ -67,7 +67,11 @@ describe("verified run classification", () => {
       })
     ).toBe("unknown");
     expect(
-      classifyVerifiedGitHubTrust({ ...identity, ref: "refs/tags/v1.0.0" })
+      classifyVerifiedGitHubTrust({
+        ...identity,
+        ref: "refs/tags/v1.0.0",
+        refType: "tag",
+      })
     ).toBe("unknown");
   });
 

@@ -657,6 +657,44 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("POST /v1/restore accepts dev bearer auth without OIDC", () =>
+    Effect.gen(function* restoreAcceptsDevBearerAuthWithoutOidcEffect() {
+      const internalRefName = "internal/main/latest";
+      const internalSnapshotId = "snap_dev_restore";
+      const metadata = createInMemoryMetadataBackend({
+        refs: [refFor(internalRefName, internalSnapshotId, "internal")],
+        snapshots: [
+          snapshotFor(
+            internalSnapshotId,
+            "internal",
+            workspaceIdFor(seededNamespace, internalRefName)
+          ),
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/restore", {
+            ...restoreRequest,
+            identity: undefined,
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(body.decision, "allowed");
+      assert.strictEqual(body.trustClass, "internal");
+      assert.strictEqual(
+        body.workspaceId,
+        workspaceIdFor(seededNamespace, internalRefName)
+      );
+    })
+  );
+
   it("POST /v1/restore treats same-repo pull requests as external without verified PR metadata", async () => {
     const metadata = createInMemoryMetadataBackend({
       refs: [seededRef],
@@ -1089,6 +1127,73 @@ describe("worker API", () => {
     })
   );
 
+  it.effect("POST /v1/save prepare and commit accept dev bearer auth", () =>
+    Effect.gen(function* saveAcceptsDevBearerAuthEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const prepareRequest = {
+        client: restoreRequest.client,
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        idempotencyKey: "run-123456789-dev-save",
+        manifest: {
+          digest: seededManifestDigest,
+          key: seededManifestKey,
+          size: 8,
+          snapshotId: "snap_dev_save",
+        },
+        objects: seededSnapshot.objects,
+        protocolVersion: 1,
+        workspace: restoreRequest.workspace,
+      };
+      const prepareResponse = yield* Effect.promise(() =>
+        handleFetch(jsonRequest("/v1/save/prepare", prepareRequest), env, {
+          blobStore: seededBlobStore(),
+          metadata,
+        })
+      );
+      const prepareBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => prepareResponse.json())
+      );
+      const commitResponse = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/save/commit", {
+            baseSnapshotId: prepareBody.baseSnapshotId,
+            expectedHeadGeneration: prepareBody.expectedHeadGeneration,
+            idempotencyKey: prepareRequest.idempotencyKey,
+            manifest: prepareRequest.manifest,
+            objects: prepareRequest.objects,
+            protocolVersion: 1,
+            runId: restoreRequest.github.runId,
+            target: prepareBody.commitTarget,
+            workspaceId: prepareBody.workspaceId,
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const commitBody = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => commitResponse.json())
+      );
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_dev_save")
+      );
+
+      assert.strictEqual(prepareResponse.status, 200);
+      assert.strictEqual(prepareBody.trustClass, "internal");
+      assert.strictEqual(
+        prepareBody.commitTarget.refName,
+        "internal/main/latest"
+      );
+      assert.strictEqual(commitResponse.status, 200);
+      assert.strictEqual(commitBody.decision, "committed");
+      if (commitBody.decision !== "committed") {
+        return yield* Effect.die("Expected committed dev save.");
+      }
+      assert.strictEqual(commitBody.snapshotId, "snap_dev_save");
+      assert.strictEqual(header?.trustClass, "internal");
+    })
+  );
+
   it.effect("POST /v1/save/prepare denies fork pull request writes", () =>
     Effect.gen(function* prepareDeniesForkPullRequestWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
@@ -1320,6 +1425,7 @@ describe("worker API", () => {
         yield* Effect.promise(() => response.json())
       );
       const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+      const audit = yield* metadata.listAuditEvents();
 
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(body, {
@@ -1327,6 +1433,13 @@ describe("worker API", () => {
         reason: "oidc_missing",
       });
       assert.isNull(ref);
+      assert.deepInclude(audit[0], {
+        eventType: "commit",
+        namespace: "unverified/commit-save",
+        refName: "unknown",
+        snapshotId: null,
+        workspaceId: null,
+      });
     })
   );
 
