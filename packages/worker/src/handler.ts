@@ -863,7 +863,7 @@ const recordOidcDeniedAudit = Effect.fn("recordOidcDeniedAudit")(
 );
 
 const unboundCommitDeniedTarget = {
-  namespace: "unverified/commit-save",
+  namespace: "unbound/commit-save",
   refName: "unknown",
 } satisfies RefTarget;
 

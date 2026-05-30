@@ -1435,7 +1435,7 @@ describe("worker API", () => {
       assert.isNull(ref);
       assert.deepInclude(audit[0], {
         eventType: "commit",
-        namespace: "unverified/commit-save",
+        namespace: "unbound/commit-save",
         refName: "unknown",
         snapshotId: null,
         workspaceId: null,
