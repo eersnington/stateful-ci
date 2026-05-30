@@ -400,6 +400,49 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
       )
     );
 
+    it.effect("omits OIDC identity for explicit dev auth", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreOmitsOidcForDevAuthEffect() {
+          const { requests } = yield* withProtocolServer(
+            () =>
+              Response.json(
+                Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                  decision: "denied",
+                  reason: "backend_policy_not_configured",
+                  save: { allowed: false },
+                  trustClass: "unknown",
+                })
+              ),
+            (url) =>
+              restoreProgram({
+                ...githubEnv,
+                STATEFUL_CI_API_TOKEN: "test-token",
+                STATEFUL_CI_API_URL: url,
+                STATEFUL_CI_DEV_AUTH_ENABLED: "true",
+                STATEFUL_CI_OIDC_TOKEN: undefined,
+              })
+          );
+          const [protocolRequest] = requests;
+
+          if (protocolRequest === undefined) {
+            return yield* Effect.die("Expected restore request.");
+          }
+
+          const request = yield* decodeOrDie(
+            RestoreRequest,
+            protocolRequest.body
+          );
+
+          assert.strictEqual(requests.length, 1);
+          assert.strictEqual(
+            protocolRequest.authorization,
+            "Bearer test-token"
+          );
+          assert.strictEqual(request.identity, undefined);
+        })
+      )
+    );
+
     it.effect("reports malformed OIDC acquisition URL as a CLI failure", () =>
       withWorkspace(setupRestoreWorkspace, () =>
         Effect.gen(function* restoreFailsWithMalformedOidcUrlEffect() {
@@ -1121,6 +1164,78 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             String(missingObject.size)
           );
           assert.deepStrictEqual(uploadRequest.bodyBytes, localObjectBytes);
+        })
+      )
+    );
+
+    it.effect("omits OIDC identity for explicit dev auth", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* saveOmitsOidcForDevAuthEffect() {
+          const { requests } = yield* withProtocolServer(
+            (request) => {
+              if (request.url === "/v1/save/prepare") {
+                return Response.json(
+                  Schema.encodeUnknownSync(PrepareSaveResponse)({
+                    baseSnapshotId: null,
+                    commitTarget: {
+                      namespace:
+                        "repo=eersnington/stateful-ci/workflow=ci.yml/config=test",
+                      refName: "internal/main/latest",
+                    },
+                    decision: "allowed",
+                    expectedHeadGeneration: 0,
+                    missingObjects: [],
+                    trustClass: "internal",
+                    workspaceId: "ws_123",
+                  })
+                );
+              }
+
+              return Response.json(
+                Schema.encodeUnknownSync(CommitSaveResponse)({
+                  decision: "denied",
+                  reason: "backend_policy_not_configured",
+                })
+              );
+            },
+            (url) =>
+              saveProgram({
+                ...githubEnv,
+                STATEFUL_CI_API_TOKEN: "test-token",
+                STATEFUL_CI_API_URL: url,
+                STATEFUL_CI_DEV_AUTH_ENABLED: "true",
+                STATEFUL_CI_OIDC_TOKEN: undefined,
+              })
+          );
+          const [prepareProtocolRequest, commitProtocolRequest] = requests;
+
+          if (
+            prepareProtocolRequest === undefined ||
+            commitProtocolRequest === undefined
+          ) {
+            return yield* Effect.die("Expected prepare and commit requests.");
+          }
+
+          const prepareRequest = yield* decodeOrDie(
+            PrepareSaveRequest,
+            prepareProtocolRequest.body
+          );
+          const commitRequest = yield* decodeOrDie(
+            CommitSaveRequest,
+            commitProtocolRequest.body
+          );
+
+          assert.strictEqual(requests.length, 2);
+          assert.strictEqual(
+            prepareProtocolRequest.authorization,
+            "Bearer test-token"
+          );
+          assert.strictEqual(
+            commitProtocolRequest.authorization,
+            "Bearer test-token"
+          );
+          assert.strictEqual(prepareRequest.identity, undefined);
+          assert.strictEqual(commitRequest.identity, undefined);
         })
       )
     );
