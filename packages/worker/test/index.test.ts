@@ -1043,9 +1043,9 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/save/prepare fails closed with malformed configured JWKS", async () => {
+  it("POST /v1/prepare fails closed with malformed configured JWKS", async () => {
     const response = await worker.fetch(
-      jsonRequest("/v1/save/prepare", {
+      jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
         github: restoreRequest.github,
@@ -1075,7 +1075,7 @@ describe("worker API", () => {
     });
   });
 
-  it.effect("POST /v1/save/prepare returns missing upload plans", () =>
+  it.effect("POST /v1/prepare returns missing upload plans", () =>
     Effect.gen(function* prepareReturnsMissingObjectsEffect() {
       const blobStore = createInMemoryBlobStore(
         new Map([
@@ -1088,7 +1088,7 @@ describe("worker API", () => {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/prepare", {
+          jsonRequest("/v1/prepare", {
             client: restoreRequest.client,
             git: restoreRequest.git,
             github: restoreRequest.github,
@@ -1127,7 +1127,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save prepare and commit accept dev bearer auth", () =>
+  it.effect("POST /v1/prepare and /v1/commit accept dev bearer auth", () =>
     Effect.gen(function* saveAcceptsDevBearerAuthEffect() {
       const metadata = createInMemoryMetadataBackend();
       const prepareRequest = {
@@ -1146,7 +1146,7 @@ describe("worker API", () => {
         workspace: restoreRequest.workspace,
       };
       const prepareResponse = yield* Effect.promise(() =>
-        handleFetch(jsonRequest("/v1/save/prepare", prepareRequest), env, {
+        handleFetch(jsonRequest("/v1/prepare", prepareRequest), env, {
           blobStore: seededBlobStore(),
           metadata,
         })
@@ -1156,7 +1156,7 @@ describe("worker API", () => {
       );
       const commitResponse = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: prepareBody.baseSnapshotId,
             expectedHeadGeneration: prepareBody.expectedHeadGeneration,
             idempotencyKey: prepareRequest.idempotencyKey,
@@ -1194,12 +1194,12 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/prepare denies fork pull request writes", () =>
+  it.effect("POST /v1/prepare denies fork pull request writes", () =>
     Effect.gen(function* prepareDeniesForkPullRequestWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/prepare", {
+          jsonRequest("/v1/prepare", {
             client: externalPullRequest.client,
             git: externalPullRequest.git,
             github: externalPullRequest.github,
@@ -1243,12 +1243,12 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/prepare denies pull_request_target writes", () =>
+  it.effect("POST /v1/prepare denies pull_request_target writes", () =>
     Effect.gen(function* prepareDeniesPullRequestTargetWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/prepare", {
+          jsonRequest("/v1/prepare", {
             client: restoreRequest.client,
             git: {
               ...restoreRequest.git,
@@ -1295,9 +1295,9 @@ describe("worker API", () => {
     })
   );
 
-  it("POST /v1/save/prepare returns backend failure when object HEAD fails", async () => {
+  it("POST /v1/prepare returns backend failure when object HEAD fails", async () => {
     const response = await handleFetch(
-      jsonRequest("/v1/save/prepare", {
+      jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
         github: restoreRequest.github,
@@ -1324,9 +1324,9 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/save/prepare fails closed without object storage", async () => {
+  it("POST /v1/prepare fails closed without object storage", async () => {
     const response = await worker.fetch(
-      jsonRequest("/v1/save/prepare", {
+      jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
         github: restoreRequest.github,
@@ -1352,12 +1352,12 @@ describe("worker API", () => {
     });
   });
 
-  it.effect("POST /v1/save/commit validates objects before commit", () =>
+  it.effect("POST /v1/commit validates objects before commit", () =>
     Effect.gen(function* commitValidatesObjectsBeforeCommitEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1385,7 +1385,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit denies unverified production identity", () =>
+  it.effect("POST /v1/commit denies unverified production identity", () =>
     Effect.gen(function* commitDeniesUnverifiedProductionIdentityEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1400,7 +1400,7 @@ describe("worker API", () => {
       });
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1443,12 +1443,12 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit denies pull_request_target writes", () =>
+  it.effect("POST /v1/commit denies pull_request_target writes", () =>
     Effect.gen(function* commitDeniesPullRequestTargetWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save-pull-request-target",
@@ -1494,7 +1494,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit validates object presence", () =>
+  it.effect("POST /v1/commit validates object presence", () =>
     Effect.gen(function* commitValidatesObjectsEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1509,7 +1509,7 @@ describe("worker API", () => {
       });
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1546,7 +1546,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit rejects each missing object kind", () =>
+  it.effect("POST /v1/commit rejects each missing object kind", () =>
     Effect.gen(function* commitRejectsEachMissingObjectKindEffect() {
       for (const missingKind of ["manifest", "pack", "chunk"] as const) {
         const metadata = createInMemoryMetadataBackend({
@@ -1570,7 +1570,7 @@ describe("worker API", () => {
 
         const response = yield* Effect.promise(() =>
           handleFetch(
-            jsonRequest("/v1/save/commit", {
+            jsonRequest("/v1/commit", {
               baseSnapshotId: null,
               expectedHeadGeneration: 0,
               idempotencyKey: `run-123456789-save-${missingKind}`,
@@ -1608,7 +1608,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit rejects stored object size mismatches", () =>
+  it.effect("POST /v1/commit rejects stored object size mismatches", () =>
     Effect.gen(function* commitRejectsStoredObjectSizeMismatchEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1630,7 +1630,7 @@ describe("worker API", () => {
 
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save-size-mismatch",
@@ -1667,7 +1667,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit advances refs through coordinator", () =>
+  it.effect("POST /v1/commit advances refs through coordinator", () =>
     Effect.gen(function* commitDoesNotMutateWithoutCoordinatorEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1682,7 +1682,7 @@ describe("worker API", () => {
       });
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",

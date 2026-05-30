@@ -121,8 +121,8 @@ const printSaveResponse = (
  * Runs the two-phase save protocol.
  *
  * The GitHub OIDC identity is intentionally resolved separately for prepare and
- * commit. `/v1/save/prepare` uses the first identity to authorize the save plan
- * and return any required object uploads. `/v1/save/commit` uses an identity
+ * commit. `/v1/prepare` uses the first identity to authorize the save plan
+ * and return any required object uploads. `/v1/commit` uses an identity
  * resolved after uploads to authorize the final metadata mutation and re-check
  * the GitHub run context.
  *

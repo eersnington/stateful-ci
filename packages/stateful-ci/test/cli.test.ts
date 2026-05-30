@@ -1024,7 +1024,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                 return Response.json({ value: `oidc-${oidcRequestCount}` });
               }
 
-              if (request.url === "/v1/save/prepare") {
+              if (request.url === "/v1/prepare") {
                 const prepareRequest = Schema.decodeUnknownSync(
                   PrepareSaveRequest
                 )(request.body);
@@ -1130,14 +1130,14 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             "/oidc?audience=stateful-ci"
           );
           assert.strictEqual(prepareProtocolRequest.method, "POST");
-          assert.strictEqual(prepareProtocolRequest.url, "/v1/save/prepare");
+          assert.strictEqual(prepareProtocolRequest.url, "/v1/prepare");
           assert.strictEqual(uploadRequest.method, "PUT");
           assert.strictEqual(
             uploadRequest.url,
             `/v1/objects/${missingObject.key}`
           );
           assert.strictEqual(commitProtocolRequest.method, "POST");
-          assert.strictEqual(commitProtocolRequest.url, "/v1/save/commit");
+          assert.strictEqual(commitProtocolRequest.url, "/v1/commit");
           assert.strictEqual(prepareRequest.objects.length > 1, true);
           assert.strictEqual(prepareRequest.github.runId, "123456789");
           assert.strictEqual(
@@ -1173,7 +1173,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         Effect.gen(function* saveOmitsOidcForDevAuthEffect() {
           const { requests } = yield* withProtocolServer(
             (request) => {
-              if (request.url === "/v1/save/prepare") {
+              if (request.url === "/v1/prepare") {
                 return Response.json(
                   Schema.encodeUnknownSync(PrepareSaveResponse)({
                     baseSnapshotId: null,
@@ -1340,7 +1340,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
 
               yield* withProtocolServer(
                 (request) => {
-                  if (request.url === "/v1/save/prepare") {
+                  if (request.url === "/v1/prepare") {
                     const preparedRequest = Schema.decodeUnknownSync(
                       PrepareSaveRequest
                     )(request.body);
@@ -1388,7 +1388,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                     return new Response(null, { status: 204 });
                   }
 
-                  if (request.url === "/v1/save/commit") {
+                  if (request.url === "/v1/commit") {
                     const committedRequest = Schema.decodeUnknownSync(
                       CommitSaveRequest
                     )(request.body);
@@ -1445,7 +1445,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           Effect.gen(function* saveReportsGenerationConflictEffect() {
             const { requests } = yield* withProtocolServer(
               (request) => {
-                if (request.url === "/v1/save/prepare") {
+                if (request.url === "/v1/prepare") {
                   return Response.json(
                     Schema.encodeUnknownSync(PrepareSaveResponse)({
                       baseSnapshotId: null,
@@ -1463,7 +1463,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                   );
                 }
 
-                if (request.url === "/v1/save/commit") {
+                if (request.url === "/v1/commit") {
                   return Response.json(
                     Schema.encodeUnknownSync(CommitSaveResponse)({
                       actualHeadGeneration: 1,
@@ -1484,8 +1484,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             const logs = yield* TestConsole.logLines;
 
             assert.strictEqual(
-              requests.filter((request) => request.url === "/v1/save/commit")
-                .length,
+              requests.filter((request) => request.url === "/v1/commit").length,
               1
             );
             assert.strictEqual(
@@ -1507,7 +1506,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
 
           yield* withProtocolServer(
             (request) => {
-              if (request.url === "/v1/save/prepare") {
+              if (request.url === "/v1/prepare") {
                 return Response.json(
                   Schema.encodeUnknownSync(PrepareSaveResponse)({
                     baseSnapshotId: null,
@@ -1525,7 +1524,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                 );
               }
 
-              if (request.url === "/v1/save/commit") {
+              if (request.url === "/v1/commit") {
                 const committedRequest = Schema.decodeUnknownSync(
                   CommitSaveRequest
                 )(request.body);
@@ -1604,7 +1603,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           );
 
           assert.strictEqual(requests.length, 1);
-          assert.strictEqual(requests[0]?.url, "/v1/save/prepare");
+          assert.strictEqual(requests[0]?.url, "/v1/prepare");
         })
       )
     );
@@ -1615,7 +1614,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           const error = yield* Effect.flip(
             withProtocolServer(
               (request) => {
-                if (request.url === "/v1/save/prepare") {
+                if (request.url === "/v1/prepare") {
                   const prepareRequest = Schema.decodeUnknownSync(
                     PrepareSaveRequest
                   )(request.body);
@@ -1723,7 +1722,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
 
           assert.strictEqual(error._tag, "CliFailure");
           assert.strictEqual(requests.length, 1);
-          assert.strictEqual(requests[0]?.url, "/v1/save/prepare");
+          assert.strictEqual(requests[0]?.url, "/v1/prepare");
         })
       )
     );
@@ -1736,7 +1735,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
 
           yield* withProtocolServer(
             (request) => {
-              if (request.url === "/v1/save/prepare") {
+              if (request.url === "/v1/prepare") {
                 const prepareRequest = Schema.decodeUnknownSync(
                   PrepareSaveRequest
                 )(request.body);
@@ -1779,7 +1778,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                 return new Response(null, { status: 204 });
               }
 
-              if (request.url === "/v1/save/commit") {
+              if (request.url === "/v1/commit") {
                 committedRequest = Schema.decodeUnknownSync(CommitSaveRequest)(
                   request.body
                 );

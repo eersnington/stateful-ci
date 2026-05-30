@@ -277,9 +277,9 @@ export const CommitSaveResponse = Schema.Union([
 export type CommitSaveResponse = Schema.Schema.Type<typeof CommitSaveResponse>;
 
 export const routes = {
-  commitSave: { method: "POST", path: "/v1/save/commit" },
+  commitSave: { method: "POST", path: "/v1/commit" },
   health: { method: "GET", path: "/health" },
   objects: { pathPrefix: objectRoutePrefix },
-  prepareSave: { method: "POST", path: "/v1/save/prepare" },
+  prepareSave: { method: "POST", path: "/v1/prepare" },
   restore: { method: "POST", path: "/v1/restore" },
 } as const;
