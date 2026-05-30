@@ -1029,7 +1029,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           assert.strictEqual(prepareRequest.github.runId, "123456789");
           assert.strictEqual(
             prepareRequest.idempotencyKey,
-            "run-123456789-save"
+            `run-123456789-save-${prepareRequest.manifest.snapshotId}`
           );
           assert.strictEqual(commitRequest.workspaceId, "ws_123");
           assert.strictEqual(commitRequest.expectedHeadGeneration, 0);
@@ -1051,6 +1051,64 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             String(missingObject.size)
           );
           assert.deepStrictEqual(uploadRequest.bodyBytes, localObjectBytes);
+        })
+      )
+    );
+
+    it.effect("scopes idempotency keys to the produced snapshot", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* saveScopesIdempotencyKeysEffect() {
+          const preparedRequests: PrepareSaveRequest[] = [];
+
+          yield* withProtocolServer(
+            (request) => {
+              const prepareRequest = Schema.decodeUnknownSync(
+                PrepareSaveRequest
+              )(request.body);
+              preparedRequests.push(prepareRequest);
+
+              return Response.json(
+                Schema.encodeUnknownSync(PrepareSaveResponse)({
+                  decision: "denied",
+                  reason: "backend_policy_not_configured",
+                  trustClass: "trusted",
+                  workspaceId: "ws_123",
+                })
+              );
+            },
+            (url) =>
+              Effect.gen(function* runSameRunDifferentJobsEffect() {
+                const env = {
+                  ...githubEnv,
+                  STATEFUL_CI_API_URL: url,
+                };
+
+                yield* saveProgram({ ...env, GITHUB_JOB: "test" });
+                yield* saveProgram({ ...env, GITHUB_JOB: "lint" });
+              })
+          );
+          const [testJobRequest, lintJobRequest] = preparedRequests;
+
+          if (testJobRequest === undefined || lintJobRequest === undefined) {
+            return yield* Effect.die("Expected two prepare-save requests.");
+          }
+
+          assert.strictEqual(testJobRequest.github.runId, "123456789");
+          assert.strictEqual(lintJobRequest.github.runId, "123456789");
+          assert.strictEqual(testJobRequest.workspace.job, "test");
+          assert.strictEqual(lintJobRequest.workspace.job, "lint");
+          assert.notStrictEqual(
+            testJobRequest.idempotencyKey,
+            lintJobRequest.idempotencyKey
+          );
+          assert.strictEqual(
+            testJobRequest.idempotencyKey,
+            `run-123456789-save-${testJobRequest.manifest.snapshotId}`
+          );
+          assert.strictEqual(
+            lintJobRequest.idempotencyKey,
+            `run-123456789-save-${lintJobRequest.manifest.snapshotId}`
+          );
         })
       )
     );

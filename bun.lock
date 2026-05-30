@@ -32,7 +32,7 @@
       "name": "stateful-ci",
       "version": "0.0.1",
       "bin": {
-        "stateful-ci": "./src/cli.ts",
+        "stateful-ci": "./src/index.ts",
       },
       "dependencies": {
         "@effect/platform-node": "catalog:",

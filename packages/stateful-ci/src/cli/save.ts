@@ -65,7 +65,7 @@ const prepareSaveRequestFromRestore = Effect.fn(
     git: context.git,
     github: context.github,
     idempotencyKey: Schema.decodeSync(IdempotencyKey)(
-      `run-${context.github.runId}-save`
+      `run-${context.github.runId}-save-${snapshot.manifestDescriptor.snapshotId}`
     ),
     identity: context.identity,
     manifest: snapshot.manifestDescriptor,
