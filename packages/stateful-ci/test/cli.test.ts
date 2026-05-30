@@ -1770,6 +1770,171 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
       })
     );
 
+    it.effect("reuses existing R2 buckets confirmed by JSON list", () =>
+      Effect.gen(function* deployReusesExistingR2BucketEffect() {
+        yield* Effect.addFinalizer(cleanupDeployConfig);
+        const calls: DeployStepCall[] = [];
+        const runner = ({ args, stdin }: DeployStepCall) => {
+          calls.push(stdin === undefined ? { args } : { args, stdin });
+          const command = args.join(" ");
+
+          if (command === "wrangler r2 bucket create stateful-ci-objects") {
+            return Effect.fail({
+              _tag: "CliFailure" as const,
+              message: "create failed",
+            });
+          }
+
+          if (command === "wrangler d1 list --json") {
+            return Effect.succeed({
+              stderr: "",
+              stdout: JSON.stringify([
+                {
+                  name: "stateful-ci-metadata",
+                  uuid: "11111111-1111-1111-1111-111111111111",
+                },
+              ]),
+            });
+          }
+
+          if (command === "wrangler r2 bucket list --json") {
+            return Effect.succeed({
+              stderr: "",
+              stdout: JSON.stringify([{ name: "stateful-ci-objects" }]),
+            });
+          }
+
+          return Effect.succeed({
+            stderr: "",
+            stdout: "",
+          });
+        };
+
+        yield* deployProgramWithRunner(deployEnv, runner);
+
+        assert.deepStrictEqual(calls.map((call) => call.args).slice(0, 5), [
+          ["wrangler", "d1", "create", "stateful-ci-metadata"],
+          ["wrangler", "d1", "list", "--json"],
+          ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+          ["wrangler", "r2", "bucket", "list", "--json"],
+          [
+            "wrangler",
+            "d1",
+            "migrations",
+            "apply",
+            "stateful-ci-metadata",
+            "--remote",
+            "--config",
+            deployConfigFsPath,
+          ],
+        ]);
+      })
+    );
+
+    it.effect("reuses existing D1 databases confirmed by JSON list", () =>
+      Effect.gen(function* deployReusesExistingD1DatabaseEffect() {
+        yield* Effect.addFinalizer(cleanupDeployConfig);
+        const calls: DeployStepCall[] = [];
+        const runner = ({ args, stdin }: DeployStepCall) => {
+          calls.push(stdin === undefined ? { args } : { args, stdin });
+
+          if (args.join(" ") === "wrangler d1 create stateful-ci-metadata") {
+            return Effect.fail({
+              _tag: "CliFailure" as const,
+              message: "create failed",
+            });
+          }
+
+          return Effect.succeed({
+            stderr: "",
+            stdout:
+              args.join(" ") === "wrangler d1 list --json"
+                ? JSON.stringify([
+                    {
+                      name: "stateful-ci-metadata",
+                      uuid: "11111111-1111-1111-1111-111111111111",
+                    },
+                  ])
+                : "",
+          });
+        };
+
+        yield* deployProgramWithRunner(deployEnv, runner);
+
+        assert.deepStrictEqual(calls.map((call) => call.args).slice(0, 4), [
+          ["wrangler", "d1", "create", "stateful-ci-metadata"],
+          ["wrangler", "d1", "list", "--json"],
+          ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+          [
+            "wrangler",
+            "d1",
+            "migrations",
+            "apply",
+            "stateful-ci-metadata",
+            "--remote",
+            "--config",
+            deployConfigFsPath,
+          ],
+        ]);
+      })
+    );
+
+    it.effect(
+      "fails when R2 create fails and JSON list does not confirm it",
+      () =>
+        Effect.gen(function* deployRejectsUnconfirmedR2ReuseEffect() {
+          yield* Effect.addFinalizer(cleanupDeployConfig);
+          const calls: DeployStepCall[] = [];
+          const runner = ({ args, stdin }: DeployStepCall) => {
+            calls.push(stdin === undefined ? { args } : { args, stdin });
+            const command = args.join(" ");
+
+            if (command === "wrangler r2 bucket create stateful-ci-objects") {
+              return Effect.fail({
+                _tag: "CliFailure" as const,
+                message: "create failed",
+              });
+            }
+
+            if (command === "wrangler d1 list --json") {
+              return Effect.succeed({
+                stderr: "",
+                stdout: JSON.stringify([
+                  {
+                    name: "stateful-ci-metadata",
+                    uuid: "11111111-1111-1111-1111-111111111111",
+                  },
+                ]),
+              });
+            }
+
+            if (command === "wrangler r2 bucket list --json") {
+              return Effect.succeed({ stderr: "", stdout: JSON.stringify([]) });
+            }
+
+            return Effect.succeed({
+              stderr: "",
+              stdout: "",
+            });
+          };
+          const error = yield* Effect.flip(
+            deployProgramWithRunner(deployEnv, runner)
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "did not confirm");
+          assert.deepStrictEqual(
+            calls.map((call) => call.args),
+            [
+              ["wrangler", "d1", "create", "stateful-ci-metadata"],
+              ["wrangler", "d1", "list", "--json"],
+              ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+              ["wrangler", "r2", "bucket", "list", "--json"],
+            ]
+          );
+        })
+    );
+
     it.effect("fails before provisioning when deploy secrets are missing", () =>
       Effect.gen(function* deployFailsBeforeProvisioningWithoutSecretsEffect() {
         const calls: DeployStepCall[] = [];

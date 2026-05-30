@@ -50,6 +50,12 @@ const D1DatabaseListEntry = Schema.Struct({
 const D1DatabaseList = Schema.Array(D1DatabaseListEntry);
 type D1DatabaseListEntry = Schema.Schema.Type<typeof D1DatabaseListEntry>;
 
+const R2BucketListEntry = Schema.Struct({
+  name: Schema.String,
+});
+
+const R2BucketList = Schema.Array(R2BucketListEntry);
+
 const deployResourceNameFromEnv = (
   env: RuntimeEnv,
   key: string,
@@ -88,6 +94,16 @@ const parseD1DatabaseId = (source: string, databaseName: string) => {
   }
 
   return null;
+};
+
+const parseR2BucketExists = (source: string, bucketName: string) => {
+  const decoded = Schema.decodeUnknownExit(Schema.fromJsonString(R2BucketList))(
+    source
+  );
+
+  return Exit.isSuccess(decoded)
+    ? decoded.value.some((entry) => entry.name === bucketName)
+    : false;
 };
 
 const deployConfigText = (input: {
@@ -184,11 +200,28 @@ const ensureR2Bucket = Effect.fn("ensureR2Bucket")(
     yield* runStep({
       args: ["wrangler", "r2", "bucket", "create", bucket],
     }).pipe(
-      Effect.catchTag("CliFailure", (error) =>
-        error.message.toLowerCase().includes("already exists")
-          ? Console.log(`R2 bucket ${bucket} already exists; reusing it.`)
-          : Effect.fail(error)
-      )
+      Effect.matchEffect({
+        onFailure: () =>
+          Effect.gen(function* confirmExistingR2BucketEffect() {
+            const list = yield* runStep({
+              args: ["wrangler", "r2", "bucket", "list", "--json"],
+            });
+
+            if (parseR2BucketExists(list.stdout, bucket)) {
+              yield* Console.log(
+                `R2 bucket ${bucket} already exists; reusing it.`
+              );
+              return;
+            }
+
+            return yield* Effect.fail(
+              cliFailure(
+                `Could not create R2 bucket ${bucket}, and Wrangler JSON output did not confirm that the bucket already exists. Stateful CI backend resources may be partially provisioned; run bunx wrangler r2 bucket list --json and retry stateful-ci deploy after confirming the bucket exists.`
+              )
+            );
+          }),
+        onSuccess: () => Effect.void,
+      })
     );
   }
 );
@@ -218,17 +251,21 @@ const ensureD1Database = Effect.fn("ensureD1Database")(
     database: string,
     runStep: DeployStepRunner
   ) {
-    yield* runStep({ args: ["wrangler", "d1", "create", database] }).pipe(
-      Effect.matchEffect({
-        onFailure: (error) =>
-          error.message.toLowerCase().includes("already exists")
-            ? Console.log(`D1 database ${database} already exists; reusing it.`)
-            : Effect.fail(error),
-        onSuccess: () => Effect.void,
+    const created = yield* runStep({
+      args: ["wrangler", "d1", "create", database],
+    }).pipe(
+      Effect.match({
+        onFailure: () => false,
+        onSuccess: () => true,
       })
     );
+    const databaseId = yield* findD1DatabaseId(database, runStep);
 
-    return yield* findD1DatabaseId(database, runStep);
+    if (!created) {
+      yield* Console.log(`D1 database ${database} already exists; reusing it.`);
+    }
+
+    return databaseId;
   }
 );
 
