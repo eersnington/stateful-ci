@@ -24,7 +24,7 @@ import {
   restoreProgram,
   runCli,
   saveProgram,
-} from "../src/cli";
+} from "../src/cli/index";
 
 const githubEnv = {
   GITHUB_ACTOR: "eersnington",
@@ -467,6 +467,23 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
 
           assert.strictEqual(error._tag, "CliFailure");
           assert.include(error.message, "Missing STATEFUL_CI_API_URL");
+        })
+      )
+    );
+
+    it.effect("fails before network calls when API URL is invalid", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreFailsWithInvalidApiUrlEffect() {
+          const error = yield* Effect.flip(
+            restoreProgram({
+              ...githubEnv,
+              STATEFUL_CI_API_TOKEN: "test-token",
+              STATEFUL_CI_API_URL: "not a url",
+            })
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "STATEFUL_CI_API_URL was invalid");
         })
       )
     );

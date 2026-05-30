@@ -24,4 +24,4 @@ runs:
             exit 1
             ;;
         esac
-        bun "$GITHUB_ACTION_PATH/packages/stateful-ci/src/cli.ts" "$STATEFUL_CI_COMMAND"
+        bun "$GITHUB_ACTION_PATH/packages/stateful-ci/src/index.ts" "$STATEFUL_CI_COMMAND"
