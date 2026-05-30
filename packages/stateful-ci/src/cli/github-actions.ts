@@ -156,6 +156,30 @@ export const githubOidcIdentityFromEnv = Effect.fn("githubOidcIdentityFromEnv")(
   }
 );
 
+const devAuthEnabledFromEnv = (env: RuntimeEnv) => {
+  const value =
+    optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED") ??
+    optionalEnv(env, "DEV_AUTH_ENABLED") ??
+    optionalEnv(env, "STATEFUL_CI_DEV_AUTH");
+
+  return value === "1" || value === "true";
+};
+
+export const githubOidcIdentityFromEnvOptional = Effect.fn(
+  "githubOidcIdentityFromEnvOptional"
+)(function* githubOidcIdentityFromEnvOptionalEffect(env: RuntimeEnv) {
+  const hasOidcInput =
+    optionalEnv(env, "STATEFUL_CI_OIDC_TOKEN") !== null ||
+    optionalEnv(env, "ACTIONS_ID_TOKEN_REQUEST_URL") !== null ||
+    optionalEnv(env, "ACTIONS_ID_TOKEN_REQUEST_TOKEN") !== null;
+
+  if (hasOidcInput || !devAuthEnabledFromEnv(env)) {
+    return yield* githubOidcIdentityFromEnv(env);
+  }
+
+  return null;
+});
+
 export const restoreRequestFromEnv = Effect.fn("restoreRequestFromEnv")(
   function* restoreRequestFromEnvEffect(env: RuntimeEnv, loaded: LoadedConfig) {
     const request = {
