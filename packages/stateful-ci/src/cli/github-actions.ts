@@ -159,8 +159,7 @@ export const githubOidcIdentityFromEnv = Effect.fn("githubOidcIdentityFromEnv")(
 const devAuthEnabledFromEnv = (env: RuntimeEnv) => {
   const value =
     optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED") ??
-    optionalEnv(env, "DEV_AUTH_ENABLED") ??
-    optionalEnv(env, "STATEFUL_CI_DEV_AUTH");
+    optionalEnv(env, "DEV_AUTH_ENABLED");
 
   return value === "1" || value === "true";
 };

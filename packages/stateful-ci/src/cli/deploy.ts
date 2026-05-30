@@ -340,8 +340,7 @@ export const deployProgramWithRunner = (
       databaseId,
       devAuthEnabled:
         optionalEnv(env, "DEV_AUTH_ENABLED") ??
-        optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED") ??
-        optionalEnv(env, "STATEFUL_CI_DEV_AUTH"),
+        optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED"),
       oidcAudience:
         optionalEnv(env, "OIDC_AUDIENCE") ??
         optionalEnv(env, "STATEFUL_CI_OIDC_AUDIENCE") ??
