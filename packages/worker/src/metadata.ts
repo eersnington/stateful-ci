@@ -2,7 +2,6 @@ import type {
   CommitSaveResponse,
   DenialReason,
   IdempotencyKey,
-  ManifestDescriptor,
   RunId,
   SnapshotId,
   SnapshotObjectInventoryEntry,
@@ -200,20 +199,17 @@ export class MetadataBackend extends Context.Service<
   }
 >()("stateful-ci/worker/MetadataBackend") {}
 
-const refKey = (target: RefTarget) => `${target.namespace}\n${target.refName}`;
+export const scopeKeyForRefTarget = (target: RefTarget) =>
+  `${target.namespace}\n${target.refName}`;
+
+export const workspaceIdForRefTarget = (target: RefTarget) =>
+  Schema.decodeSync(WorkspaceIdSchema)(
+    `ws:${target.namespace}:${target.refName}`
+  );
 
 export const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
   Effect.map((millis) => new Date(millis).toISOString())
 );
-
-export const manifestDescriptorFromSnapshotHeader = (
-  snapshot: SnapshotHeader
-): ManifestDescriptor => ({
-  digest: snapshot.manifestDigest,
-  key: snapshot.manifestKey,
-  size: snapshot.manifestSize,
-  snapshotId: snapshot.snapshotId,
-});
 
 export const inventoryFromSnapshotRows = (
   objects: readonly SnapshotObjectRow[]
@@ -227,7 +223,7 @@ export const inventoryFromSnapshotRows = (
     }))
   );
 
-export const snapshotRowsFromInventory = (
+const snapshotRowsFromInventory = (
   snapshotId: SnapshotId,
   objects: readonly SnapshotObjectInventoryEntry[]
 ): readonly SnapshotObjectRow[] =>
@@ -250,7 +246,7 @@ export const createInMemoryMetadataBackend = (
   seed: InMemoryMetadataSeed = {}
 ): MetadataBackend["Service"] => {
   const refs = new Map(
-    (seed.refs ?? []).map((ref) => [refKey(ref), ref] as const)
+    (seed.refs ?? []).map((ref) => [scopeKeyForRefTarget(ref), ref] as const)
   );
   const snapshots = new Map(
     (seed.snapshots ?? []).map(
@@ -293,7 +289,7 @@ export const createInMemoryMetadataBackend = (
       }),
     compareAndAdvanceRef: (namespace, refName, expectedGeneration, next) =>
       Effect.gen(function* compareAndAdvanceRefEffect() {
-        const key = refKey({ namespace, refName });
+        const key = scopeKeyForRefTarget({ namespace, refName });
         const previous = refs.get(key);
         const actualGeneration =
           previous?.generation ?? Schema.decodeSync(HeadGeneration)(0);
@@ -320,7 +316,9 @@ export const createInMemoryMetadataBackend = (
     getIdempotentCommit: (idempotencyKey) =>
       Effect.sync(() => idempotentCommits.get(idempotencyKey) ?? null),
     getRef: (namespace, refName) =>
-      Effect.sync(() => refs.get(refKey({ namespace, refName })) ?? null),
+      Effect.sync(
+        () => refs.get(scopeKeyForRefTarget({ namespace, refName })) ?? null
+      ),
     getSnapshotHeader: (snapshotId) =>
       Effect.sync(() => snapshots.get(snapshotId) ?? null),
     getSnapshotObjects: (snapshotId) =>
@@ -526,12 +524,14 @@ const snapshotFromRow = (row: Record<string, unknown>): SnapshotHeader => ({
 const objectFromRow = (row: Record<string, unknown>): SnapshotObjectRow =>
   ({
     ...Schema.decodeUnknownSync(SnapshotObjectInventoryEntrySchema)({
-      digest: row.object_digest,
-      key: row.object_key,
-      kind: row.object_kind,
-      size: row.size,
+      digest: stringColumn(row, "object_digest"),
+      key: stringColumn(row, "object_key"),
+      kind: stringColumn(row, "object_kind"),
+      size: numberColumn(row, "size"),
     }),
-    snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(row.snapshot_id),
+    snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(
+      stringColumn(row, "snapshot_id")
+    ),
   }) satisfies SnapshotObjectRow;
 
 const optionalStringField = <Key extends string>(
@@ -683,9 +683,9 @@ export const createD1MetadataBackend = (
           manifestDigest: Schema.decodeSync(Sha256Digest)(
             stringColumn(row, "manifest_digest")
           ),
-          result: Schema.decodeUnknownSync(CommitSaveResponseSchema)(
-            JSON.parse(stringColumn(row, "result_json")) as unknown
-          ),
+          result: Schema.decodeUnknownSync(
+            Schema.fromJsonString(CommitSaveResponseSchema)
+          )(stringColumn(row, "result_json")),
           runId: Schema.decodeUnknownSync(RunIdSchema)(
             stringColumn(row, "run_id")
           ),

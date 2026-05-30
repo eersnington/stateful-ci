@@ -17,7 +17,6 @@ import {
   CommitSaveDeniedResponse,
   CommitSaveIdempotentResponse,
   HeadGeneration as HeadGenerationSchema,
-  WorkspaceId as WorkspaceIdSchema,
 } from "@stateful-ci/core";
 import { Context, Effect, Schema } from "effect";
 
@@ -25,6 +24,8 @@ import {
   currentIsoTimestamp,
   inventoryFromSnapshotRows,
   MetadataBackend,
+  scopeKeyForRefTarget,
+  workspaceIdForRefTarget,
 } from "./metadata";
 import type {
   RefRow,
@@ -146,14 +147,6 @@ export class SnapshotCoordinator extends Context.Service<
   }
 >()("stateful-ci/worker/SnapshotCoordinator") {}
 
-const scopeKeyForTarget = (target: RefTarget) =>
-  `${target.namespace}\n${target.refName}`;
-
-const workspaceIdForTarget = (target: RefTarget) =>
-  Schema.decodeSync(WorkspaceIdSchema)(
-    `ws:${target.namespace}:${target.refName}`
-  );
-
 const refGeneration = (ref: RefRow | null) =>
   ref?.generation ?? Schema.decodeSync(HeadGenerationSchema)(0);
 
@@ -168,7 +161,7 @@ const manifestFromSnapshotHeader = (
 
 const saveTargetForPolicy = (target: RefTarget, trustClass: TrustClass) => {
   const savePolicy = evaluateSavePolicy({
-    scopeKey: scopeKeyForTarget(target),
+    scopeKey: scopeKeyForRefTarget(target),
     trustClass,
   });
 
@@ -434,14 +427,14 @@ export const createMetadataSnapshotCoordinator =
             }
 
             const decision =
-              snapshot.workspaceId === workspaceIdForTarget(candidate)
+              snapshot.workspaceId === workspaceIdForRefTarget(candidate)
                 ? evaluateRestorePolicy({
                     consumer: {
-                      scopeKey: scopeKeyForTarget(input.target),
+                      scopeKey: scopeKeyForRefTarget(input.target),
                       trustClass: input.trustClass,
                     },
                     producer: {
-                      scopeKey: scopeKeyForTarget(candidate),
+                      scopeKey: scopeKeyForRefTarget(candidate),
                       trustClass: snapshot.trustClass ?? ref.trustClass,
                     },
                   })
@@ -526,7 +519,7 @@ export const createMetadataSnapshotCoordinator =
           }
 
           const savePolicy = evaluateSavePolicy({
-            scopeKey: scopeKeyForTarget(target),
+            scopeKey: scopeKeyForRefTarget(target),
             trustClass: target.trustClass,
           });
 
@@ -693,7 +686,7 @@ export const createMetadataSnapshotCoordinator =
         Effect.gen(function* prepareSaveEffect() {
           const metadata = yield* MetadataBackend;
           const savePolicy = evaluateSavePolicy({
-            scopeKey: scopeKeyForTarget(input.target),
+            scopeKey: scopeKeyForRefTarget(input.target),
             trustClass: input.trustClass,
           });
 
