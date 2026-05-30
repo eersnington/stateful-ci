@@ -3,14 +3,21 @@
   "version": "0.0.1",
   "private": false,
   "bin": {
-    "stateful-ci": "./src/index.ts"
+    "stateful-ci": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "src"
+  ],
   "type": "module",
   "exports": {
-    ".": "./src/cli/index.ts"
+    ".": {
+      "types": "./src/cli/index.ts",
+      "import": "./dist/cli/index.js"
+    }
   },
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node",
+    "build": "bun build src/index.ts src/cli/index.ts --outdir dist --target node",
     "dev": "bun src/index.ts",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit"
