@@ -155,11 +155,6 @@ const readCoordinatorRequest = (request: Request) =>
     )
   );
 
-const decodeCoordinatorBody =
-  <S extends Schema.Decoder<unknown>>(schema: S) =>
-  (body: unknown) =>
-    Schema.decodeUnknownSync(schema)(body);
-
 const VoidResponseSchema = Schema.Struct({ ok: Schema.Literal(true) });
 
 const RestoreCoordinatorResultSchema = Schema.Union([
@@ -209,8 +204,6 @@ const PrepareSaveCoordinatorResultSchema = Schema.Union([
     reason: RestoreObjectDenialInputSchema.fields.reason,
   }),
 ]);
-
-const jsonResponse = (value: unknown) => Response.json(value);
 
 export class WorkspaceSnapshotCoordinatorDurableObject {
   readonly #env: DurableObjectEnv;
@@ -266,25 +259,27 @@ export class WorkspaceSnapshotCoordinatorDurableObject {
 
           switch (message.action) {
             case "authorizeRestore": {
-              return jsonResponse(
+              return Response.json(
                 yield* coordinator.authorizeRestore(message.input)
               );
             }
             case "commitSave": {
-              return jsonResponse(yield* coordinator.commitSave(message.input));
+              return Response.json(
+                yield* coordinator.commitSave(message.input)
+              );
             }
             case "prepareSave": {
-              return jsonResponse(
+              return Response.json(
                 yield* coordinator.prepareSave(message.input)
               );
             }
             case "recordRestoreAllowed": {
               yield* coordinator.recordRestoreAllowed(message.input);
-              return jsonResponse({ ok: true });
+              return Response.json({ ok: true });
             }
             case "recordRestoreObjectDenial": {
               yield* coordinator.recordRestoreObjectDenial(message.input);
-              return jsonResponse({ ok: true });
+              return Response.json({ ok: true });
             }
             default: {
               const unhandled: never = message;
@@ -345,21 +340,22 @@ export const createDurableObjectSnapshotCoordinator = (
         namespace,
         input.target,
         { action: "authorizeRestore", input },
-        decodeCoordinatorBody(RestoreCoordinatorResultSchema)
+        (body) => Schema.decodeUnknownSync(RestoreCoordinatorResultSchema)(body)
       ),
     commitSave: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "commitSave", input },
-        decodeCoordinatorBody(CommitSaveResponseSchema)
+        (body) => Schema.decodeUnknownSync(CommitSaveResponseSchema)(body)
       ),
     prepareSave: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "prepareSave", input },
-        decodeCoordinatorBody(PrepareSaveCoordinatorResultSchema)
+        (body) =>
+          Schema.decodeUnknownSync(PrepareSaveCoordinatorResultSchema)(body)
       ),
     recordRestoreAllowed: (input) =>
       callCoordinator(
@@ -367,7 +363,7 @@ export const createDurableObjectSnapshotCoordinator = (
         input.target,
         { action: "recordRestoreAllowed", input },
         (body) => {
-          decodeCoordinatorBody(VoidResponseSchema)(body);
+          Schema.decodeUnknownSync(VoidResponseSchema)(body);
         }
       ),
     recordRestoreObjectDenial: (input) =>
@@ -376,7 +372,7 @@ export const createDurableObjectSnapshotCoordinator = (
         input.target,
         { action: "recordRestoreObjectDenial", input },
         (body) => {
-          decodeCoordinatorBody(VoidResponseSchema)(body);
+          Schema.decodeUnknownSync(VoidResponseSchema)(body);
         }
       ),
   });

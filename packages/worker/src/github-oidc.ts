@@ -253,10 +253,7 @@ const verificationKeysFor = Effect.fn("verificationKeysFor")(
     options: GitHubOidcVerificationOptions
   ) {
     if (options.jwks !== undefined) {
-      return {
-        jwk: options.jwks.find((key) => key.kid === header.kid),
-        keys: options.jwks,
-      } as const;
+      return options.jwks.find((key) => key.kid === header.kid);
     }
 
     const jwksUrl = options.jwksUrl ?? githubJwksUrl;
@@ -264,15 +261,12 @@ const verificationKeysFor = Effect.fn("verificationKeysFor")(
     const cachedKey = cachedKeys.find((key) => key.kid === header.kid);
 
     if (cachedKey !== undefined) {
-      return { jwk: cachedKey, keys: cachedKeys } as const;
+      return cachedKey;
     }
 
     const refreshedKeys = yield* jwksForVerification(jwksUrl, true);
 
-    return {
-      jwk: refreshedKeys.find((key) => key.kid === header.kid),
-      keys: refreshedKeys,
-    } as const;
+    return refreshedKeys.find((key) => key.kid === header.kid);
   }
 );
 
@@ -392,7 +386,7 @@ export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
       return yield* subjectError;
     }
 
-    const { jwk } = yield* verificationKeysFor(header, options);
+    const jwk = yield* verificationKeysFor(header, options);
 
     if (jwk === undefined) {
       return yield* oidcError(
