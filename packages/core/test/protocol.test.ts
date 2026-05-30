@@ -12,7 +12,6 @@ import {
   PrepareSaveResponse,
   RestoreAllowedResponse,
   RestoreRequest,
-  SaveRequest,
   Sha256Digest,
   SnapshotObjectInventoryEntry,
   TrustClass,
@@ -130,32 +129,10 @@ const commitSaveRequest = {
   workspaceId: "ws_123",
 };
 
-const saveRequest = {
-  baseSnapshotId: "snap_123",
-  manifest: {
-    chunkCount: 1,
-    fileCount: 21_903,
-    hash: manifestDigest,
-    id: "snap_124",
-    key: manifestKey,
-    objects,
-    safety: {
-      skippedByBuiltInDenylist: 3,
-      skippedByUserExclude: 12,
-      skippedUnsupportedType: 1,
-    },
-    totalBytes: 481_203_912,
-  },
-  protocolVersion: 1,
-  runId: "123456789",
-  workspaceId: "ws_123",
-};
-
 const decodeRestoreRequest = Schema.decodeUnknownResult(RestoreRequest);
 const decodeRestoreAllowedResponse = Schema.decodeUnknownResult(
   RestoreAllowedResponse
 );
-const decodeSaveRequest = Schema.decodeUnknownResult(SaveRequest);
 const decodePrepareSaveRequest = Schema.decodeUnknownResult(PrepareSaveRequest);
 const decodeCommitSaveRequest = Schema.decodeUnknownResult(CommitSaveRequest);
 const decodeSha256Digest = Schema.decodeUnknownResult(Sha256Digest);
@@ -212,12 +189,6 @@ describe("protocol schemas", () => {
         trustClass: "trusted",
       })
     ).toStrictEqual(restoreRequest);
-  });
-
-  it("SaveRequest decodes manifest metadata and complete object inventory", () => {
-    expect(Schema.decodeUnknownSync(SaveRequest)(saveRequest)).toStrictEqual(
-      saveRequest
-    );
   });
 
   it("PrepareSaveRequest decodes explicit prepare-save payloads", () => {
@@ -418,20 +389,6 @@ describe("protocol schemas", () => {
           object: objects[1],
           route: `/v1/objects/${chunkKey}`,
           transport: "worker-route",
-        })
-      )
-    ).toBeTruthy();
-  });
-
-  it("SaveRequest rejects malformed manifest digests", () => {
-    expect(
-      Result.isFailure(
-        decodeSaveRequest({
-          ...saveRequest,
-          manifest: {
-            ...saveRequest.manifest,
-            hash: "sha256:not-a-real-digest",
-          },
         })
       )
     ).toBeTruthy();

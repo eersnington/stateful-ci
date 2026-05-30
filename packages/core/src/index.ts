@@ -93,10 +93,6 @@ export {
   RestoreResponse,
   RestoreSavePlan,
   routes,
-  SaveCommittedResponse,
-  SaveDeniedResponse,
-  SaveRequest,
-  SaveResponse,
   SignedUrlTransferPlanEntry,
   WorkerRouteTransferPlanEntry,
 } from "./protocol";

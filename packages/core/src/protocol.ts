@@ -16,7 +16,6 @@ import {
 } from "./ids";
 import {
   ManifestDescriptor,
-  SaveManifest,
   SnapshotObjectInventory,
   SnapshotObjectInventoryEntry,
   SnapshotRef,
@@ -111,15 +110,6 @@ export type ObjectTransferPlanNonEmpty = Schema.Schema.Type<
   typeof ObjectTransferPlanNonEmpty
 >;
 
-export const SaveRequest = Schema.Struct({
-  baseSnapshotId: Schema.NullOr(SnapshotId),
-  manifest: SaveManifest,
-  protocolVersion: Schema.Literal(protocolVersion),
-  runId: RunId,
-  workspaceId: WorkspaceId,
-});
-export type SaveRequest = Schema.Schema.Type<typeof SaveRequest>;
-
 const inventoryContainsManifest = <
   A extends {
     readonly manifest: ManifestDescriptor;
@@ -182,28 +172,6 @@ export const RestoreResponse = Schema.Union([
   RestoreDeniedResponse,
 ]);
 export type RestoreResponse = Schema.Schema.Type<typeof RestoreResponse>;
-
-export const SaveCommittedResponse = Schema.Struct({
-  decision: Schema.Literal("committed"),
-  latest: Schema.Boolean,
-  snapshotId: SnapshotId,
-  workspaceId: WorkspaceId,
-});
-export type SaveCommittedResponse = Schema.Schema.Type<
-  typeof SaveCommittedResponse
->;
-
-export const SaveDeniedResponse = Schema.Struct({
-  decision: Schema.Literal("denied"),
-  reason: DenialReason,
-});
-export type SaveDeniedResponse = Schema.Schema.Type<typeof SaveDeniedResponse>;
-
-export const SaveResponse = Schema.Union([
-  SaveCommittedResponse,
-  SaveDeniedResponse,
-]);
-export type SaveResponse = Schema.Schema.Type<typeof SaveResponse>;
 
 export const PrepareSaveRequest = Schema.Struct({
   client: ClientContext,
@@ -314,5 +282,4 @@ export const routes = {
   objects: { pathPrefix: objectRoutePrefix },
   prepareSave: { method: "POST", path: "/v1/save/prepare" },
   restore: { method: "POST", path: "/v1/restore" },
-  save: { method: "POST", path: "/v1/save" },
 } as const;
