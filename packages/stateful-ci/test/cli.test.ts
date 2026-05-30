@@ -24,7 +24,7 @@ import {
   restoreProgram,
   runCli,
   saveProgram,
-} from "../src/cli";
+} from "../src/cli/index";
 
 const githubEnv = {
   GITHUB_ACTOR: "eersnington",
@@ -455,6 +455,46 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         )
     );
 
+    it.effect(
+      "fails when denied restore allows save without a workspace target",
+      () =>
+        withWorkspace(setupRestoreWorkspace, ({ fs, path, root }) =>
+          Effect.gen(
+            function* restoreRejectsSaveWithoutWorkspaceTargetEffect() {
+              const error = yield* Effect.flip(
+                withProtocolServer(
+                  () =>
+                    Response.json(
+                      Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                        decision: "denied",
+                        reason: "backend_policy_not_configured",
+                        save: { allowed: true, target: "trusted/main/latest" },
+                        trustClass: "trusted",
+                      })
+                    ),
+                  (url) =>
+                    restoreProgram({
+                      ...githubEnv,
+                      STATEFUL_CI_API_TOKEN: "test-token",
+                      STATEFUL_CI_API_URL: url,
+                    })
+                )
+              );
+              const missingSession = yield* Effect.flip(
+                fs.readFileString(
+                  path.join(root, ".stateful-ci/restore-session.json")
+                )
+              );
+
+              assert.strictEqual(error._tag, "CliFailure");
+              assert.include(error.message, "allowed save");
+              assert.include(error.message, "workspaceId");
+              assert.strictEqual(missingSession._tag, "PlatformError");
+            }
+          )
+        )
+    );
+
     it.effect("fails before network calls when API URL is missing", () =>
       withWorkspace(setupRestoreWorkspace, () =>
         Effect.gen(function* restoreFailsWithoutApiUrlEffect() {
@@ -467,6 +507,53 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
 
           assert.strictEqual(error._tag, "CliFailure");
           assert.include(error.message, "Missing STATEFUL_CI_API_URL");
+        })
+      )
+    );
+
+    it.effect("fails before network calls when API URL is invalid", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreFailsWithInvalidApiUrlEffect() {
+          const error = yield* Effect.flip(
+            restoreProgram({
+              ...githubEnv,
+              STATEFUL_CI_API_TOKEN: "test-token",
+              STATEFUL_CI_API_URL: "not a url",
+            })
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "STATEFUL_CI_API_URL was invalid");
+        })
+      )
+    );
+
+    it.effect("rejects path-prefixed API URLs before network calls", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreRejectsApiUrlPathPrefixEffect() {
+          const { requests, value: error } = yield* withProtocolServer(
+            () =>
+              Response.json(
+                Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                  decision: "denied",
+                  reason: "backend_policy_not_configured",
+                  save: { allowed: false },
+                  trustClass: "unknown",
+                })
+              ),
+            (url) =>
+              Effect.flip(
+                restoreProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: `${url}/stateful-ci`,
+                })
+              )
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "Worker root URL");
+          assert.strictEqual(requests.length, 0);
         })
       )
     );
@@ -1012,7 +1099,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
           assert.strictEqual(prepareRequest.github.runId, "123456789");
           assert.strictEqual(
             prepareRequest.idempotencyKey,
-            "run-123456789-save"
+            `run-123456789-save-${prepareRequest.manifest.snapshotId}`
           );
           assert.strictEqual(commitRequest.workspaceId, "ws_123");
           assert.strictEqual(commitRequest.expectedHeadGeneration, 0);
@@ -1034,6 +1121,64 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             String(missingObject.size)
           );
           assert.deepStrictEqual(uploadRequest.bodyBytes, localObjectBytes);
+        })
+      )
+    );
+
+    it.effect("scopes idempotency keys to the produced snapshot", () =>
+      withWorkspace(setupSaveWorkspace, () =>
+        Effect.gen(function* saveScopesIdempotencyKeysEffect() {
+          const preparedRequests: PrepareSaveRequest[] = [];
+
+          yield* withProtocolServer(
+            (request) => {
+              const prepareRequest = Schema.decodeUnknownSync(
+                PrepareSaveRequest
+              )(request.body);
+              preparedRequests.push(prepareRequest);
+
+              return Response.json(
+                Schema.encodeUnknownSync(PrepareSaveResponse)({
+                  decision: "denied",
+                  reason: "backend_policy_not_configured",
+                  trustClass: "trusted",
+                  workspaceId: "ws_123",
+                })
+              );
+            },
+            (url) =>
+              Effect.gen(function* runSameRunDifferentJobsEffect() {
+                const env = {
+                  ...githubEnv,
+                  STATEFUL_CI_API_URL: url,
+                };
+
+                yield* saveProgram({ ...env, GITHUB_JOB: "test" });
+                yield* saveProgram({ ...env, GITHUB_JOB: "lint" });
+              })
+          );
+          const [testJobRequest, lintJobRequest] = preparedRequests;
+
+          if (testJobRequest === undefined || lintJobRequest === undefined) {
+            return yield* Effect.die("Expected two prepare-save requests.");
+          }
+
+          assert.strictEqual(testJobRequest.github.runId, "123456789");
+          assert.strictEqual(lintJobRequest.github.runId, "123456789");
+          assert.strictEqual(testJobRequest.workspace.job, "test");
+          assert.strictEqual(lintJobRequest.workspace.job, "lint");
+          assert.notStrictEqual(
+            testJobRequest.idempotencyKey,
+            lintJobRequest.idempotencyKey
+          );
+          assert.strictEqual(
+            testJobRequest.idempotencyKey,
+            `run-123456789-save-${testJobRequest.manifest.snapshotId}`
+          );
+          assert.strictEqual(
+            lintJobRequest.idempotencyKey,
+            `run-123456789-save-${lintJobRequest.manifest.snapshotId}`
+          );
         })
       )
     );
@@ -1693,6 +1838,171 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
         );
         assert.notInclude(config, "STATEFUL_CI_TRANSFER_SECRET");
       })
+    );
+
+    it.effect("reuses existing R2 buckets confirmed by JSON list", () =>
+      Effect.gen(function* deployReusesExistingR2BucketEffect() {
+        yield* Effect.addFinalizer(cleanupDeployConfig);
+        const calls: DeployStepCall[] = [];
+        const runner = ({ args, stdin }: DeployStepCall) => {
+          calls.push(stdin === undefined ? { args } : { args, stdin });
+          const command = args.join(" ");
+
+          if (command === "wrangler r2 bucket create stateful-ci-objects") {
+            return Effect.fail({
+              _tag: "CliFailure" as const,
+              message: "create failed",
+            });
+          }
+
+          if (command === "wrangler d1 list --json") {
+            return Effect.succeed({
+              stderr: "",
+              stdout: JSON.stringify([
+                {
+                  name: "stateful-ci-metadata",
+                  uuid: "11111111-1111-1111-1111-111111111111",
+                },
+              ]),
+            });
+          }
+
+          if (command === "wrangler r2 bucket list --json") {
+            return Effect.succeed({
+              stderr: "",
+              stdout: JSON.stringify([{ name: "stateful-ci-objects" }]),
+            });
+          }
+
+          return Effect.succeed({
+            stderr: "",
+            stdout: "",
+          });
+        };
+
+        yield* deployProgramWithRunner(deployEnv, runner);
+
+        assert.deepStrictEqual(calls.map((call) => call.args).slice(0, 5), [
+          ["wrangler", "d1", "create", "stateful-ci-metadata"],
+          ["wrangler", "d1", "list", "--json"],
+          ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+          ["wrangler", "r2", "bucket", "list", "--json"],
+          [
+            "wrangler",
+            "d1",
+            "migrations",
+            "apply",
+            "stateful-ci-metadata",
+            "--remote",
+            "--config",
+            deployConfigFsPath,
+          ],
+        ]);
+      })
+    );
+
+    it.effect("reuses existing D1 databases confirmed by JSON list", () =>
+      Effect.gen(function* deployReusesExistingD1DatabaseEffect() {
+        yield* Effect.addFinalizer(cleanupDeployConfig);
+        const calls: DeployStepCall[] = [];
+        const runner = ({ args, stdin }: DeployStepCall) => {
+          calls.push(stdin === undefined ? { args } : { args, stdin });
+
+          if (args.join(" ") === "wrangler d1 create stateful-ci-metadata") {
+            return Effect.fail({
+              _tag: "CliFailure" as const,
+              message: "create failed",
+            });
+          }
+
+          return Effect.succeed({
+            stderr: "",
+            stdout:
+              args.join(" ") === "wrangler d1 list --json"
+                ? JSON.stringify([
+                    {
+                      name: "stateful-ci-metadata",
+                      uuid: "11111111-1111-1111-1111-111111111111",
+                    },
+                  ])
+                : "",
+          });
+        };
+
+        yield* deployProgramWithRunner(deployEnv, runner);
+
+        assert.deepStrictEqual(calls.map((call) => call.args).slice(0, 4), [
+          ["wrangler", "d1", "create", "stateful-ci-metadata"],
+          ["wrangler", "d1", "list", "--json"],
+          ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+          [
+            "wrangler",
+            "d1",
+            "migrations",
+            "apply",
+            "stateful-ci-metadata",
+            "--remote",
+            "--config",
+            deployConfigFsPath,
+          ],
+        ]);
+      })
+    );
+
+    it.effect(
+      "fails when R2 create fails and JSON list does not confirm it",
+      () =>
+        Effect.gen(function* deployRejectsUnconfirmedR2ReuseEffect() {
+          yield* Effect.addFinalizer(cleanupDeployConfig);
+          const calls: DeployStepCall[] = [];
+          const runner = ({ args, stdin }: DeployStepCall) => {
+            calls.push(stdin === undefined ? { args } : { args, stdin });
+            const command = args.join(" ");
+
+            if (command === "wrangler r2 bucket create stateful-ci-objects") {
+              return Effect.fail({
+                _tag: "CliFailure" as const,
+                message: "create failed",
+              });
+            }
+
+            if (command === "wrangler d1 list --json") {
+              return Effect.succeed({
+                stderr: "",
+                stdout: JSON.stringify([
+                  {
+                    name: "stateful-ci-metadata",
+                    uuid: "11111111-1111-1111-1111-111111111111",
+                  },
+                ]),
+              });
+            }
+
+            if (command === "wrangler r2 bucket list --json") {
+              return Effect.succeed({ stderr: "", stdout: JSON.stringify([]) });
+            }
+
+            return Effect.succeed({
+              stderr: "",
+              stdout: "",
+            });
+          };
+          const error = yield* Effect.flip(
+            deployProgramWithRunner(deployEnv, runner)
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "did not confirm");
+          assert.deepStrictEqual(
+            calls.map((call) => call.args),
+            [
+              ["wrangler", "d1", "create", "stateful-ci-metadata"],
+              ["wrangler", "d1", "list", "--json"],
+              ["wrangler", "r2", "bucket", "create", "stateful-ci-objects"],
+              ["wrangler", "r2", "bucket", "list", "--json"],
+            ]
+          );
+        })
     );
 
     it.effect("fails before provisioning when deploy secrets are missing", () =>
