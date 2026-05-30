@@ -388,9 +388,9 @@ const transferTokenPayload = (input: {
     input.expiresAt,
   ].join("\n");
 
-const signTransferPayload = Effect.fn("signTransferPayload")(
-  function* signTransferPayloadEffect(secret: string, payload: string) {
-    const key = yield* Effect.tryPromise({
+const importTransferSigningKey = Effect.fn("importTransferSigningKey")(
+  function* importTransferSigningKeyEffect(secret: string) {
+    return yield* Effect.tryPromise({
       catch: () =>
         new Forbidden({
           message:
@@ -405,6 +405,11 @@ const signTransferPayload = Effect.fn("signTransferPayload")(
           ["sign"]
         ),
     });
+  }
+);
+
+const signTransferPayload = Effect.fn("signTransferPayload")(
+  function* signTransferPayloadEffect(key: CryptoKey, payload: string) {
     const signature = yield* Effect.tryPromise({
       catch: () =>
         new Forbidden({
@@ -433,26 +438,12 @@ const planWithObjectHeaders = (plan: ObjectTransferPlanEntry) => ({
 
 const transferHeadersForPlan = Effect.fn("transferHeadersForPlan")(
   function* transferHeadersForPlanEffect(
-    env: WorkerEnv | undefined,
+    key: CryptoKey,
+    expiresAt: string,
     plan: ObjectTransferPlanEntry
   ) {
-    if (devAuthEnabled(env)) {
-      return planWithObjectHeaders(plan) satisfies ObjectTransferPlanEntry;
-    }
-
-    const secret = transferSecretForEnv(env);
-
-    if (secret === null) {
-      return yield* new Forbidden({
-        message:
-          "The Worker does not have STATEFUL_CI_TRANSFER_SECRET configured, so backend-authorized object transfer plans cannot be issued. Configure the transfer secret before using restore/save object downloads or uploads.",
-      });
-    }
-
-    const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-    const expiresAt = String(now + transferTokenTtlMillis);
     const token = yield* signTransferPayload(
-      secret,
+      key,
       transferTokenPayload({
         digest: plan.object.digest,
         expiresAt,
@@ -461,11 +452,12 @@ const transferHeadersForPlan = Effect.fn("transferHeadersForPlan")(
         size: plan.object.size,
       })
     );
+    const planWithHeaders = planWithObjectHeaders(plan);
 
     return {
-      ...planWithObjectHeaders(plan),
+      ...planWithHeaders,
       headers: {
-        ...planWithObjectHeaders(plan).headers,
+        ...planWithHeaders.headers,
         [transferExpiresAtHeader]: expiresAt,
         [transferTokenHeader]: token,
       },
@@ -478,10 +470,26 @@ const withTransferHeaders = (
   plans: readonly ObjectTransferPlanEntry[]
 ) =>
   Effect.gen(function* withTransferHeadersEffect() {
+    if (devAuthEnabled(env)) {
+      return plans.map(planWithObjectHeaders);
+    }
+
+    const secret = transferSecretForEnv(env);
+
+    if (secret === null) {
+      return yield* new Forbidden({
+        message:
+          "The Worker does not have STATEFUL_CI_TRANSFER_SECRET configured, so backend-authorized object transfer plans cannot be issued. Configure the transfer secret before using restore/save object downloads or uploads.",
+      });
+    }
+
+    const key = yield* importTransferSigningKey(secret);
+    const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+    const expiresAt = String(now + transferTokenTtlMillis);
     const authorizedPlans: ObjectTransferPlanEntry[] = [];
 
     for (const plan of plans) {
-      authorizedPlans.push(yield* transferHeadersForPlan(env, plan));
+      authorizedPlans.push(yield* transferHeadersForPlan(key, expiresAt, plan));
     }
 
     return authorizedPlans;
@@ -560,8 +568,9 @@ const authorizeObjectTransfer = Effect.fn("authorizeObjectTransfer")(
       });
     }
 
+    const signingKey = yield* importTransferSigningKey(expectedToken);
     const expected = yield* signTransferPayload(
-      expectedToken,
+      signingKey,
       transferTokenPayload({
         digest: object.digest,
         expiresAt,
@@ -956,17 +965,6 @@ const invalidObjectUploadPlanResponse = (path: string) =>
     { status: 400 }
   );
 
-const readObjectBody = (request: Request) =>
-  Effect.tryPromise({
-    catch: () =>
-      new BlobStoreError({
-        message:
-          "Could not read the snapshot object upload body. The object was not stored.",
-        reason: "io_failed",
-      }),
-    try: async () => new Uint8Array(await request.arrayBuffer()),
-  });
-
 const handleObjectRoute = Effect.fn("handleObjectRoute")(
   function* handleObjectRouteEffect(
     request: Request,
@@ -999,11 +997,11 @@ const handleObjectRoute = Effect.fn("handleObjectRoute")(
         return invalidObjectUploadPlanResponse(path);
       }
 
-      const bytes = yield* blobStore.get(key);
+      const object = yield* blobStore.get(key);
 
-      return new Response(bytes, {
+      return new Response(object.body, {
         headers: {
-          "content-length": String(bytes.byteLength),
+          "content-length": String(object.size),
           "content-type": "application/octet-stream",
           "x-stateful-ci-object-kind": objectKindForKey(key),
         },
@@ -1032,10 +1030,16 @@ const handleObjectRoute = Effect.fn("handleObjectRoute")(
         });
       }
 
-      const body = yield* readObjectBody(request);
+      if (request.body === null) {
+        return yield* new BlobStoreError({
+          key,
+          message: `Snapshot object ${key} upload did not include a request body. The object was not stored.`,
+          reason: "size_mismatch",
+        });
+      }
 
       yield* blobStore.putIfAbsent({
-        body,
+        body: request.body,
         expectedDigest: object.digest,
         expectedSize: object.size,
         key,

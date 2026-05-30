@@ -1,11 +1,8 @@
 import type { SnapshotObjectKey } from "@stateful-ci/core";
+import { sha256HexFromDigest } from "@stateful-ci/core";
 import { Effect } from "effect";
 
-import {
-  BlobStore,
-  validateExistingObjectBytes,
-  validatePutIfAbsentInput,
-} from "./blob-store";
+import { BlobStore } from "./blob-store";
 import { BlobStoreError } from "./blob-store-error";
 
 export interface R2BlobStoreBucket {
@@ -54,15 +51,7 @@ export const createR2BlobStore = (
           return yield* missingObject(key);
         }
 
-        return yield* Effect.tryPromise({
-          catch: () =>
-            new BlobStoreError({
-              key,
-              message: `Could not read snapshot object ${key} bytes from R2. Check the bucket binding and retry.`,
-              reason: "io_failed",
-            }),
-          try: async () => new Uint8Array(await object.arrayBuffer()),
-        });
+        return { body: object.body, size: object.size };
       }),
     head: (key) =>
       Effect.tryPromise({
@@ -80,8 +69,6 @@ export const createR2BlobStore = (
       }),
     putIfAbsent: (input) =>
       Effect.gen(function* putIfAbsentEffect() {
-        yield* validatePutIfAbsentInput(input);
-
         const inserted = yield* Effect.tryPromise({
           catch: () =>
             new BlobStoreError({
@@ -92,10 +79,19 @@ export const createR2BlobStore = (
           try: () =>
             bucket.put(input.key, input.body, {
               onlyIf: new Headers({ "If-None-Match": "*" }),
+              sha256: sha256HexFromDigest(input.expectedDigest),
             }),
         });
 
         if (inserted !== null) {
+          if (inserted.size !== input.expectedSize) {
+            return yield* new BlobStoreError({
+              key: input.key,
+              message: `Snapshot object ${input.key} upload stored ${inserted.size} bytes, but the backend expected ${input.expectedSize}.`,
+              reason: "size_mismatch",
+            });
+          }
+
           return;
         }
 
@@ -123,6 +119,25 @@ export const createR2BlobStore = (
           });
         }
 
-        yield* validateExistingObjectBytes(input, existing);
+        const conflict = new BlobStoreError({
+          key: input.key,
+          message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
+          reason: "conflict",
+        });
+
+        if (existing.byteLength !== input.expectedSize) {
+          return yield* conflict;
+        }
+
+        const digestBytes = yield* Effect.promise(() =>
+          crypto.subtle.digest("SHA-256", existing)
+        );
+        const digest = [...new Uint8Array(digestBytes)]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("");
+
+        if (digest !== sha256HexFromDigest(input.expectedDigest)) {
+          return yield* conflict;
+        }
       }),
   });

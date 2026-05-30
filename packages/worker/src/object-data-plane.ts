@@ -12,9 +12,6 @@ import { Effect, Exit, Schema } from "effect";
 
 import { BlobStore } from "./blob-store";
 
-export const objectRouteForKey = (key: SnapshotObjectKey) =>
-  `${routes.objects.pathPrefix}${key}`;
-
 export const parseObjectRouteKey = (path: string) => {
   if (!path.startsWith(routes.objects.pathPrefix)) {
     return null;
@@ -40,7 +37,7 @@ const transferPlanEntry = (
       : undefined,
   method,
   object,
-  route: objectRouteForKey(object.key),
+  route: `${routes.objects.pathPrefix}${object.key}`,
   transport: "worker-route",
 });
 

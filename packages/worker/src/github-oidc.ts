@@ -8,7 +8,7 @@ import {
 } from "@stateful-ci/core";
 import { Clock, Effect, Exit, Schema } from "effect";
 
-export const githubActionsIssuer =
+const githubActionsIssuer =
   "https://token.actions.githubusercontent.com" as const;
 export const defaultGitHubOidcAudience = "stateful-ci" as const;
 
@@ -71,7 +71,7 @@ export class GitHubOidcVerificationError extends Schema.TaggedErrorClass<GitHubO
   }
 ) {}
 
-export interface GitHubOidcVerificationOptions {
+interface GitHubOidcVerificationOptions {
   readonly audience: string;
   readonly issuedAtToleranceSeconds?: number;
   readonly jwks?: readonly GitHubJwk[];
