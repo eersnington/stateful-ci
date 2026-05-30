@@ -13,7 +13,8 @@ import { env } from "cloudflare:workers";
 import { Effect, Schema } from "effect";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import worker, { handleFetch } from "../src/index";
+import { handleFetch } from "../src/handler";
+import worker from "../src/index";
 import { createD1MetadataBackend } from "../src/metadata";
 import {
   createSignedGitHubOidcToken,

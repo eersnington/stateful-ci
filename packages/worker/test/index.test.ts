@@ -18,7 +18,8 @@ import { Effect, Schema } from "effect";
 import { beforeAll } from "vitest";
 
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
-import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
+import { handleFetch, maxProtocolBodyBytes } from "../src/handler";
+import worker from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
 import {
@@ -146,10 +147,6 @@ const restoreRequest = {
   },
 };
 
-const manifestDigest =
-  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const manifestKey =
-  "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
 const seededManifestDigest =
   "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f";
 const seededManifestKey =
@@ -166,36 +163,6 @@ const seededManifestBytes = new TextEncoder().encode("manifest");
 const seededPackBytes = new TextEncoder().encode("pack");
 const seededChunkBytes = new TextEncoder().encode("chunk");
 const seededWorkspaceTotalBytes = 481_203_912;
-const saveObjects = [
-  {
-    digest: manifestDigest,
-    key: manifestKey,
-    kind: "manifest",
-    size: 512,
-  },
-] as const;
-
-const saveRequest = {
-  baseSnapshotId: "snap_123",
-  manifest: {
-    chunkCount: 1,
-    fileCount: 21_903,
-    hash: manifestDigest,
-    id: "snap_124",
-    key: manifestKey,
-    objects: saveObjects,
-    safety: {
-      skippedByBuiltInDenylist: 3,
-      skippedByUserExclude: 12,
-      skippedUnsupportedType: 1,
-    },
-    totalBytes: seededWorkspaceTotalBytes,
-  },
-  protocolVersion: 1,
-  runId: "123456789",
-  workspaceId: "ws_123",
-};
-
 const seededNamespace =
   "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
@@ -1070,19 +1037,6 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/save fails closed", async () => {
-    const response = await worker.fetch(
-      jsonRequest("/v1/save", saveRequest),
-      env
-    );
-
-    expect(response.status).toBe(410);
-    await expect(response.json()).resolves.toStrictEqual({
-      decision: "denied",
-      reason: "backend_policy_not_configured",
-    });
-  });
-
   it.effect("POST /v1/save/prepare returns missing upload plans", () =>
     Effect.gen(function* prepareReturnsMissingObjectsEffect() {
       const blobStore = createInMemoryBlobStore(
@@ -1721,38 +1675,6 @@ describe("worker API", () => {
       trustClass: "external",
     });
   });
-
-  it.effect("POST /v1/save is fail-closed and does not mutate metadata", () =>
-    Effect.gen(function* legacySaveIsFailClosedEffect() {
-      const metadata = createInMemoryMetadataBackend({
-        workspaceTargets: [
-          {
-            namespace: seededNamespace,
-            refName: seededRefName,
-            runId: Schema.decodeSync(RunId)("123456789"),
-            trustClass: "trusted",
-            workspaceId: seededWorkspaceId,
-          },
-        ],
-      });
-      const response = yield* Effect.promise(() =>
-        handleFetch(jsonRequest("/v1/save", saveRequest), env, { metadata })
-      );
-      const body = yield* Effect.promise(() => response.json());
-      const header = yield* metadata.getSnapshotHeader(
-        Schema.decodeSync(SnapshotId)("snap_124")
-      );
-      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
-
-      assert.strictEqual(response.status, 410);
-      assert.deepStrictEqual(body, {
-        decision: "denied",
-        reason: "backend_policy_not_configured",
-      });
-      assert.isNull(header);
-      assert.isNull(ref);
-    })
-  );
 
   it("invalid JSON returns structured 400", async () => {
     const response = await worker.fetch(
