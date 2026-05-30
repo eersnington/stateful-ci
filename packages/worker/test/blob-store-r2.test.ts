@@ -25,14 +25,4 @@ describe("R2 blob store", () => {
       assert.strictEqual(error.key, objectKey);
     })
   );
-
-  it.effect("preserves missing object errors for ranged GET", () =>
-    Effect.gen(function* missingRangeGetEffect() {
-      const blobStore = createR2BlobStore(missingBucket);
-      const error = yield* Effect.flip(blobStore.getRange(objectKey, 0, 8));
-
-      assert.strictEqual(error.reason, "missing");
-      assert.strictEqual(error.key, objectKey);
-    })
-  );
 });

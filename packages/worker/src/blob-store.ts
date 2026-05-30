@@ -1,10 +1,10 @@
 import type { Sha256Digest, SnapshotObjectKey } from "@stateful-ci/core";
-import { Context, Effect } from "effect";
+import { Sha256Digest as Sha256DigestSchema } from "@stateful-ci/core";
+import { Context, Effect, Schema } from "effect";
 
 import { BlobStoreError } from "./blob-store-error";
 
 export interface BlobObjectHead {
-  readonly key: SnapshotObjectKey;
   readonly size: number;
 }
 
@@ -15,48 +15,79 @@ export interface PutIfAbsentInput {
   readonly key: SnapshotObjectKey;
 }
 
-export interface PutIfAbsentResult {
-  readonly status: "already-present" | "inserted";
-}
-
 export class BlobStore extends Context.Service<
   BlobStore,
   {
     readonly get: (
       key: SnapshotObjectKey
     ) => Effect.Effect<Uint8Array, BlobStoreError>;
-    readonly getRange: (
-      key: SnapshotObjectKey,
-      offset: number,
-      length: number
-    ) => Effect.Effect<Uint8Array, BlobStoreError>;
     readonly head: (
       key: SnapshotObjectKey
     ) => Effect.Effect<BlobObjectHead | null, BlobStoreError>;
-    readonly presignGet: (
-      key: SnapshotObjectKey,
-      ttlSeconds: number
-    ) => Effect.Effect<null, BlobStoreError>;
-    readonly presignPut: (
-      key: SnapshotObjectKey,
-      ttlSeconds: number,
-      constraints: {
-        readonly expectedDigest: Sha256Digest;
-        readonly expectedSize: number;
-      }
-    ) => Effect.Effect<null, BlobStoreError>;
     readonly putIfAbsent: (
       input: PutIfAbsentInput
-    ) => Effect.Effect<PutIfAbsentResult, BlobStoreError>;
+    ) => Effect.Effect<void, BlobStoreError>;
   }
 >()("stateful-ci/worker/BlobStore") {}
 
-export const unsupportedPresign = (key: SnapshotObjectKey) =>
-  Effect.fail(
-    new BlobStoreError({
-      key,
-      message:
-        "Signed object URLs are not configured for this backend. Use authenticated Worker object routes instead.",
-      reason: "unsupported",
-    })
+const digestForSnapshotObject = (bytes: Uint8Array) =>
+  Effect.promise(() => crypto.subtle.digest("SHA-256", bytes)).pipe(
+    Effect.map((digest) =>
+      Schema.decodeSync(Sha256DigestSchema)(
+        `sha256:${[...new Uint8Array(digest)]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("")}`
+      )
+    )
   );
+
+export const validatePutIfAbsentInput = Effect.fn("validatePutIfAbsentInput")(
+  function* validatePutIfAbsentInputEffect(input: PutIfAbsentInput) {
+    if (input.body.byteLength !== input.expectedSize) {
+      return yield* new BlobStoreError({
+        key: input.key,
+        message: `Snapshot object ${input.key} upload size was ${input.body.byteLength}, but the backend expected ${input.expectedSize}.`,
+        reason: "size_mismatch",
+      });
+    }
+
+    const digest = yield* digestForSnapshotObject(input.body);
+
+    if (digest !== input.expectedDigest) {
+      return yield* new BlobStoreError({
+        key: input.key,
+        message: `Snapshot object ${input.key} upload digest did not match the expected digest. The object was not stored.`,
+        reason: "digest_mismatch",
+      });
+    }
+  }
+);
+
+export const validateExistingObjectBytes = (
+  input: PutIfAbsentInput,
+  existing: Uint8Array
+) => {
+  if (existing.byteLength !== input.body.byteLength) {
+    return Effect.fail(
+      new BlobStoreError({
+        key: input.key,
+        message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
+        reason: "conflict",
+      })
+    );
+  }
+
+  for (let index = 0; index < existing.byteLength; index += 1) {
+    if (existing[index] !== input.body[index]) {
+      return Effect.fail(
+        new BlobStoreError({
+          key: input.key,
+          message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
+          reason: "conflict",
+        })
+      );
+    }
+  }
+
+  return Effect.void;
+};
