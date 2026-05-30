@@ -488,6 +488,36 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
       )
     );
 
+    it.effect("rejects path-prefixed API URLs before network calls", () =>
+      withWorkspace(setupRestoreWorkspace, () =>
+        Effect.gen(function* restoreRejectsApiUrlPathPrefixEffect() {
+          const { requests, value: error } = yield* withProtocolServer(
+            () =>
+              Response.json(
+                Schema.encodeUnknownSync(RestoreDeniedResponse)({
+                  decision: "denied",
+                  reason: "backend_policy_not_configured",
+                  save: { allowed: false },
+                  trustClass: "unknown",
+                })
+              ),
+            (url) =>
+              Effect.flip(
+                restoreProgram({
+                  ...githubEnv,
+                  STATEFUL_CI_API_TOKEN: "test-token",
+                  STATEFUL_CI_API_URL: `${url}/stateful-ci`,
+                })
+              )
+          );
+
+          assert.strictEqual(error._tag, "CliFailure");
+          assert.include(error.message, "Worker root URL");
+          assert.strictEqual(requests.length, 0);
+        })
+      )
+    );
+
     it.effect(
       "reports reachable backend HTTP errors separately from network failures",
       () =>

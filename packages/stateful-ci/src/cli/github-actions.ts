@@ -61,6 +61,14 @@ export const apiConfigFromEnv = Effect.fn("apiConfigFromEnv")(
       );
     }
 
+    if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+      return yield* Effect.fail(
+        cliFailure(
+          "STATEFUL_CI_API_URL must be the deployed Worker root URL without a path, query, or fragment. Set it to the Worker origin, for example https://stateful-ci.example.workers.dev."
+        )
+      );
+    }
+
     return {
       token: optionalEnv(env, "STATEFUL_CI_API_TOKEN"),
       url,
