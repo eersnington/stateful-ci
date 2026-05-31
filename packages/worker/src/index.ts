@@ -1,6 +1,6 @@
 import { WorkspaceSnapshotCoordinatorDurableObject } from "./durable-object";
 import { handleFetch } from "./handler";
-import type { WorkerEnv } from "./handler";
+import type { WorkerEnv } from "./worker-env";
 
 export { WorkspaceSnapshotCoordinatorDurableObject };
 
