@@ -293,6 +293,11 @@ const objectMethodNotAllowedResponse = (path: string, method: string) =>
     { headers: { Allow: "HEAD, GET, PUT" }, status: 405 }
   );
 
+type ObjectRouteMethod = "HEAD" | "GET" | "PUT";
+
+const isObjectRouteMethod = (method: string): method is ObjectRouteMethod =>
+  method === "HEAD" || method === "GET" || method === "PUT";
+
 export const handleObjectRoute = Effect.fn("handleObjectRoute")(
   function* handleObjectRouteEffect(
     request: Request,
@@ -302,7 +307,7 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
   ) {
     const { method } = request;
 
-    if (method !== "HEAD" && method !== "GET" && method !== "PUT") {
+    if (!isObjectRouteMethod(method)) {
       return objectMethodNotAllowedResponse(path, method);
     }
 
@@ -342,46 +347,42 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
       });
     }
 
-    if (method === "PUT") {
-      const object = expectedObjectFromHeaders(key, request.headers);
+    const object = expectedObjectFromHeaders(key, request.headers);
 
-      if (object === null) {
-        return invalidObjectUploadPlanResponse(path);
-      }
-
-      const contentLength = request.headers.get("content-length");
-      const declaredSize = Number(contentLength);
-
-      if (
-        contentLength === null ||
-        !Number.isSafeInteger(declaredSize) ||
-        declaredSize !== object.size
-      ) {
-        return yield* new BlobStoreError({
-          key,
-          message: `Snapshot object ${key} upload declared ${contentLength ?? "no"} Content-Length, but the backend expected ${object.size}. The object was not stored.`,
-          reason: "size_mismatch",
-        });
-      }
-
-      if (request.body === null) {
-        return yield* new BlobStoreError({
-          key,
-          message: `Snapshot object ${key} upload did not include a request body. The object was not stored.`,
-          reason: "size_mismatch",
-        });
-      }
-
-      yield* blobStore.putIfAbsent({
-        body: request.body,
-        expectedDigest: object.digest,
-        expectedSize: object.size,
-        key,
-      });
-
-      return new Response(null, { status: 204 });
+    if (object === null) {
+      return invalidObjectUploadPlanResponse(path);
     }
 
-    return objectMethodNotAllowedResponse(path, method);
+    const contentLength = request.headers.get("content-length");
+    const declaredSize = Number(contentLength);
+
+    if (
+      contentLength === null ||
+      !Number.isSafeInteger(declaredSize) ||
+      declaredSize !== object.size
+    ) {
+      return yield* new BlobStoreError({
+        key,
+        message: `Snapshot object ${key} upload declared ${contentLength ?? "no"} Content-Length, but the backend expected ${object.size}. The object was not stored.`,
+        reason: "size_mismatch",
+      });
+    }
+
+    if (request.body === null) {
+      return yield* new BlobStoreError({
+        key,
+        message: `Snapshot object ${key} upload did not include a request body. The object was not stored.`,
+        reason: "size_mismatch",
+      });
+    }
+
+    yield* blobStore.putIfAbsent({
+      body: request.body,
+      expectedDigest: object.digest,
+      expectedSize: object.size,
+      key,
+    });
+
+    return new Response(null, { status: 204 });
   }
 );
