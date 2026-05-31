@@ -282,6 +282,17 @@ const invalidObjectUploadPlanResponse = (path: string) =>
     { status: 400 }
   );
 
+const objectMethodNotAllowedResponse = (path: string, method: string) =>
+  Response.json(
+    new MethodNotAllowed({
+      allowed: ["HEAD", "GET", "PUT"],
+      message: `The ${path} route only accepts HEAD, GET, or PUT requests.`,
+      method,
+      path,
+    }),
+    { headers: { Allow: "HEAD, GET, PUT" }, status: 405 }
+  );
+
 export const handleObjectRoute = Effect.fn("handleObjectRoute")(
   function* handleObjectRouteEffect(
     request: Request,
@@ -289,10 +300,16 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
     key: SnapshotObjectInventoryEntry["key"],
     path: string
   ) {
+    const { method } = request;
+
+    if (method !== "HEAD" && method !== "GET" && method !== "PUT") {
+      return objectMethodNotAllowedResponse(path, method);
+    }
+
     const blobStore = yield* BlobStore;
     yield* authorizeObjectTransfer(request, env, key);
 
-    if (request.method === "HEAD") {
+    if (method === "HEAD") {
       const head = yield* blobStore.head(key);
 
       return head === null
@@ -306,7 +323,7 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
           });
     }
 
-    if (request.method === "GET") {
+    if (method === "GET") {
       if (
         !devAuthEnabled(env) &&
         expectedObjectFromHeaders(key, request.headers) === null
@@ -325,7 +342,7 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
       });
     }
 
-    if (request.method === "PUT") {
+    if (method === "PUT") {
       const object = expectedObjectFromHeaders(key, request.headers);
 
       if (object === null) {
@@ -365,14 +382,6 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
       return new Response(null, { status: 204 });
     }
 
-    return Response.json(
-      new MethodNotAllowed({
-        allowed: ["HEAD", "GET", "PUT"],
-        message: `The ${path} route only accepts HEAD, GET, or PUT requests.`,
-        method: request.method,
-        path,
-      }),
-      { headers: { Allow: "HEAD, GET, PUT" }, status: 405 }
-    );
+    return objectMethodNotAllowedResponse(path, method);
   }
 );

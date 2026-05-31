@@ -470,6 +470,22 @@ describe("worker API", () => {
     });
   });
 
+  it("object routes reject unsupported methods before auth", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("HEAD, GET, PUT");
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "MethodNotAllowed",
+      allowed: ["HEAD", "GET", "PUT"],
+      method: "POST",
+    });
+  });
+
   it("PUT /v1/objects requires prepare-plan headers", async () => {
     const response = await handleFetch(
       new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
