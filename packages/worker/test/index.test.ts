@@ -979,8 +979,11 @@ describe("worker API", () => {
     expect(audit[0]).toMatchObject({
       decision: "denied",
       eventType: "restore",
+      namespace: "unbound/control-plane-auth",
       reason: "oidc_missing",
+      refName: "unknown",
       trustClass: "unknown",
+      workspaceId: null,
     });
   });
 
@@ -1044,7 +1047,8 @@ describe("worker API", () => {
   });
 
   it("POST /v1/prepare fails closed with malformed configured JWKS", async () => {
-    const response = await worker.fetch(
+    const metadata = createInMemoryMetadataBackend();
+    const response = await handleFetch(
       jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
@@ -1064,14 +1068,26 @@ describe("worker API", () => {
       {
         STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
         STATEFUL_CI_GITHUB_JWKS_JSON: "not json",
-      }
+      },
+      { metadata }
     );
+    const audit = await Effect.runPromise(metadata.listAuditEvents());
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
       decision: "denied",
       reason: "oidc_invalid",
       trustClass: "unknown",
+    });
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
+      decision: "denied",
+      eventType: "prepare-save",
+      namespace: "unbound/control-plane-auth",
+      reason: "oidc_invalid",
+      refName: "unknown",
+      trustClass: "unknown",
+      workspaceId: null,
     });
   });
 
