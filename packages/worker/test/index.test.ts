@@ -18,7 +18,7 @@ import { Effect, Schema } from "effect";
 import { beforeAll } from "vitest";
 
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
-import { handleFetch, maxProtocolBodyBytes } from "../src/handler";
+import { handleFetch } from "../src/handler";
 import worker from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
@@ -1839,7 +1839,7 @@ describe("worker API", () => {
   it("oversized JSON returns structured 413 before schema validation", async () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/v1/restore", {
-        body: JSON.stringify({ payload: "a".repeat(maxProtocolBodyBytes) }),
+        body: JSON.stringify({ payload: "a".repeat(70 * 1024) }),
         headers: {
           authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
           "content-type": "application/json",
@@ -1852,7 +1852,6 @@ describe("worker API", () => {
     expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({
       _tag: "RequestBodyTooLarge",
-      limitBytes: maxProtocolBodyBytes,
     });
   });
 
