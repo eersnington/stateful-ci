@@ -12,6 +12,16 @@ import { Effect, Exit, Schema } from "effect";
 
 import { BlobStore } from "./blob-store";
 
+export class SnapshotObjectAvailabilityError extends Schema.TaggedErrorClass<SnapshotObjectAvailabilityError>()(
+  "SnapshotObjectAvailabilityError",
+  {
+    reason: Schema.Literals([
+      "snapshot_object_missing",
+      "snapshot_object_mismatch",
+    ]),
+  }
+) {}
+
 export const parseObjectRouteKey = (path: string) => {
   if (!path.startsWith(routes.objects.pathPrefix)) {
     return null;
@@ -72,14 +82,18 @@ const objectAvailability = Effect.fn("objectAvailability")(
 
     for (const object of objects) {
       if (!objectMatchesCanonicalKey(object)) {
-        return yield* Effect.fail("snapshot_object_mismatch" as const);
+        return yield* new SnapshotObjectAvailabilityError({
+          reason: "snapshot_object_mismatch",
+        });
       }
 
       const head = yield* blobStore.head(object.key);
 
       if (head === null) {
         if (missing === "fail") {
-          return yield* Effect.fail("snapshot_object_missing" as const);
+          return yield* new SnapshotObjectAvailabilityError({
+            reason: "snapshot_object_missing",
+          });
         }
 
         missingObjects.push(uploadPlanEntry(object));
@@ -87,7 +101,9 @@ const objectAvailability = Effect.fn("objectAvailability")(
       }
 
       if (head.size !== object.size) {
-        return yield* Effect.fail("snapshot_object_mismatch" as const);
+        return yield* new SnapshotObjectAvailabilityError({
+          reason: "snapshot_object_mismatch",
+        });
       }
     }
 
