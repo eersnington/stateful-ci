@@ -572,7 +572,7 @@ export const handlePrepareSave: (
               auth,
               trustedRefs
             );
-            const expiresAt = yield* currentIsoTimestamp;
+            const preparedAt = yield* currentIsoTimestamp;
 
             if (
               auth._tag === "VerifiedGitHubOidc" &&
@@ -619,7 +619,7 @@ export const handlePrepareSave: (
                   Effect.gen(function* prepareAllowedEffect() {
                     const saveAuthorization = yield* coordinator.prepareSave({
                       auditPayloadJson: context.auditPayloadJson,
-                      expiresAt,
+                      preparedAt,
                       producer: context.producer,
                       runId: context.runId,
                       target: context.target,

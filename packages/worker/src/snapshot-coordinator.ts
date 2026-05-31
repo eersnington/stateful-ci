@@ -75,7 +75,7 @@ export interface AuthorizeRestoreInput {
 
 export interface PrepareSaveInput {
   readonly auditPayloadJson?: string | null | undefined;
-  readonly expiresAt: string;
+  readonly preparedAt: string;
   readonly producer: ProducerContext;
   readonly runId: RunId;
   readonly target: RefTarget;
@@ -713,7 +713,7 @@ export const createMetadataSnapshotCoordinator =
           );
           yield* metadata.rememberWorkspaceTarget({
             ...input.target,
-            expiresAt: input.expiresAt,
+            expiresAt: input.preparedAt,
             producerActor: input.producer.actor,
             producerEvent: input.producer.event,
             producerJob: input.producer.job,

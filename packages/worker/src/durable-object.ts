@@ -52,7 +52,7 @@ const AuthorizeRestoreInputSchema = Schema.Struct({
 
 const PrepareSaveInputSchema = Schema.Struct({
   auditPayloadJson: Schema.optional(Schema.NullOr(Schema.String)),
-  expiresAt: Schema.String.check(Schema.isMinLength(1)),
+  preparedAt: Schema.String.check(Schema.isMinLength(1)),
   producer: ProducerContextSchema,
   runId: RunId,
   target: RefTargetSchema,
