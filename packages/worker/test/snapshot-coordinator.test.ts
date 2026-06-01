@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
+  ChunkKey,
   HeadGeneration,
   IdempotencyKey,
   ManifestKey,
@@ -261,7 +262,16 @@ describe("snapshot coordinator", () => {
       Effect.gen(function* coordinatorRecoversMissingIdempotencyEffect() {
         const metadata = createInMemoryMetadataBackend({
           refs: [refFor(commitInput.manifest.snapshotId)],
-          snapshots: [committedHeader],
+          snapshotObjects: [
+            {
+              digest: manifestDigest,
+              key: manifestKey,
+              kind: "manifest",
+              size: 8,
+              snapshotId: commitInput.manifest.snapshotId,
+            },
+          ],
+          snapshots: [retryHeader],
           workspaceTargets: [testWorkspaceTarget],
         });
         const coordinator = createMetadataSnapshotCoordinator();
@@ -280,6 +290,44 @@ describe("snapshot coordinator", () => {
         });
         assert.deepStrictEqual(replay, recovered);
       })
+  );
+
+  it.effect(
+    "rejects idempotent replay when persisted objects do not match the request",
+    () =>
+      Effect.gen(
+        function* coordinatorRejectsMismatchedIdempotentReplayEffect() {
+          const chunkDigest = Schema.decodeSync(Sha256Digest)(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          );
+          const chunkKey = Schema.decodeSync(ChunkKey)(
+            "chunks/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          );
+          const metadata = createInMemoryMetadataBackend({
+            workspaceTargets: [testWorkspaceTarget],
+          });
+          const coordinator = createMetadataSnapshotCoordinator();
+
+          yield* coordinator
+            .commitSave(commitInput)
+            .pipe(Effect.provideService(MetadataBackend, metadata));
+
+          const replay = yield* coordinator
+            .commitSave({
+              ...commitInput,
+              objects: [
+                ...commitInput.objects,
+                { digest: chunkDigest, key: chunkKey, kind: "chunk", size: 4 },
+              ],
+            })
+            .pipe(Effect.provideService(MetadataBackend, metadata));
+
+          assert.deepStrictEqual(replay, {
+            decision: "denied",
+            reason: "idempotency_conflict",
+          });
+        }
+      )
   );
 
   it.effect(

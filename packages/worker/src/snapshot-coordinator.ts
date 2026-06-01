@@ -25,6 +25,8 @@ import {
   inventoryFromSnapshotRows,
   MetadataBackend,
   scopeKeyForRefTarget,
+  snapshotObjectsMatch,
+  snapshotRowsFromInventory,
   workspaceIdForRefTarget,
 } from "./metadata";
 import type {
@@ -169,6 +171,15 @@ const saveTargetForPolicy = (target: RefTarget, trustClass: TrustClass) => {
   return savePolicy.allowed ? target : null;
 };
 
+const snapshotStatsJsonForObjects = (
+  objects: readonly SnapshotObjectInventoryEntry[]
+) =>
+  JSON.stringify({
+    chunkCount: objects.filter((object) => object.kind === "chunk").length,
+    objectCount: objects.length,
+    totalObjectBytes: objects.reduce((total, object) => total + object.size, 0),
+  });
+
 const snapshotHeaderForCommit = (
   input: CommitSaveInput,
   trustClass: TrustClass,
@@ -190,18 +201,46 @@ const snapshotHeaderForCommit = (
   producerWorkflow: input.producer.workflow,
   safetyJson: "{}",
   snapshotId: input.manifest.snapshotId,
-  statsJson: JSON.stringify({
-    chunkCount: input.objects.filter((object) => object.kind === "chunk")
-      .length,
-    objectCount: input.objects.length,
-    totalObjectBytes: input.objects.reduce(
-      (total, object) => total + object.size,
-      0
-    ),
-  }),
+  statsJson: snapshotStatsJsonForObjects(input.objects),
   trustClass,
   workspaceId: input.workspaceId,
 });
+
+const snapshotMetadataMatchesInput = Effect.fn("snapshotMetadataMatchesInput")(
+  function* snapshotMetadataMatchesInput(
+    metadata: MetadataBackend["Service"],
+    input: CommitSaveInput
+  ): Effect.fn.Return<boolean, MetadataBackendError> {
+    const snapshot = yield* metadata.getSnapshotHeader(
+      input.manifest.snapshotId
+    );
+
+    if (
+      snapshot === null ||
+      snapshot.manifestDigest !== input.manifest.digest ||
+      snapshot.manifestKey !== input.manifest.key ||
+      snapshot.manifestSize !== input.manifest.size ||
+      snapshot.namespace !== input.target.namespace ||
+      snapshot.parentSnapshotId !== input.baseSnapshotId ||
+      snapshot.producerRunId !== input.producer.runId ||
+      snapshot.safetyJson !== "{}" ||
+      snapshot.snapshotId !== input.manifest.snapshotId ||
+      snapshot.statsJson !== snapshotStatsJsonForObjects(input.objects) ||
+      snapshot.workspaceId !== input.workspaceId
+    ) {
+      return false;
+    }
+
+    const objects = yield* metadata.getSnapshotObjects(
+      input.manifest.snapshotId
+    );
+
+    return snapshotObjectsMatch(
+      objects,
+      snapshotRowsFromInventory(input.manifest.snapshotId, input.objects)
+    );
+  }
+);
 
 const snapshotHeaderMatchesCommit = (
   snapshot: SnapshotHeader,
@@ -308,15 +347,9 @@ const recoverIdempotentCommit = Effect.fn("recoverIdempotentCommit")(
     actualGeneration: HeadGeneration,
     ref: RefRow | null
   ): Effect.fn.Return<CommitSaveResponse | null, MetadataBackendError> {
-    const matchingSnapshot =
-      ref?.snapshotId === input.manifest.snapshotId
-        ? yield* metadata.getSnapshotHeader(input.manifest.snapshotId)
-        : null;
-
     if (
-      matchingSnapshot?.workspaceId !== input.workspaceId ||
-      matchingSnapshot.manifestDigest !== input.manifest.digest ||
-      matchingSnapshot.producerRunId !== input.producer.runId
+      ref?.snapshotId !== input.manifest.snapshotId ||
+      !(yield* snapshotMetadataMatchesInput(metadata, input))
     ) {
       return null;
     }
@@ -372,6 +405,13 @@ const replayIdempotentCommit = Effect.fn("replayIdempotentCommit")(
       });
     }
 
+    if (!(yield* snapshotMetadataMatchesInput(metadata, input))) {
+      return Schema.decodeSync(CommitSaveDeniedResponse)({
+        decision: "denied",
+        reason: "idempotency_conflict",
+      });
+    }
+
     return Schema.decodeSync(CommitSaveIdempotentResponse)({
       decision: "idempotent",
       headGeneration: commit.headGeneration,
@@ -397,6 +437,13 @@ const recoverReservedIdempotency = Effect.fn("recoverReservedIdempotency")(
       ref?.snapshotId === commit.snapshotId &&
       actualHeadGeneration === commit.headGeneration
     ) {
+      if (!(yield* snapshotMetadataMatchesInput(metadata, input))) {
+        return Schema.decodeSync(CommitSaveDeniedResponse)({
+          decision: "denied",
+          reason: "idempotency_conflict",
+        });
+      }
+
       return Schema.decodeSync(CommitSaveIdempotentResponse)({
         decision: "idempotent",
         headGeneration: commit.headGeneration,

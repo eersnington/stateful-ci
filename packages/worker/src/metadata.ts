@@ -307,7 +307,7 @@ export const inventoryFromSnapshotRows = (
     }))
   );
 
-const snapshotRowsFromInventory = (
+export const snapshotRowsFromInventory = (
   snapshotId: SnapshotId,
   objects: readonly SnapshotObjectInventoryEntry[]
 ): readonly SnapshotObjectRow[] =>
@@ -352,7 +352,7 @@ const snapshotObjectMatches = (
   left.size === right.size &&
   left.snapshotId === right.snapshotId;
 
-const snapshotObjectsMatch = (
+export const snapshotObjectsMatch = (
   left: readonly SnapshotObjectRow[],
   right: readonly SnapshotObjectRow[]
 ) => {
@@ -884,32 +884,10 @@ export const createD1MetadataBackend = (
       }),
     putSnapshotHeader: (header) =>
       Effect.gen(function* putSnapshotHeaderD1Effect() {
-        const existing = yield* queryOne(
-          db
-            .prepare("select * from snapshots where snapshot_id = ?")
-            .bind(header.snapshotId),
-          "getSnapshotHeaderForWrite",
-          snapshotFromRow
-        );
-
-        if (existing !== null) {
-          if (snapshotHeaderMatches(existing, header)) {
-            return;
-          }
-
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "D1 metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotHeader",
-            })
-          );
-        }
-
         yield* runStatement(
           db
             .prepare(
-              "insert into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              "insert or ignore into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(
               header.snapshotId,
@@ -934,47 +912,36 @@ export const createD1MetadataBackend = (
             ),
           "putSnapshotHeader"
         );
+
+        const stored = yield* queryOne(
+          db
+            .prepare("select * from snapshots where snapshot_id = ?")
+            .bind(header.snapshotId),
+          "verifySnapshotHeaderWrite",
+          snapshotFromRow
+        );
+
+        if (stored === null || !snapshotHeaderMatches(stored, header)) {
+          return yield* Effect.fail(
+            new MetadataBackendError({
+              message:
+                "D1 metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+              operation: "putSnapshotHeader",
+            })
+          );
+        }
       }),
     putSnapshotObjects: (snapshotId, objects) =>
       Effect.gen(function* putSnapshotObjectsD1Effect() {
         const desired = snapshotRowsFromInventory(snapshotId, objects);
-        const existingResult = yield* Effect.tryPromise({
-          catch: (cause) =>
-            new MetadataBackendError({
-              cause,
-              message:
-                "D1 metadata query failed during getSnapshotObjectsForWrite. Check the D1 binding and migration state before retrying.",
-              operation: "getSnapshotObjectsForWrite",
-            }),
-          try: () =>
-            db
-              .prepare(
-                "select * from snapshot_objects where snapshot_id = ? order by object_key"
-              )
-              .bind(snapshotId)
-              .all<SnapshotObjectD1Row>(),
-        });
-        const existing = existingResult.results.map(objectFromRow);
-
-        if (snapshotObjectConflict(existing, desired)) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "D1 metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotObjects",
-            })
-          );
-        }
-
-        const existingKeys = new Set(existing.map((object) => object.key));
 
         yield* Effect.forEach(
-          desired.filter((object) => !existingKeys.has(object.key)),
+          desired,
           (object) =>
             runStatement(
               db
                 .prepare(
-                  "insert into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
+                  "insert or ignore into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
                 )
                 .bind(
                   object.snapshotId,
