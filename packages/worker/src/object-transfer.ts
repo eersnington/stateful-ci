@@ -295,18 +295,18 @@ const invalidObjectUploadPlanResponse = (path: string) =>
 const objectMethodNotAllowedResponse = (path: string, method: string) =>
   Response.json(
     new MethodNotAllowed({
-      allowed: ["HEAD", "GET", "PUT"],
-      message: `The ${path} route only accepts HEAD, GET, or PUT requests.`,
+      allowed: ["GET", "PUT"],
+      message: `The ${path} route only accepts GET or PUT requests.`,
       method,
       path,
     }),
-    { headers: { Allow: "HEAD, GET, PUT" }, status: 405 }
+    { headers: { Allow: "GET, PUT" }, status: 405 }
   );
 
-type ObjectRouteMethod = "HEAD" | "GET" | "PUT";
+type ObjectRouteMethod = "GET" | "PUT";
 
 const isObjectRouteMethod = (method: string): method is ObjectRouteMethod =>
-  method === "HEAD" || method === "GET" || method === "PUT";
+  method === "GET" || method === "PUT";
 
 export const handleObjectRoute = Effect.fn("handleObjectRoute")(
   function* handleObjectRouteEffect(
@@ -323,20 +323,6 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
 
     const blobStore = yield* BlobStore;
     yield* authorizeObjectTransfer(request, env, key);
-
-    if (method === "HEAD") {
-      const head = yield* blobStore.head(key);
-
-      return head === null
-        ? new Response(null, { status: 404 })
-        : new Response(null, {
-            headers: {
-              "content-length": String(head.size),
-              "x-stateful-ci-object-kind": objectKindForKey(key),
-            },
-            status: 200,
-          });
-    }
 
     if (method === "GET") {
       const object = yield* blobStore.get(key);

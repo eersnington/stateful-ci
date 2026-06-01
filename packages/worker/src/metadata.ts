@@ -103,7 +103,7 @@ export interface AuditEvent extends RefTarget {
 }
 
 export interface WorkspaceTarget extends RefTarget {
-  readonly expiresAt?: string;
+  readonly preparedAt?: string;
   readonly producerActor?: string;
   readonly producerEvent?: string;
   readonly producerJob?: string;
@@ -177,8 +177,8 @@ interface SnapshotObjectD1Row {
 }
 
 interface WorkspaceTargetD1Row {
-  readonly expires_at: string | null;
   readonly namespace: string;
+  readonly prepared_at: string | null;
   readonly producer_actor: string | null;
   readonly producer_event: string | null;
   readonly producer_job: string | null;
@@ -319,6 +319,68 @@ const snapshotRowsFromInventory = (
     snapshotId,
   }));
 
+const byObjectKey = (left: SnapshotObjectRow, right: SnapshotObjectRow) =>
+  left.key.localeCompare(right.key);
+
+const snapshotHeaderMatches = (left: SnapshotHeader, right: SnapshotHeader) =>
+  left.manifestDigest === right.manifestDigest &&
+  left.manifestKey === right.manifestKey &&
+  left.manifestSize === right.manifestSize &&
+  left.namespace === right.namespace &&
+  left.parentSnapshotId === right.parentSnapshotId &&
+  left.producerActor === right.producerActor &&
+  left.producerEvent === right.producerEvent &&
+  left.producerJob === right.producerJob &&
+  left.producerRef === right.producerRef &&
+  left.producerRepository === right.producerRepository &&
+  left.producerRunId === right.producerRunId &&
+  left.producerSha === right.producerSha &&
+  left.producerWorkflow === right.producerWorkflow &&
+  left.safetyJson === right.safetyJson &&
+  left.snapshotId === right.snapshotId &&
+  left.statsJson === right.statsJson &&
+  left.trustClass === right.trustClass &&
+  left.workspaceId === right.workspaceId;
+
+const snapshotObjectMatches = (
+  left: SnapshotObjectRow,
+  right: SnapshotObjectRow
+) =>
+  left.digest === right.digest &&
+  left.key === right.key &&
+  left.kind === right.kind &&
+  left.size === right.size &&
+  left.snapshotId === right.snapshotId;
+
+const snapshotObjectsMatch = (
+  left: readonly SnapshotObjectRow[],
+  right: readonly SnapshotObjectRow[]
+) => {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const leftSorted = left.toSorted(byObjectKey);
+  const rightSorted = right.toSorted(byObjectKey);
+
+  return leftSorted.every((object, index) => {
+    const other = rightSorted[index];
+    return other !== undefined && snapshotObjectMatches(object, other);
+  });
+};
+
+const snapshotObjectConflict = (
+  existing: readonly SnapshotObjectRow[],
+  desired: readonly SnapshotObjectRow[]
+) => {
+  const desiredByKey = new Map(desired.map((object) => [object.key, object]));
+
+  return existing.some((object) => {
+    const match = desiredByKey.get(object.key);
+    return match === undefined || !snapshotObjectMatches(object, match);
+  });
+};
+
 const auditMatchesQuery = (event: AuditEvent, query: AuditEventQuery = {}) =>
   (query.namespace === undefined || event.namespace === query.namespace) &&
   (query.refName === undefined || event.refName === query.refName) &&
@@ -415,7 +477,13 @@ export const createInMemoryMetadataBackend = (
       ),
     putSnapshotHeader: (header) =>
       Effect.gen(function* putSnapshotHeaderInMemoryEffect() {
-        if (snapshots.has(header.snapshotId)) {
+        const existing = snapshots.get(header.snapshotId);
+
+        if (existing !== undefined) {
+          if (snapshotHeaderMatches(existing, header)) {
+            return;
+          }
+
           return yield* Effect.fail(
             new MetadataBackendError({
               message:
@@ -429,7 +497,10 @@ export const createInMemoryMetadataBackend = (
       }),
     putSnapshotObjects: (snapshotId, objects) =>
       Effect.gen(function* putSnapshotObjectsInMemoryEffect() {
-        if ((snapshotObjects.get(snapshotId)?.length ?? 0) > 0) {
+        const desired = snapshotRowsFromInventory(snapshotId, objects);
+        const existing = snapshotObjects.get(snapshotId) ?? [];
+
+        if (snapshotObjectConflict(existing, desired)) {
           return yield* Effect.fail(
             new MetadataBackendError({
               message:
@@ -439,10 +510,7 @@ export const createInMemoryMetadataBackend = (
           );
         }
 
-        snapshotObjects.set(
-          snapshotId,
-          snapshotRowsFromInventory(snapshotId, objects)
-        );
+        snapshotObjects.set(snapshotId, desired);
       }),
     releaseIdempotentCommit: (commit) =>
       Effect.sync(() => {
@@ -564,7 +632,7 @@ const objectFromRow = (row: SnapshotObjectD1Row): SnapshotObjectRow =>
 const workspaceTargetFromRow = (row: WorkspaceTargetD1Row): WorkspaceTarget =>
   ({
     namespace: row.namespace,
-    ...(row.expires_at === null ? {} : { expiresAt: row.expires_at }),
+    ...(row.prepared_at === null ? {} : { preparedAt: row.prepared_at }),
     ...(row.producer_actor === null
       ? {}
       : { producerActor: row.producer_actor }),
@@ -815,47 +883,80 @@ export const createD1MetadataBackend = (
         },
       }),
     putSnapshotHeader: (header) =>
-      runStatement(
-        db
-          .prepare(
-            "insert into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          )
-          .bind(
-            header.snapshotId,
-            header.workspaceId,
-            header.namespace,
-            header.parentSnapshotId,
-            header.manifestKey,
-            header.manifestDigest,
-            header.manifestSize,
-            header.trustClass,
-            header.producerRepository,
-            header.producerWorkflow,
-            header.producerJob,
-            header.producerRef,
-            header.producerEvent,
-            header.producerSha,
-            header.producerActor,
-            header.producerRunId,
-            header.statsJson,
-            header.safetyJson,
-            header.createdAt
-          ),
-        "putSnapshotHeader"
-      ),
-    putSnapshotObjects: (snapshotId, objects) =>
-      Effect.gen(function* putSnapshotObjectsD1Effect() {
+      Effect.gen(function* putSnapshotHeaderD1Effect() {
         const existing = yield* queryOne(
           db
-            .prepare(
-              "select object_key from snapshot_objects where snapshot_id = ? limit 1"
-            )
-            .bind(snapshotId),
-          "getSnapshotObjectsForWrite",
-          (row: { readonly object_key: string }) => row.object_key
+            .prepare("select * from snapshots where snapshot_id = ?")
+            .bind(header.snapshotId),
+          "getSnapshotHeaderForWrite",
+          snapshotFromRow
         );
 
         if (existing !== null) {
+          if (snapshotHeaderMatches(existing, header)) {
+            return;
+          }
+
+          return yield* Effect.fail(
+            new MetadataBackendError({
+              message:
+                "D1 metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+              operation: "putSnapshotHeader",
+            })
+          );
+        }
+
+        yield* runStatement(
+          db
+            .prepare(
+              "insert into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(
+              header.snapshotId,
+              header.workspaceId,
+              header.namespace,
+              header.parentSnapshotId,
+              header.manifestKey,
+              header.manifestDigest,
+              header.manifestSize,
+              header.trustClass,
+              header.producerRepository,
+              header.producerWorkflow,
+              header.producerJob,
+              header.producerRef,
+              header.producerEvent,
+              header.producerSha,
+              header.producerActor,
+              header.producerRunId,
+              header.statsJson,
+              header.safetyJson,
+              header.createdAt
+            ),
+          "putSnapshotHeader"
+        );
+      }),
+    putSnapshotObjects: (snapshotId, objects) =>
+      Effect.gen(function* putSnapshotObjectsD1Effect() {
+        const desired = snapshotRowsFromInventory(snapshotId, objects);
+        const existingResult = yield* Effect.tryPromise({
+          catch: (cause) =>
+            new MetadataBackendError({
+              cause,
+              message:
+                "D1 metadata query failed during getSnapshotObjectsForWrite. Check the D1 binding and migration state before retrying.",
+              operation: "getSnapshotObjectsForWrite",
+            }),
+          try: () =>
+            db
+              .prepare(
+                "select * from snapshot_objects where snapshot_id = ? order by object_key"
+              )
+              .bind(snapshotId)
+              .all<SnapshotObjectD1Row>(),
+        });
+        const existing = existingResult.results.map(objectFromRow);
+
+        if (snapshotObjectConflict(existing, desired)) {
           return yield* Effect.fail(
             new MetadataBackendError({
               message:
@@ -865,8 +966,10 @@ export const createD1MetadataBackend = (
           );
         }
 
+        const existingKeys = new Set(existing.map((object) => object.key));
+
         yield* Effect.forEach(
-          snapshotRowsFromInventory(snapshotId, objects),
+          desired.filter((object) => !existingKeys.has(object.key)),
           (object) =>
             runStatement(
               db
@@ -884,6 +987,35 @@ export const createD1MetadataBackend = (
             ),
           { discard: true }
         );
+
+        const finalResult = yield* Effect.tryPromise({
+          catch: (cause) =>
+            new MetadataBackendError({
+              cause,
+              message:
+                "D1 metadata query failed during verifySnapshotObjectsWrite. Snapshot object rows could not be verified; retry after checking the D1 binding and migration state.",
+              operation: "verifySnapshotObjectsWrite",
+            }),
+          try: () =>
+            db
+              .prepare(
+                "select * from snapshot_objects where snapshot_id = ? order by object_key"
+              )
+              .bind(snapshotId)
+              .all<SnapshotObjectD1Row>(),
+        });
+
+        if (
+          !snapshotObjectsMatch(finalResult.results.map(objectFromRow), desired)
+        ) {
+          return yield* Effect.fail(
+            new MetadataBackendError({
+              message:
+                "D1 metadata write failed during putSnapshotObjects. Snapshot object rows were not fully persisted; retry after checking the D1 binding and migration state.",
+              operation: "putSnapshotObjects",
+            })
+          );
+        }
       }),
     releaseIdempotentCommit: (commit) =>
       runStatement(
@@ -927,7 +1059,7 @@ export const createD1MetadataBackend = (
       runStatement(
         db
           .prepare(
-            "insert into workspace_targets (workspace_id, namespace, ref_name, run_id, trust_class, expires_at, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(workspace_id) do update set namespace = excluded.namespace, ref_name = excluded.ref_name, run_id = excluded.run_id, trust_class = excluded.trust_class, expires_at = excluded.expires_at, producer_repository = excluded.producer_repository, producer_workflow = excluded.producer_workflow, producer_job = excluded.producer_job, producer_ref = excluded.producer_ref, producer_event = excluded.producer_event, producer_sha = excluded.producer_sha, producer_actor = excluded.producer_actor"
+            "insert into workspace_targets (workspace_id, namespace, ref_name, run_id, trust_class, prepared_at, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(workspace_id) do update set namespace = excluded.namespace, ref_name = excluded.ref_name, run_id = excluded.run_id, trust_class = excluded.trust_class, prepared_at = excluded.prepared_at, producer_repository = excluded.producer_repository, producer_workflow = excluded.producer_workflow, producer_job = excluded.producer_job, producer_ref = excluded.producer_ref, producer_event = excluded.producer_event, producer_sha = excluded.producer_sha, producer_actor = excluded.producer_actor"
           )
           .bind(
             target.workspaceId,
@@ -935,7 +1067,7 @@ export const createD1MetadataBackend = (
             target.refName,
             target.runId,
             target.trustClass,
-            target.expiresAt ?? null,
+            target.preparedAt ?? null,
             target.producerRepository ?? null,
             target.producerWorkflow ?? null,
             target.producerJob ?? null,

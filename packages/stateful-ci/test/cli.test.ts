@@ -1179,7 +1179,7 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
                     baseSnapshotId: null,
                     commitTarget: {
                       namespace:
-                        "repo=eersnington/stateful-ci/workflow=ci.yml/config=test",
+                        "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=test",
                       refName: "internal/main/latest",
                     },
                     decision: "allowed",

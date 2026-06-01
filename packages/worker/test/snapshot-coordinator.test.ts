@@ -8,13 +8,14 @@ import {
   SnapshotId,
   WorkspaceId,
 } from "@stateful-ci/core";
-import { Effect, Schema } from "effect";
+import { Effect, Exit, Schema } from "effect";
 
 import {
   createInMemoryMetadataBackend,
   MetadataBackend,
 } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
+import { MetadataBackendError } from "../src/metadata-backend-error";
 import { createMetadataSnapshotCoordinator } from "../src/snapshot-coordinator";
 
 const namespace =
@@ -24,7 +25,7 @@ const workspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${namespace}:${refName}`
 );
 const runId = Schema.decodeSync(RunId)("123456789");
-const expiresAt = "2026-05-22T01:00:00.000Z";
+const preparedAt = "2026-05-22T01:00:00.000Z";
 const manifestDigest = Schema.decodeSync(Sha256Digest)(
   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 );
@@ -81,6 +82,15 @@ const committedHeader = {
   workspaceId,
 } satisfies SnapshotHeader;
 
+const retryHeader = {
+  ...committedHeader,
+  statsJson: JSON.stringify({
+    chunkCount: 0,
+    objectCount: 1,
+    totalObjectBytes: 8,
+  }),
+} satisfies SnapshotHeader;
+
 const refFor = (snapshotId: SnapshotId) =>
   ({
     generation: Schema.decodeSync(HeadGeneration)(1),
@@ -94,8 +104,8 @@ const refFor = (snapshotId: SnapshotId) =>
   }) satisfies RefRow;
 
 const testWorkspaceTarget = {
-  expiresAt,
   namespace,
+  preparedAt,
   refName,
   runId,
   trustClass: "trusted",
@@ -273,7 +283,120 @@ describe("snapshot coordinator", () => {
   );
 
   it.effect(
-    "does not replay idempotent when ref CAS fails after idempotency claim",
+    "does not persist idempotency before snapshot metadata succeeds",
+    () =>
+      Effect.gen(function* coordinatorDoesNotPoisonIdempotencyEffect() {
+        const backing = createInMemoryMetadataBackend({
+          workspaceTargets: [testWorkspaceTarget],
+        });
+        let failHeader = true;
+        const metadata = MetadataBackend.of({
+          ...backing,
+          putSnapshotHeader: (header) => {
+            if (failHeader) {
+              failHeader = false;
+              return Effect.fail(
+                new MetadataBackendError({
+                  message:
+                    "Injected metadata failure during putSnapshotHeader.",
+                  operation: "putSnapshotHeader",
+                })
+              );
+            }
+
+            return backing.putSnapshotHeader(header);
+          },
+        });
+        const coordinator = createMetadataSnapshotCoordinator();
+        const first = yield* Effect.exit(
+          coordinator
+            .commitSave(commitInput)
+            .pipe(Effect.provideService(MetadataBackend, metadata))
+        );
+        const claimed = yield* metadata.getIdempotentCommit(
+          commitInput.idempotencyKey
+        );
+        const retry = yield* coordinator
+          .commitSave(commitInput)
+          .pipe(Effect.provideService(MetadataBackend, metadata));
+
+        assert.isTrue(Exit.isFailure(first));
+        assert.strictEqual(claimed, null);
+        assert.strictEqual(retry.decision, "committed");
+      })
+  );
+
+  it.effect("completes a retry after snapshot header was already written", () =>
+    Effect.gen(function* coordinatorRetriesAfterHeaderWriteEffect() {
+      const metadata = createInMemoryMetadataBackend({
+        snapshots: [retryHeader],
+        workspaceTargets: [testWorkspaceTarget],
+      });
+      const coordinator = createMetadataSnapshotCoordinator();
+      const result = yield* coordinator
+        .commitSave(commitInput)
+        .pipe(Effect.provideService(MetadataBackend, metadata));
+      const ref = yield* metadata.getRef(namespace, refName);
+
+      assert.strictEqual(result.decision, "committed");
+      assert.strictEqual(ref?.snapshotId, commitInput.manifest.snapshotId);
+    })
+  );
+
+  it.effect(
+    "completes a retry after partial snapshot object rows were written",
+    () =>
+      Effect.gen(function* coordinatorRetriesAfterPartialObjectsEffect() {
+        const chunkDigest = Schema.decodeSync(Sha256Digest)(
+          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        const chunkKey = Schema.decodeSync(ManifestKey)(
+          "manifests/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"
+        );
+        const input = {
+          ...commitInput,
+          objects: [
+            ...commitInput.objects,
+            { digest: chunkDigest, key: chunkKey, kind: "manifest", size: 4 },
+          ],
+        } as const;
+        const metadata = createInMemoryMetadataBackend({
+          snapshotObjects: [
+            {
+              digest: manifestDigest,
+              key: manifestKey,
+              kind: "manifest",
+              size: 8,
+              snapshotId: commitInput.manifest.snapshotId,
+            },
+          ],
+          snapshots: [
+            {
+              ...retryHeader,
+              statsJson: JSON.stringify({
+                chunkCount: 0,
+                objectCount: 2,
+                totalObjectBytes: 12,
+              }),
+            },
+          ],
+          workspaceTargets: [testWorkspaceTarget],
+        });
+        const coordinator = createMetadataSnapshotCoordinator();
+        const result = yield* coordinator
+          .commitSave(input)
+          .pipe(Effect.provideService(MetadataBackend, metadata));
+        const objects = yield* metadata.getSnapshotObjects(
+          commitInput.manifest.snapshotId
+        );
+
+        assert.strictEqual(result.decision, "committed");
+        assert.strictEqual(objects.length, 2);
+      })
+  );
+
+  it.effect(
+    "does not replay idempotent when ref CAS fails after metadata writes",
     () =>
       Effect.gen(function* coordinatorRejectsStaleIdempotencyEffect() {
         const backing = createInMemoryMetadataBackend({

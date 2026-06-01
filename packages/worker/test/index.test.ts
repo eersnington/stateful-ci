@@ -165,6 +165,8 @@ const seededChunkBytes = new TextEncoder().encode("chunk");
 const seededWorkspaceTotalBytes = 481_203_912;
 const seededNamespace =
   "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const seededDevNamespace =
+  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
 const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${seededNamespace}:${seededRefName}`
@@ -342,16 +344,6 @@ describe("worker API", () => {
 
       const firstPut = yield* Effect.promise(put);
       const secondPut = yield* Effect.promise(put);
-      const head = yield* Effect.promise(() =>
-        handleFetch(
-          new Request(`https://stateful-ci.test${route}`, {
-            headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
-            method: "HEAD",
-          }),
-          env,
-          { blobStore }
-        )
-      );
       const get = yield* Effect.promise(() =>
         handleFetch(
           new Request(`https://stateful-ci.test${route}`, {
@@ -365,11 +357,6 @@ describe("worker API", () => {
 
       assert.strictEqual(firstPut.status, 204);
       assert.strictEqual(secondPut.status, 204);
-      assert.strictEqual(head.status, 200);
-      assert.strictEqual(
-        head.headers.get("content-length"),
-        String(bytes.byteLength)
-      );
       assert.strictEqual(get.status, 200);
       assert.deepStrictEqual(
         new Uint8Array(yield* Effect.promise(() => get.arrayBuffer())),
@@ -458,7 +445,7 @@ describe("worker API", () => {
     const response = await worker.fetch(
       new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
         headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
-        method: "HEAD",
+        method: "GET",
       }),
       env
     );
@@ -478,12 +465,26 @@ describe("worker API", () => {
     );
 
     expect(response.status).toBe(405);
-    expect(response.headers.get("Allow")).toBe("HEAD, GET, PUT");
+    expect(response.headers.get("Allow")).toBe("GET, PUT");
     await expect(response.json()).resolves.toMatchObject({
       _tag: "MethodNotAllowed",
-      allowed: ["HEAD", "GET", "PUT"],
+      allowed: ["GET", "PUT"],
       method: "POST",
     });
+  });
+
+  it("object routes reject HEAD because transfer plans use GET or PUT", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "HEAD",
+      }),
+      env,
+      { blobStore: seededBlobStore() }
+    );
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("GET, PUT");
   });
 
   it("PUT /v1/objects requires prepare-plan headers", async () => {
@@ -678,12 +679,17 @@ describe("worker API", () => {
       const internalRefName = "internal/main/latest";
       const internalSnapshotId = "snap_dev_restore";
       const metadata = createInMemoryMetadataBackend({
-        refs: [refFor(internalRefName, internalSnapshotId, "internal")],
+        refs: [
+          {
+            ...refFor(internalRefName, internalSnapshotId, "internal"),
+            namespace: seededDevNamespace,
+          },
+        ],
         snapshots: [
           snapshotFor(
             internalSnapshotId,
             "internal",
-            workspaceIdFor(seededNamespace, internalRefName)
+            workspaceIdFor(seededDevNamespace, internalRefName)
           ),
         ],
       });
@@ -706,7 +712,7 @@ describe("worker API", () => {
       assert.strictEqual(body.trustClass, "internal");
       assert.strictEqual(
         body.workspaceId,
-        workspaceIdFor(seededNamespace, internalRefName)
+        workspaceIdFor(seededDevNamespace, internalRefName)
       );
     })
   );
@@ -1157,6 +1163,100 @@ describe("worker API", () => {
         reason: null,
       });
     })
+  );
+
+  it.effect("POST /v1/prepare partitions dev auth targets by job", () =>
+    Effect.gen(function* preparePartitionsDevTargetsByJobEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const prepare = (job: string, idempotencyKey: string) =>
+        handleFetch(
+          jsonRequest("/v1/prepare", {
+            client: restoreRequest.client,
+            git: restoreRequest.git,
+            github: restoreRequest.github,
+            idempotencyKey,
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: `snap_${job}`,
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            workspace: { ...restoreRequest.workspace, job },
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        );
+      const testResponse = yield* Effect.promise(() =>
+        prepare("test", "run-123456789-save-test")
+      );
+      const buildResponse = yield* Effect.promise(() =>
+        prepare("build", "run-123456789-save-build")
+      );
+      const testBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => testResponse.json())
+      );
+      const buildBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => buildResponse.json())
+      );
+
+      assert.strictEqual(testResponse.status, 200);
+      assert.strictEqual(buildResponse.status, 200);
+      assert.notStrictEqual(testBody.workspaceId, buildBody.workspaceId);
+      assert.include(testBody.commitTarget.namespace, "/job=test/");
+      assert.include(buildBody.commitTarget.namespace, "/job=build/");
+    })
+  );
+
+  it.effect(
+    "POST /v1/prepare ignores request job for OIDC namespace authority",
+    () =>
+      Effect.gen(function* prepareIgnoresOidcRequestJobEffect() {
+        const metadata = createInMemoryMetadataBackend();
+        const prepare = (job: string, idempotencyKey: string) =>
+          handleFetch(
+            jsonRequest("/v1/prepare", {
+              client: restoreRequest.client,
+              git: restoreRequest.git,
+              github: restoreRequest.github,
+              idempotencyKey,
+              identity: restoreRequest.identity,
+              manifest: {
+                digest: seededManifestDigest,
+                key: seededManifestKey,
+                size: 8,
+                snapshotId: `snap_oidc_${job}`,
+              },
+              objects: seededSnapshot.objects,
+              protocolVersion: 1,
+              workspace: { ...restoreRequest.workspace, job },
+            }),
+            env,
+            { blobStore: seededBlobStore(), metadata }
+          );
+        const testResponse = yield* Effect.promise(() =>
+          prepare("test", "run-123456789-oidc-test")
+        );
+        const buildResponse = yield* Effect.promise(() =>
+          prepare("build", "run-123456789-oidc-build")
+        );
+        const testBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+          yield* Effect.promise(() => testResponse.json())
+        );
+        const buildBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+          yield* Effect.promise(() => buildResponse.json())
+        );
+
+        assert.strictEqual(testResponse.status, 200);
+        assert.strictEqual(buildResponse.status, 200);
+        assert.strictEqual(testBody.workspaceId, buildBody.workspaceId);
+        assert.strictEqual(
+          testBody.commitTarget.namespace,
+          buildBody.commitTarget.namespace
+        );
+        assert.notInclude(testBody.commitTarget.namespace, "/job=");
+      })
   );
 
   it.effect("POST /v1/prepare and /v1/commit accept dev bearer auth", () =>

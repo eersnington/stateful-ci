@@ -28,6 +28,7 @@ import {
   workspaceIdForRefTarget,
 } from "./metadata";
 import type {
+  IdempotentCommit,
   RefRow,
   RefTarget,
   SnapshotHeader,
@@ -202,6 +203,29 @@ const snapshotHeaderForCommit = (
   workspaceId: input.workspaceId,
 });
 
+const snapshotHeaderMatchesCommit = (
+  snapshot: SnapshotHeader,
+  header: SnapshotHeader
+) =>
+  snapshot.manifestDigest === header.manifestDigest &&
+  snapshot.manifestKey === header.manifestKey &&
+  snapshot.manifestSize === header.manifestSize &&
+  snapshot.namespace === header.namespace &&
+  snapshot.parentSnapshotId === header.parentSnapshotId &&
+  snapshot.producerActor === header.producerActor &&
+  snapshot.producerEvent === header.producerEvent &&
+  snapshot.producerJob === header.producerJob &&
+  snapshot.producerRef === header.producerRef &&
+  snapshot.producerRepository === header.producerRepository &&
+  snapshot.producerRunId === header.producerRunId &&
+  snapshot.producerSha === header.producerSha &&
+  snapshot.producerWorkflow === header.producerWorkflow &&
+  snapshot.safetyJson === header.safetyJson &&
+  snapshot.snapshotId === header.snapshotId &&
+  snapshot.statsJson === header.statsJson &&
+  snapshot.trustClass === header.trustClass &&
+  snapshot.workspaceId === header.workspaceId;
+
 const idempotencyMatches = (
   commit: {
     readonly manifestDigest: CommitSaveInput["manifest"]["digest"];
@@ -357,6 +381,67 @@ const replayIdempotentCommit = Effect.fn("replayIdempotentCommit")(
   }
 );
 
+const recoverReservedIdempotency = Effect.fn("recoverReservedIdempotency")(
+  function* recoverReservedIdempotency(
+    metadata: MetadataBackend["Service"],
+    input: CommitSaveInput,
+    commit: IdempotentCommit
+  ): Effect.fn.Return<CommitSaveResponse | null, MetadataBackendError> {
+    const ref = yield* metadata.getRef(
+      input.target.namespace,
+      input.target.refName
+    );
+    const actualHeadGeneration = refGeneration(ref);
+
+    if (
+      ref?.snapshotId === commit.snapshotId &&
+      actualHeadGeneration === commit.headGeneration
+    ) {
+      return Schema.decodeSync(CommitSaveIdempotentResponse)({
+        decision: "idempotent",
+        headGeneration: commit.headGeneration,
+        snapshotId: commit.snapshotId,
+        workspaceId: commit.workspaceId,
+      });
+    }
+
+    if (
+      actualHeadGeneration === input.expectedHeadGeneration &&
+      (ref?.snapshotId ?? null) === input.baseSnapshotId
+    ) {
+      yield* metadata.releaseIdempotentCommit(commit);
+      return null;
+    }
+
+    return Schema.decodeSync(CommitSaveConflictResponse)({
+      actualHeadGeneration,
+      decision: "conflict",
+      reason: "head_generation_mismatch",
+    });
+  }
+);
+
+const resolveExistingIdempotency = Effect.fn("resolveExistingIdempotency")(
+  function* resolveExistingIdempotency(
+    metadata: MetadataBackend["Service"],
+    input: CommitSaveInput,
+    existing: IdempotentCommit | null
+  ): Effect.fn.Return<CommitSaveResponse | null, MetadataBackendError> {
+    if (existing === null) {
+      return null;
+    }
+
+    if (!idempotencyMatches(existing, input)) {
+      return Schema.decodeSync(CommitSaveDeniedResponse)({
+        decision: "denied",
+        reason: "idempotency_conflict",
+      });
+    }
+
+    return yield* recoverReservedIdempotency(metadata, input, existing);
+  }
+);
+
 const appendAudit = (
   event: Parameters<MetadataBackend["Service"]["appendAuditEvent"]>[0]
 ) =>
@@ -377,10 +462,10 @@ export const createMetadataSnapshotCoordinator =
           );
 
           if (saveTarget !== null) {
-            const expiresAt = yield* currentIsoTimestamp;
+            const preparedAt = yield* currentIsoTimestamp;
             yield* metadata.rememberWorkspaceTarget({
               ...saveTarget,
-              expiresAt,
+              preparedAt,
               runId: input.runId,
               trustClass: input.trustClass,
               workspaceId: input.workspaceId,
@@ -488,16 +573,14 @@ export const createMetadataSnapshotCoordinator =
           const existing = yield* metadata.getIdempotentCommit(
             input.idempotencyKey
           );
+          const existingIdempotency = yield* resolveExistingIdempotency(
+            metadata,
+            input,
+            existing
+          );
 
-          if (existing !== null) {
-            if (idempotencyMatches(existing, input)) {
-              return yield* replayIdempotentCommit(metadata, input, existing);
-            }
-
-            return Schema.decodeSync(CommitSaveDeniedResponse)({
-              decision: "denied",
-              reason: "idempotency_conflict",
-            });
+          if (existingIdempotency !== null) {
+            return existingIdempotency;
           }
 
           const target = yield* metadata.getWorkspaceTarget(input.workspaceId);
@@ -571,16 +654,6 @@ export const createMetadataSnapshotCoordinator =
             }
           }
 
-          const existingSnapshot = yield* metadata.getSnapshotHeader(
-            input.manifest.snapshotId
-          );
-          if (existingSnapshot !== null) {
-            return Schema.decodeSync(CommitSaveDeniedResponse)({
-              decision: "denied",
-              reason: "invalid_protocol_payload",
-            });
-          }
-
           const createdAt = yield* currentIsoTimestamp;
           const producer = producerFromTarget(target, input.producer);
 
@@ -598,6 +671,20 @@ export const createMetadataSnapshotCoordinator =
             target.trustClass,
             createdAt
           );
+
+          const existingSnapshot = yield* metadata.getSnapshotHeader(
+            input.manifest.snapshotId
+          );
+
+          if (
+            existingSnapshot !== null &&
+            !snapshotHeaderMatchesCommit(existingSnapshot, header)
+          ) {
+            return Schema.decodeSync(CommitSaveDeniedResponse)({
+              decision: "denied",
+              reason: "invalid_protocol_payload",
+            });
+          }
 
           const committed = Schema.decodeSync(CommitSaveCommittedResponse)({
             decision: "committed",
@@ -636,11 +723,24 @@ export const createMetadataSnapshotCoordinator =
             });
           }
 
-          yield* metadata.putSnapshotHeader(header);
-          yield* metadata.putSnapshotObjects(
-            input.manifest.snapshotId,
-            input.objects
-          );
+          yield* metadata
+            .putSnapshotHeader(header)
+            .pipe(
+              Effect.catch((error) =>
+                metadata
+                  .releaseIdempotentCommit(idempotentCommit)
+                  .pipe(Effect.flatMap(() => Effect.fail(error)))
+              )
+            );
+          yield* metadata
+            .putSnapshotObjects(input.manifest.snapshotId, input.objects)
+            .pipe(
+              Effect.catch((error) =>
+                metadata
+                  .releaseIdempotentCommit(idempotentCommit)
+                  .pipe(Effect.flatMap(() => Effect.fail(error)))
+              )
+            );
 
           const advanced = yield* metadata.compareAndAdvanceRef(
             target.namespace,
@@ -713,7 +813,7 @@ export const createMetadataSnapshotCoordinator =
           );
           yield* metadata.rememberWorkspaceTarget({
             ...input.target,
-            expiresAt: input.preparedAt,
+            preparedAt: input.preparedAt,
             producerActor: input.producer.actor,
             producerEvent: input.producer.event,
             producerJob: input.producer.job,

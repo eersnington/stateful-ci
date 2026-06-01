@@ -125,6 +125,8 @@ const metadataTargetForIdentity = (
   identity: VerifiedGitHubActionsIdentity,
   trustClass: ReturnType<typeof classifyVerifiedGitHubTrust>
 ): RefTarget => ({
+  // GitHub OIDC does not expose a stable signed job name, so production
+  // namespace authority must not come from request.workspace.job.
   namespace: `repo=${identity.repository}/workflow=${identity.workflow}/config=${request.client.configHash}`,
   refName: `${trustClass}/${refSegment(identity.ref)}/latest`,
 });
@@ -133,7 +135,7 @@ const metadataTargetForRequest = (
   request: Pick<RestoreRequest, "client" | "git" | "workspace">,
   trustClass: TrustClass
 ): RefTarget => ({
-  namespace: `repo=${request.workspace.repo}/workflow=${request.workspace.workflow}/config=${request.client.configHash}`,
+  namespace: `repo=${request.workspace.repo}/workflow=${request.workspace.workflow}/job=${request.workspace.job}/config=${request.client.configHash}`,
   refName: `${trustClass}/${refSegment(request.git.ref)}/latest`,
 });
 

@@ -246,8 +246,8 @@ describe("D1 metadata backend contract", () => {
 
     await Effect.runPromise(
       metadata.rememberWorkspaceTarget({
-        expiresAt: "2026-05-22T01:00:00.000Z",
         namespace,
+        preparedAt: "2026-05-22T01:00:00.000Z",
         producerActor: "eersnington",
         producerEvent: "push",
         producerJob: "test",
@@ -263,8 +263,8 @@ describe("D1 metadata backend contract", () => {
     );
     await Effect.runPromise(
       metadata.rememberWorkspaceTarget({
-        expiresAt: "2026-05-22T02:00:00.000Z",
         namespace,
+        preparedAt: "2026-05-22T02:00:00.000Z",
         refName,
         runId,
         trustClass: "trusted",
@@ -275,8 +275,8 @@ describe("D1 metadata backend contract", () => {
     await expect(
       Effect.runPromise(metadata.getWorkspaceTarget(workspaceId))
     ).resolves.toMatchObject({
-      expiresAt: "2026-05-22T02:00:00.000Z",
       namespace,
+      preparedAt: "2026-05-22T02:00:00.000Z",
       refName,
       runId,
       trustClass: "trusted",
