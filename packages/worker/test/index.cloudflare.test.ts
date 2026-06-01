@@ -13,7 +13,8 @@ import { env } from "cloudflare:workers";
 import { Effect, Schema } from "effect";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import worker, { handleFetch } from "../src/index";
+import { handleFetch } from "../src/handler";
+import worker from "../src/index";
 import { createD1MetadataBackend } from "../src/metadata";
 import {
   createSignedGitHubOidcToken,
@@ -42,6 +43,12 @@ const packKey = Schema.decodeSync(PackKey)(
 const snapshotId = Schema.decodeSync(SnapshotId)("snap_900");
 const manifestBytes = new TextEncoder().encode("manifest");
 const packBytes = new TextEncoder().encode("pack");
+const objectRouteDigest = Schema.decodeSync(Sha256Digest)(
+  "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f"
+);
+const objectRouteKey = Schema.decodeSync(ManifestKey)(
+  "manifests/sha256/05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f.json"
+);
 
 const metadata = () => createD1MetadataBackend(env.STATEFUL_CI_METADATA);
 
@@ -131,6 +138,7 @@ const cleanD1 = async () => {
   await env.STATEFUL_CI_METADATA.prepare("delete from snapshots").run();
   await env.STATEFUL_CI_OBJECTS.delete(manifestKey);
   await env.STATEFUL_CI_OBJECTS.delete(packKey);
+  await env.STATEFUL_CI_OBJECTS.delete(objectRouteKey);
 };
 
 describe("Worker Cloudflare runtime bindings", () => {
@@ -144,6 +152,37 @@ describe("Worker Cloudflare runtime bindings", () => {
   });
 
   beforeEach(cleanD1);
+
+  it("stores and serves object route bytes through R2", async () => {
+    const route = `/v1/objects/${objectRouteKey}`;
+    const put = await worker.fetch(
+      new Request(`https://stateful-ci.test${route}`, {
+        body: manifestBytes,
+        headers: {
+          authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
+          "content-length": String(manifestBytes.byteLength),
+          "x-stateful-ci-object-digest": objectRouteDigest,
+          "x-stateful-ci-object-kind": "manifest",
+          "x-stateful-ci-object-size": String(manifestBytes.byteLength),
+        },
+        method: "PUT",
+      }),
+      testEnv
+    );
+    const get = await worker.fetch(
+      new Request(`https://stateful-ci.test${route}`, {
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "GET",
+      }),
+      testEnv
+    );
+
+    expect(put.status).toBe(204);
+    expect(get.status).toBe(200);
+    expect(new Uint8Array(await get.arrayBuffer())).toStrictEqual(
+      manifestBytes
+    );
+  });
 
   it("uses the Durable Object coordinator path for prepare and commit", async () => {
     await env.STATEFUL_CI_OBJECTS.put(manifestKey, manifestBytes);

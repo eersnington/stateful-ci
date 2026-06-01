@@ -18,7 +18,8 @@ import { Effect, Schema } from "effect";
 import { beforeAll } from "vitest";
 
 import { createInMemoryBlobStore } from "../src/blob-store-memory";
-import worker, { handleFetch, maxProtocolBodyBytes } from "../src/index";
+import { handleFetch } from "../src/handler";
+import worker from "../src/index";
 import { createInMemoryMetadataBackend } from "../src/metadata";
 import type { RefRow, SnapshotHeader } from "../src/metadata";
 import {
@@ -146,10 +147,6 @@ const restoreRequest = {
   },
 };
 
-const manifestDigest =
-  "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const manifestKey =
-  "manifests/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
 const seededManifestDigest =
   "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f";
 const seededManifestKey =
@@ -166,38 +163,10 @@ const seededManifestBytes = new TextEncoder().encode("manifest");
 const seededPackBytes = new TextEncoder().encode("pack");
 const seededChunkBytes = new TextEncoder().encode("chunk");
 const seededWorkspaceTotalBytes = 481_203_912;
-const saveObjects = [
-  {
-    digest: manifestDigest,
-    key: manifestKey,
-    kind: "manifest",
-    size: 512,
-  },
-] as const;
-
-const saveRequest = {
-  baseSnapshotId: "snap_123",
-  manifest: {
-    chunkCount: 1,
-    fileCount: 21_903,
-    hash: manifestDigest,
-    id: "snap_124",
-    key: manifestKey,
-    objects: saveObjects,
-    safety: {
-      skippedByBuiltInDenylist: 3,
-      skippedByUserExclude: 12,
-      skippedUnsupportedType: 1,
-    },
-    totalBytes: seededWorkspaceTotalBytes,
-  },
-  protocolVersion: 1,
-  runId: "123456789",
-  workspaceId: "ws_123",
-};
-
 const seededNamespace =
   "repo=eersnington/stateful-ci/workflow=ci.yml/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const seededDevNamespace =
+  "repo=eersnington/stateful-ci/workflow=ci.yml/job=test/config=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const seededRefName = "trusted/main/latest";
 const seededWorkspaceId = Schema.decodeSync(WorkspaceId)(
   `ws:${seededNamespace}:${seededRefName}`
@@ -375,16 +344,6 @@ describe("worker API", () => {
 
       const firstPut = yield* Effect.promise(put);
       const secondPut = yield* Effect.promise(put);
-      const head = yield* Effect.promise(() =>
-        handleFetch(
-          new Request(`https://stateful-ci.test${route}`, {
-            headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
-            method: "HEAD",
-          }),
-          env,
-          { blobStore }
-        )
-      );
       const get = yield* Effect.promise(() =>
         handleFetch(
           new Request(`https://stateful-ci.test${route}`, {
@@ -398,11 +357,6 @@ describe("worker API", () => {
 
       assert.strictEqual(firstPut.status, 204);
       assert.strictEqual(secondPut.status, 204);
-      assert.strictEqual(head.status, 200);
-      assert.strictEqual(
-        head.headers.get("content-length"),
-        String(bytes.byteLength)
-      );
       assert.strictEqual(get.status, 200);
       assert.deepStrictEqual(
         new Uint8Array(yield* Effect.promise(() => get.arrayBuffer())),
@@ -491,7 +445,7 @@ describe("worker API", () => {
     const response = await worker.fetch(
       new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
         headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
-        method: "HEAD",
+        method: "GET",
       }),
       env
     );
@@ -501,6 +455,36 @@ describe("worker API", () => {
       _tag: "BlobStoreError",
       reason: "io_failed",
     });
+  });
+
+  it("object routes reject unsupported methods before auth", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("GET, PUT");
+    await expect(response.json()).resolves.toMatchObject({
+      _tag: "MethodNotAllowed",
+      allowed: ["GET", "PUT"],
+      method: "POST",
+    });
+  });
+
+  it("object routes reject HEAD because transfer plans use GET or PUT", async () => {
+    const response = await handleFetch(
+      new Request(`https://stateful-ci.test/v1/objects/${seededManifestKey}`, {
+        headers: { authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}` },
+        method: "HEAD",
+      }),
+      env,
+      { blobStore: seededBlobStore() }
+    );
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("GET, PUT");
   });
 
   it("PUT /v1/objects requires prepare-plan headers", async () => {
@@ -687,6 +671,49 @@ describe("worker API", () => {
           productionEnv.STATEFUL_CI_TRANSFER_SECRET
         );
       }
+    })
+  );
+
+  it.effect("POST /v1/restore accepts dev bearer auth without OIDC", () =>
+    Effect.gen(function* restoreAcceptsDevBearerAuthWithoutOidcEffect() {
+      const internalRefName = "internal/main/latest";
+      const internalSnapshotId = "snap_dev_restore";
+      const metadata = createInMemoryMetadataBackend({
+        refs: [
+          {
+            ...refFor(internalRefName, internalSnapshotId, "internal"),
+            namespace: seededDevNamespace,
+          },
+        ],
+        snapshots: [
+          snapshotFor(
+            internalSnapshotId,
+            "internal",
+            workspaceIdFor(seededDevNamespace, internalRefName)
+          ),
+        ],
+      });
+      const response = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/restore", {
+            ...restoreRequest,
+            identity: undefined,
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const body = Schema.decodeUnknownSync(RestoreAllowedResponse)(
+        yield* Effect.promise(() => response.json())
+      );
+
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(body.decision, "allowed");
+      assert.strictEqual(body.trustClass, "internal");
+      assert.strictEqual(
+        body.workspaceId,
+        workspaceIdFor(seededDevNamespace, internalRefName)
+      );
     })
   );
 
@@ -974,8 +1001,11 @@ describe("worker API", () => {
     expect(audit[0]).toMatchObject({
       decision: "denied",
       eventType: "restore",
+      namespace: "unbound/control-plane-auth",
       reason: "oidc_missing",
+      refName: "unknown",
       trustClass: "unknown",
+      workspaceId: null,
     });
   });
 
@@ -1038,9 +1068,10 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/save/prepare fails closed with malformed configured JWKS", async () => {
-    const response = await worker.fetch(
-      jsonRequest("/v1/save/prepare", {
+  it("POST /v1/prepare fails closed with malformed configured JWKS", async () => {
+    const metadata = createInMemoryMetadataBackend();
+    const response = await handleFetch(
+      jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
         github: restoreRequest.github,
@@ -1059,8 +1090,10 @@ describe("worker API", () => {
       {
         STATEFUL_CI_API_TOKEN: env.STATEFUL_CI_API_TOKEN,
         STATEFUL_CI_GITHUB_JWKS_JSON: "not json",
-      }
+      },
+      { metadata }
     );
+    const audit = await Effect.runPromise(metadata.listAuditEvents());
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toStrictEqual({
@@ -1068,22 +1101,19 @@ describe("worker API", () => {
       reason: "oidc_invalid",
       trustClass: "unknown",
     });
-  });
-
-  it("POST /v1/save fails closed", async () => {
-    const response = await worker.fetch(
-      jsonRequest("/v1/save", saveRequest),
-      env
-    );
-
-    expect(response.status).toBe(410);
-    await expect(response.json()).resolves.toStrictEqual({
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
       decision: "denied",
-      reason: "backend_policy_not_configured",
+      eventType: "prepare-save",
+      namespace: "unbound/control-plane-auth",
+      reason: "oidc_invalid",
+      refName: "unknown",
+      trustClass: "unknown",
+      workspaceId: null,
     });
   });
 
-  it.effect("POST /v1/save/prepare returns missing upload plans", () =>
+  it.effect("POST /v1/prepare returns missing upload plans", () =>
     Effect.gen(function* prepareReturnsMissingObjectsEffect() {
       const blobStore = createInMemoryBlobStore(
         new Map([
@@ -1096,7 +1126,7 @@ describe("worker API", () => {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/prepare", {
+          jsonRequest("/v1/prepare", {
             client: restoreRequest.client,
             git: restoreRequest.git,
             github: restoreRequest.github,
@@ -1135,12 +1165,173 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/prepare denies fork pull request writes", () =>
+  it.effect("POST /v1/prepare partitions dev auth targets by job", () =>
+    Effect.gen(function* preparePartitionsDevTargetsByJobEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const prepare = (job: string, idempotencyKey: string) =>
+        handleFetch(
+          jsonRequest("/v1/prepare", {
+            client: restoreRequest.client,
+            git: restoreRequest.git,
+            github: restoreRequest.github,
+            idempotencyKey,
+            manifest: {
+              digest: seededManifestDigest,
+              key: seededManifestKey,
+              size: 8,
+              snapshotId: `snap_${job}`,
+            },
+            objects: seededSnapshot.objects,
+            protocolVersion: 1,
+            workspace: { ...restoreRequest.workspace, job },
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        );
+      const testResponse = yield* Effect.promise(() =>
+        prepare("test", "run-123456789-save-test")
+      );
+      const buildResponse = yield* Effect.promise(() =>
+        prepare("build", "run-123456789-save-build")
+      );
+      const testBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => testResponse.json())
+      );
+      const buildBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => buildResponse.json())
+      );
+
+      assert.strictEqual(testResponse.status, 200);
+      assert.strictEqual(buildResponse.status, 200);
+      assert.notStrictEqual(testBody.workspaceId, buildBody.workspaceId);
+      assert.include(testBody.commitTarget.namespace, "/job=test/");
+      assert.include(buildBody.commitTarget.namespace, "/job=build/");
+    })
+  );
+
+  it.effect(
+    "POST /v1/prepare ignores request job for OIDC namespace authority",
+    () =>
+      Effect.gen(function* prepareIgnoresOidcRequestJobEffect() {
+        const metadata = createInMemoryMetadataBackend();
+        const prepare = (job: string, idempotencyKey: string) =>
+          handleFetch(
+            jsonRequest("/v1/prepare", {
+              client: restoreRequest.client,
+              git: restoreRequest.git,
+              github: restoreRequest.github,
+              idempotencyKey,
+              identity: restoreRequest.identity,
+              manifest: {
+                digest: seededManifestDigest,
+                key: seededManifestKey,
+                size: 8,
+                snapshotId: `snap_oidc_${job}`,
+              },
+              objects: seededSnapshot.objects,
+              protocolVersion: 1,
+              workspace: { ...restoreRequest.workspace, job },
+            }),
+            env,
+            { blobStore: seededBlobStore(), metadata }
+          );
+        const testResponse = yield* Effect.promise(() =>
+          prepare("test", "run-123456789-oidc-test")
+        );
+        const buildResponse = yield* Effect.promise(() =>
+          prepare("build", "run-123456789-oidc-build")
+        );
+        const testBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+          yield* Effect.promise(() => testResponse.json())
+        );
+        const buildBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+          yield* Effect.promise(() => buildResponse.json())
+        );
+
+        assert.strictEqual(testResponse.status, 200);
+        assert.strictEqual(buildResponse.status, 200);
+        assert.strictEqual(testBody.workspaceId, buildBody.workspaceId);
+        assert.strictEqual(
+          testBody.commitTarget.namespace,
+          buildBody.commitTarget.namespace
+        );
+        assert.notInclude(testBody.commitTarget.namespace, "/job=");
+      })
+  );
+
+  it.effect("POST /v1/prepare and /v1/commit accept dev bearer auth", () =>
+    Effect.gen(function* saveAcceptsDevBearerAuthEffect() {
+      const metadata = createInMemoryMetadataBackend();
+      const prepareRequest = {
+        client: restoreRequest.client,
+        git: restoreRequest.git,
+        github: restoreRequest.github,
+        idempotencyKey: "run-123456789-dev-save",
+        manifest: {
+          digest: seededManifestDigest,
+          key: seededManifestKey,
+          size: 8,
+          snapshotId: "snap_dev_save",
+        },
+        objects: seededSnapshot.objects,
+        protocolVersion: 1,
+        workspace: restoreRequest.workspace,
+      };
+      const prepareResponse = yield* Effect.promise(() =>
+        handleFetch(jsonRequest("/v1/prepare", prepareRequest), env, {
+          blobStore: seededBlobStore(),
+          metadata,
+        })
+      );
+      const prepareBody = Schema.decodeUnknownSync(PrepareSaveAllowedResponse)(
+        yield* Effect.promise(() => prepareResponse.json())
+      );
+      const commitResponse = yield* Effect.promise(() =>
+        handleFetch(
+          jsonRequest("/v1/commit", {
+            baseSnapshotId: prepareBody.baseSnapshotId,
+            expectedHeadGeneration: prepareBody.expectedHeadGeneration,
+            idempotencyKey: prepareRequest.idempotencyKey,
+            manifest: prepareRequest.manifest,
+            objects: prepareRequest.objects,
+            protocolVersion: 1,
+            runId: restoreRequest.github.runId,
+            target: prepareBody.commitTarget,
+            workspaceId: prepareBody.workspaceId,
+          }),
+          env,
+          { blobStore: seededBlobStore(), metadata }
+        )
+      );
+      const commitBody = Schema.decodeUnknownSync(CommitSaveResponse)(
+        yield* Effect.promise(() => commitResponse.json())
+      );
+      const header = yield* metadata.getSnapshotHeader(
+        Schema.decodeSync(SnapshotId)("snap_dev_save")
+      );
+
+      assert.strictEqual(prepareResponse.status, 200);
+      assert.strictEqual(prepareBody.trustClass, "internal");
+      assert.strictEqual(
+        prepareBody.commitTarget.refName,
+        "internal/main/latest"
+      );
+      assert.strictEqual(commitResponse.status, 200);
+      assert.strictEqual(commitBody.decision, "committed");
+      if (commitBody.decision !== "committed") {
+        return yield* Effect.die("Expected committed dev save.");
+      }
+      assert.strictEqual(commitBody.snapshotId, "snap_dev_save");
+      assert.strictEqual(header?.trustClass, "internal");
+    })
+  );
+
+  it.effect("POST /v1/prepare denies fork pull request writes", () =>
     Effect.gen(function* prepareDeniesForkPullRequestWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/prepare", {
+          jsonRequest("/v1/prepare", {
             client: externalPullRequest.client,
             git: externalPullRequest.git,
             github: externalPullRequest.github,
@@ -1184,12 +1375,12 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/prepare denies pull_request_target writes", () =>
+  it.effect("POST /v1/prepare denies pull_request_target writes", () =>
     Effect.gen(function* prepareDeniesPullRequestTargetWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/prepare", {
+          jsonRequest("/v1/prepare", {
             client: restoreRequest.client,
             git: {
               ...restoreRequest.git,
@@ -1236,9 +1427,9 @@ describe("worker API", () => {
     })
   );
 
-  it("POST /v1/save/prepare returns backend failure when object HEAD fails", async () => {
+  it("POST /v1/prepare returns backend failure when object HEAD fails", async () => {
     const response = await handleFetch(
-      jsonRequest("/v1/save/prepare", {
+      jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
         github: restoreRequest.github,
@@ -1265,9 +1456,9 @@ describe("worker API", () => {
     });
   });
 
-  it("POST /v1/save/prepare fails closed without object storage", async () => {
+  it("POST /v1/prepare fails closed without object storage", async () => {
     const response = await worker.fetch(
-      jsonRequest("/v1/save/prepare", {
+      jsonRequest("/v1/prepare", {
         client: restoreRequest.client,
         git: restoreRequest.git,
         github: restoreRequest.github,
@@ -1293,12 +1484,12 @@ describe("worker API", () => {
     });
   });
 
-  it.effect("POST /v1/save/commit validates objects before commit", () =>
+  it.effect("POST /v1/commit validates objects before commit", () =>
     Effect.gen(function* commitValidatesObjectsBeforeCommitEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1326,7 +1517,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit denies unverified production identity", () =>
+  it.effect("POST /v1/commit denies unverified production identity", () =>
     Effect.gen(function* commitDeniesUnverifiedProductionIdentityEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1341,7 +1532,7 @@ describe("worker API", () => {
       });
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1366,6 +1557,7 @@ describe("worker API", () => {
         yield* Effect.promise(() => response.json())
       );
       const ref = yield* metadata.getRef(seededNamespace, seededRefName);
+      const audit = yield* metadata.listAuditEvents();
 
       assert.strictEqual(response.status, 200);
       assert.deepStrictEqual(body, {
@@ -1373,15 +1565,22 @@ describe("worker API", () => {
         reason: "oidc_missing",
       });
       assert.isNull(ref);
+      assert.deepInclude(audit[0], {
+        eventType: "commit",
+        namespace: "unbound/commit-save",
+        refName: "unknown",
+        snapshotId: null,
+        workspaceId: null,
+      });
     })
   );
 
-  it.effect("POST /v1/save/commit denies pull_request_target writes", () =>
+  it.effect("POST /v1/commit denies pull_request_target writes", () =>
     Effect.gen(function* commitDeniesPullRequestTargetWritesEffect() {
       const metadata = createInMemoryMetadataBackend();
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save-pull-request-target",
@@ -1427,7 +1626,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit validates object presence", () =>
+  it.effect("POST /v1/commit validates object presence", () =>
     Effect.gen(function* commitValidatesObjectsEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1442,7 +1641,7 @@ describe("worker API", () => {
       });
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1479,7 +1678,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit rejects each missing object kind", () =>
+  it.effect("POST /v1/commit rejects each missing object kind", () =>
     Effect.gen(function* commitRejectsEachMissingObjectKindEffect() {
       for (const missingKind of ["manifest", "pack", "chunk"] as const) {
         const metadata = createInMemoryMetadataBackend({
@@ -1503,7 +1702,7 @@ describe("worker API", () => {
 
         const response = yield* Effect.promise(() =>
           handleFetch(
-            jsonRequest("/v1/save/commit", {
+            jsonRequest("/v1/commit", {
               baseSnapshotId: null,
               expectedHeadGeneration: 0,
               idempotencyKey: `run-123456789-save-${missingKind}`,
@@ -1541,7 +1740,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit rejects stored object size mismatches", () =>
+  it.effect("POST /v1/commit rejects stored object size mismatches", () =>
     Effect.gen(function* commitRejectsStoredObjectSizeMismatchEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1563,7 +1762,7 @@ describe("worker API", () => {
 
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save-size-mismatch",
@@ -1600,7 +1799,7 @@ describe("worker API", () => {
     })
   );
 
-  it.effect("POST /v1/save/commit advances refs through coordinator", () =>
+  it.effect("POST /v1/commit advances refs through coordinator", () =>
     Effect.gen(function* commitDoesNotMutateWithoutCoordinatorEffect() {
       const metadata = createInMemoryMetadataBackend({
         workspaceTargets: [
@@ -1615,7 +1814,7 @@ describe("worker API", () => {
       });
       const response = yield* Effect.promise(() =>
         handleFetch(
-          jsonRequest("/v1/save/commit", {
+          jsonRequest("/v1/commit", {
             baseSnapshotId: null,
             expectedHeadGeneration: 0,
             idempotencyKey: "run-123456789-save",
@@ -1722,38 +1921,6 @@ describe("worker API", () => {
     });
   });
 
-  it.effect("POST /v1/save is fail-closed and does not mutate metadata", () =>
-    Effect.gen(function* legacySaveIsFailClosedEffect() {
-      const metadata = createInMemoryMetadataBackend({
-        workspaceTargets: [
-          {
-            namespace: seededNamespace,
-            refName: seededRefName,
-            runId: Schema.decodeSync(RunId)("123456789"),
-            trustClass: "trusted",
-            workspaceId: seededWorkspaceId,
-          },
-        ],
-      });
-      const response = yield* Effect.promise(() =>
-        handleFetch(jsonRequest("/v1/save", saveRequest), env, { metadata })
-      );
-      const body = yield* Effect.promise(() => response.json());
-      const header = yield* metadata.getSnapshotHeader(
-        Schema.decodeSync(SnapshotId)("snap_124")
-      );
-      const ref = yield* metadata.getRef(seededNamespace, seededRefName);
-
-      assert.strictEqual(response.status, 410);
-      assert.deepStrictEqual(body, {
-        decision: "denied",
-        reason: "backend_policy_not_configured",
-      });
-      assert.isNull(header);
-      assert.isNull(ref);
-    })
-  );
-
   it("invalid JSON returns structured 400", async () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/v1/restore", {
@@ -1788,7 +1955,7 @@ describe("worker API", () => {
   it("oversized JSON returns structured 413 before schema validation", async () => {
     const response = await worker.fetch(
       new Request("https://stateful-ci.test/v1/restore", {
-        body: JSON.stringify({ payload: "a".repeat(maxProtocolBodyBytes) }),
+        body: JSON.stringify({ payload: "a".repeat(70 * 1024) }),
         headers: {
           authorization: `Bearer ${env.STATEFUL_CI_API_TOKEN}`,
           "content-type": "application/json",
@@ -1801,7 +1968,6 @@ describe("worker API", () => {
     expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({
       _tag: "RequestBodyTooLarge",
-      limitBytes: maxProtocolBodyBytes,
     });
   });
 

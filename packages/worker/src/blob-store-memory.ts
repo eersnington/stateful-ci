@@ -1,23 +1,8 @@
 import type { SnapshotObjectKey } from "@stateful-ci/core";
 import { Effect } from "effect";
 
-import { BlobStore, unsupportedPresign } from "./blob-store";
+import { BlobStore, validateExistingObjectBytes } from "./blob-store";
 import { BlobStoreError } from "./blob-store-error";
-import { sha256BytesEffect } from "./object-hash";
-
-const sameBytes = (left: Uint8Array, right: Uint8Array) => {
-  if (left.byteLength !== right.byteLength) {
-    return false;
-  }
-
-  for (let index = 0; index < left.byteLength; index += 1) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-
-  return true;
-};
 
 export const createInMemoryBlobStore = (
   seed: ReadonlyMap<SnapshotObjectKey, Uint8Array> = new Map(),
@@ -39,20 +24,15 @@ export const createInMemoryBlobStore = (
               reason: "missing",
             })
           )
-        : Effect.succeed(new Uint8Array(bytes));
-    },
-    getRange: (key, offset, length) => {
-      const bytes = objects.get(key);
-
-      return bytes === undefined
-        ? Effect.fail(
-            new BlobStoreError({
-              key,
-              message: `Snapshot object ${key} is missing from the object store.`,
-              reason: "missing",
-            })
-          )
-        : Effect.succeed(new Uint8Array(bytes).slice(offset, offset + length));
+        : Effect.succeed({
+            body: new ReadableStream<Uint8Array>({
+              start: (controller) => {
+                controller.enqueue(new Uint8Array(bytes));
+                controller.close();
+              },
+            }),
+            size: bytes.byteLength,
+          });
     },
     head: (key) => {
       if (options.failHead === true) {
@@ -68,22 +48,66 @@ export const createInMemoryBlobStore = (
       const bytes = objects.get(key);
 
       return Effect.succeed(
-        bytes === undefined ? null : { key, size: bytes.byteLength }
+        bytes === undefined ? null : { size: bytes.byteLength }
       );
     },
-    presignGet: (key) => unsupportedPresign(key),
-    presignPut: (key) => unsupportedPresign(key),
     putIfAbsent: (input) =>
       Effect.gen(function* putIfAbsentEffect() {
-        if (input.body.byteLength !== input.expectedSize) {
+        const uploadBody = yield* Effect.scoped(
+          Effect.gen(function* readObjectBodyEffect() {
+            const bodyReader = yield* Effect.acquireRelease(
+              Effect.sync(() => input.body.getReader()),
+              (activeReader) =>
+                Effect.promise(() => activeReader.cancel()).pipe(Effect.orDie)
+            );
+            const chunks: Uint8Array[] = [];
+            let byteLength = 0;
+
+            for (;;) {
+              const chunk = yield* Effect.tryPromise({
+                catch: () =>
+                  new BlobStoreError({
+                    key: input.key,
+                    message: `Could not read snapshot object ${input.key} stream. The object was not stored.`,
+                    reason: "io_failed",
+                  }),
+                try: () => bodyReader.read(),
+              });
+
+              if (chunk.done) {
+                break;
+              }
+
+              byteLength += chunk.value.byteLength;
+              chunks.push(chunk.value);
+            }
+
+            const bytes = new Uint8Array(byteLength);
+            let offset = 0;
+
+            for (const chunk of chunks) {
+              bytes.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+
+            return bytes;
+          })
+        );
+
+        if (uploadBody.byteLength !== input.expectedSize) {
           return yield* new BlobStoreError({
             key: input.key,
-            message: `Snapshot object ${input.key} upload size was ${input.body.byteLength}, but the backend expected ${input.expectedSize}.`,
+            message: `Snapshot object ${input.key} upload size was ${uploadBody.byteLength}, but the backend expected ${input.expectedSize}.`,
             reason: "size_mismatch",
           });
         }
 
-        const digest = yield* sha256BytesEffect(input.body);
+        const digestBytes = yield* Effect.promise(() =>
+          crypto.subtle.digest("SHA-256", uploadBody)
+        );
+        const digest = `sha256:${[...new Uint8Array(digestBytes)]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("")}`;
 
         if (digest !== input.expectedDigest) {
           return yield* new BlobStoreError({
@@ -96,19 +120,13 @@ export const createInMemoryBlobStore = (
         const existing = objects.get(input.key);
 
         if (existing !== undefined) {
-          if (!sameBytes(existing, input.body)) {
-            return yield* new BlobStoreError({
-              key: input.key,
-              message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
-              reason: "conflict",
-            });
-          }
-
-          return { status: "already-present" as const };
+          return yield* validateExistingObjectBytes(
+            { body: uploadBody, key: input.key },
+            existing
+          );
         }
 
-        objects.set(input.key, new Uint8Array(input.body));
-        return { status: "inserted" as const };
+        objects.set(input.key, new Uint8Array(uploadBody));
       }),
   });
 };

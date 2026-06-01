@@ -121,7 +121,7 @@ const seedRestoreSnapshot = async () => {
 const prepareSave = () =>
   runCoordinator(
     coordinator().prepareSave({
-      expiresAt: futureExpiresAt(),
+      preparedAt: futureExpiresAt(),
       producer,
       runId,
       target,
@@ -319,7 +319,7 @@ describe("Durable Object snapshot coordinator", () => {
     await prepareSave();
     await runCoordinator(
       coordinator().prepareSave({
-        expiresAt: futureExpiresAt(),
+        preparedAt: futureExpiresAt(),
         producer,
         runId,
         target: otherTarget,

@@ -8,7 +8,7 @@ import {
 } from "@stateful-ci/core";
 import { Clock, Effect, Exit, Schema } from "effect";
 
-export const githubActionsIssuer =
+const githubActionsIssuer =
   "https://token.actions.githubusercontent.com" as const;
 export const defaultGitHubOidcAudience = "stateful-ci" as const;
 
@@ -59,6 +59,11 @@ export const GitHubJwks = Schema.Struct({
   keys: Schema.Array(GitHubJwk),
 });
 
+const IdentityAuditPayload = Schema.Struct({
+  identity: Schema.NullOr(VerifiedGitHubActionsIdentitySchema),
+  reason: Schema.NullOr(DenialReasonSchema),
+});
+
 type JwtHeader = Schema.Schema.Type<typeof JwtHeader>;
 type GitHubOidcClaims = Schema.Schema.Type<typeof GitHubOidcClaims>;
 export type GitHubJwk = Schema.Schema.Type<typeof GitHubJwk>;
@@ -71,7 +76,7 @@ export class GitHubOidcVerificationError extends Schema.TaggedErrorClass<GitHubO
   }
 ) {}
 
-export interface GitHubOidcVerificationOptions {
+interface GitHubOidcVerificationOptions {
   readonly audience: string;
   readonly issuedAtToleranceSeconds?: number;
   readonly jwks?: readonly GitHubJwk[];
@@ -120,14 +125,16 @@ const decodeJsonSegment = <A>(
 ) =>
   Effect.gen(function* decodeJsonSegmentEffect() {
     const bytes = yield* base64UrlToBytes(source, segment);
-    const json = yield* Effect.try({
-      catch: () =>
+    const json = yield* Schema.decodeUnknownEffect(
+      Schema.UnknownFromJsonString
+    )(new TextDecoder().decode(bytes)).pipe(
+      Effect.mapError(() =>
         oidcError(
           "oidc_invalid",
           `GitHub OIDC token ${segment} is not valid JSON. Restore/save was denied because identity could not be verified.`
-        ),
-      try: () => JSON.parse(new TextDecoder().decode(bytes)),
-    });
+        )
+      )
+    );
     const decoded = Schema.decodeUnknownExit(schema)(json);
 
     return Exit.isFailure(decoded)
@@ -194,8 +201,8 @@ const fetchJwks = (jwksUrl: string) =>
           "oidc_invalid",
           "Could not fetch GitHub OIDC signing keys. Restore/save was denied because identity signatures could not be verified."
         ),
-      try: async () => {
-        const response = await fetch(jwksUrl);
+      try: async (signal) => {
+        const response = await fetch(jwksUrl, { signal });
 
         if (!response.ok) {
           throw new Error(`GitHub JWKS returned HTTP ${response.status}.`);
@@ -253,10 +260,7 @@ const verificationKeysFor = Effect.fn("verificationKeysFor")(
     options: GitHubOidcVerificationOptions
   ) {
     if (options.jwks !== undefined) {
-      return {
-        jwk: options.jwks.find((key) => key.kid === header.kid),
-        keys: options.jwks,
-      } as const;
+      return options.jwks.find((key) => key.kid === header.kid);
     }
 
     const jwksUrl = options.jwksUrl ?? githubJwksUrl;
@@ -264,15 +268,12 @@ const verificationKeysFor = Effect.fn("verificationKeysFor")(
     const cachedKey = cachedKeys.find((key) => key.kid === header.kid);
 
     if (cachedKey !== undefined) {
-      return { jwk: cachedKey, keys: cachedKeys } as const;
+      return cachedKey;
     }
 
     const refreshedKeys = yield* jwksForVerification(jwksUrl, true);
 
-    return {
-      jwk: refreshedKeys.find((key) => key.kid === header.kid),
-      keys: refreshedKeys,
-    } as const;
+    return refreshedKeys.find((key) => key.kid === header.kid);
   }
 );
 
@@ -299,9 +300,11 @@ const importVerificationKey = (jwk: GitHubJwk) =>
       ),
   });
 
-const normalizeIdentity = (claims: GitHubOidcClaims) => {
-  const decoded = Schema.decodeUnknownExit(VerifiedGitHubActionsIdentitySchema)(
-    {
+const normalizeIdentity = Effect.fn("normalizeIdentity")(
+  function* normalizeIdentityEffect(claims: GitHubOidcClaims) {
+    return yield* Schema.decodeUnknownEffect(
+      VerifiedGitHubActionsIdentitySchema
+    )({
       actor: claims.actor,
       audience: claims.aud,
       baseRef: claims.base_ref ?? null,
@@ -321,11 +324,16 @@ const normalizeIdentity = (claims: GitHubOidcClaims) => {
       subject: claims.sub,
       workflow: claims.workflow,
       workflowRef: claims.workflow_ref ?? null,
-    }
-  );
-
-  return Exit.isFailure(decoded) ? null : decoded.value;
-};
+    }).pipe(
+      Effect.mapError(() =>
+        oidcError(
+          "oidc_invalid",
+          "GitHub OIDC token claims could not be normalized. Restore/save was denied because identity could not be verified."
+        )
+      )
+    );
+  }
+);
 
 export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
   function* verifyGitHubOidcTokenEffect(
@@ -392,7 +400,7 @@ export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
       return yield* subjectError;
     }
 
-    const { jwk } = yield* verificationKeysFor(header, options);
+    const jwk = yield* verificationKeysFor(header, options);
 
     if (jwk === undefined) {
       return yield* oidcError(
@@ -423,14 +431,7 @@ export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
       );
     }
 
-    const identity = normalizeIdentity(claims);
-
-    return identity === null
-      ? yield* oidcError(
-          "oidc_invalid",
-          "GitHub OIDC token claims could not be normalized. Restore/save was denied because identity could not be verified."
-        )
-      : identity;
+    return yield* normalizeIdentity(claims);
   }
 );
 
@@ -438,7 +439,7 @@ export const identityAuditPayload = (
   identity: VerifiedGitHubActionsIdentity | null,
   reason: DenialReason | null
 ) =>
-  JSON.stringify({
+  Schema.encodeUnknownSync(Schema.fromJsonString(IdentityAuditPayload))({
     identity,
     reason,
   });

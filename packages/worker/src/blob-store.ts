@@ -4,19 +4,14 @@ import { Context, Effect } from "effect";
 import { BlobStoreError } from "./blob-store-error";
 
 export interface BlobObjectHead {
-  readonly key: SnapshotObjectKey;
   readonly size: number;
 }
 
 export interface PutIfAbsentInput {
-  readonly body: Uint8Array;
+  readonly body: ReadableStream<Uint8Array>;
   readonly expectedDigest: Sha256Digest;
   readonly expectedSize: number;
   readonly key: SnapshotObjectKey;
-}
-
-export interface PutIfAbsentResult {
-  readonly status: "already-present" | "inserted";
 }
 
 export class BlobStore extends Context.Service<
@@ -24,39 +19,47 @@ export class BlobStore extends Context.Service<
   {
     readonly get: (
       key: SnapshotObjectKey
-    ) => Effect.Effect<Uint8Array, BlobStoreError>;
-    readonly getRange: (
-      key: SnapshotObjectKey,
-      offset: number,
-      length: number
-    ) => Effect.Effect<Uint8Array, BlobStoreError>;
+    ) => Effect.Effect<
+      { readonly body: ReadableStream<Uint8Array>; readonly size: number },
+      BlobStoreError
+    >;
     readonly head: (
       key: SnapshotObjectKey
     ) => Effect.Effect<BlobObjectHead | null, BlobStoreError>;
-    readonly presignGet: (
-      key: SnapshotObjectKey,
-      ttlSeconds: number
-    ) => Effect.Effect<null, BlobStoreError>;
-    readonly presignPut: (
-      key: SnapshotObjectKey,
-      ttlSeconds: number,
-      constraints: {
-        readonly expectedDigest: Sha256Digest;
-        readonly expectedSize: number;
-      }
-    ) => Effect.Effect<null, BlobStoreError>;
     readonly putIfAbsent: (
       input: PutIfAbsentInput
-    ) => Effect.Effect<PutIfAbsentResult, BlobStoreError>;
+    ) => Effect.Effect<void, BlobStoreError>;
   }
 >()("stateful-ci/worker/BlobStore") {}
 
-export const unsupportedPresign = (key: SnapshotObjectKey) =>
-  Effect.fail(
-    new BlobStoreError({
-      key,
-      message:
-        "Signed object URLs are not configured for this backend. Use authenticated Worker object routes instead.",
-      reason: "unsupported",
-    })
-  );
+export const validateExistingObjectBytes = (
+  input: {
+    readonly body: Uint8Array;
+    readonly key: SnapshotObjectKey;
+  },
+  existing: Uint8Array
+) => {
+  if (existing.byteLength !== input.body.byteLength) {
+    return Effect.fail(
+      new BlobStoreError({
+        key: input.key,
+        message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
+        reason: "conflict",
+      })
+    );
+  }
+
+  for (let index = 0; index < existing.byteLength; index += 1) {
+    if (existing[index] !== input.body[index]) {
+      return Effect.fail(
+        new BlobStoreError({
+          key: input.key,
+          message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
+          reason: "conflict",
+        })
+      );
+    }
+  }
+
+  return Effect.void;
+};

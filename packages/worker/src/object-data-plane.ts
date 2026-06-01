@@ -12,8 +12,15 @@ import { Effect, Exit, Schema } from "effect";
 
 import { BlobStore } from "./blob-store";
 
-export const objectRouteForKey = (key: SnapshotObjectKey) =>
-  `${routes.objects.pathPrefix}${key}`;
+export class SnapshotObjectAvailabilityError extends Schema.TaggedErrorClass<SnapshotObjectAvailabilityError>()(
+  "SnapshotObjectAvailabilityError",
+  {
+    reason: Schema.Literals([
+      "snapshot_object_missing",
+      "snapshot_object_mismatch",
+    ]),
+  }
+) {}
 
 export const parseObjectRouteKey = (path: string) => {
   if (!path.startsWith(routes.objects.pathPrefix)) {
@@ -40,14 +47,14 @@ const transferPlanEntry = (
       : undefined,
   method,
   object,
-  route: objectRouteForKey(object.key),
+  route: `${routes.objects.pathPrefix}${object.key}`,
   transport: "worker-route",
 });
 
-export const uploadPlanEntry = (object: SnapshotObjectInventoryEntry) =>
+const uploadPlanEntry = (object: SnapshotObjectInventoryEntry) =>
   transferPlanEntry("PUT", object);
 
-export const downloadPlanEntry = (object: SnapshotObjectInventoryEntry) =>
+const downloadPlanEntry = (object: SnapshotObjectInventoryEntry) =>
   transferPlanEntry("GET", object);
 
 export const objectKindForKey = (key: SnapshotObjectKey) => {
@@ -62,35 +69,53 @@ export const objectKindForKey = (key: SnapshotObjectKey) => {
   return "chunk" as const;
 };
 
-export const objectMatchesCanonicalKey = (
-  object: SnapshotObjectInventoryEntry
-) => object.kind === objectKindForKey(object.key);
+const objectMatchesCanonicalKey = (object: SnapshotObjectInventoryEntry) =>
+  object.kind === objectKindForKey(object.key);
 
-export const missingObjectPlans = Effect.fn("missingObjectPlans")(
-  function* missingObjectPlansEffect(
-    objects: readonly SnapshotObjectInventoryEntry[]
+const objectAvailability = Effect.fn("objectAvailability")(
+  function* objectAvailabilityEffect(
+    objects: readonly SnapshotObjectInventoryEntry[],
+    missing: "collect" | "fail"
   ) {
     const blobStore = yield* BlobStore;
-    const missing: ObjectTransferPlanEntry[] = [];
+    const missingObjects: ObjectTransferPlanEntry[] = [];
 
     for (const object of objects) {
       if (!objectMatchesCanonicalKey(object)) {
-        return yield* Effect.fail("snapshot_object_mismatch" as const);
+        return yield* new SnapshotObjectAvailabilityError({
+          reason: "snapshot_object_mismatch",
+        });
       }
 
       const head = yield* blobStore.head(object.key);
 
       if (head === null) {
-        missing.push(uploadPlanEntry(object));
+        if (missing === "fail") {
+          return yield* new SnapshotObjectAvailabilityError({
+            reason: "snapshot_object_missing",
+          });
+        }
+
+        missingObjects.push(uploadPlanEntry(object));
         continue;
       }
 
       if (head.size !== object.size) {
-        return yield* Effect.fail("snapshot_object_mismatch" as const);
+        return yield* new SnapshotObjectAvailabilityError({
+          reason: "snapshot_object_mismatch",
+        });
       }
     }
 
-    return missing;
+    return missingObjects;
+  }
+);
+
+export const missingObjectPlans = Effect.fn("missingObjectPlans")(
+  function* missingObjectPlansEffect(
+    objects: readonly SnapshotObjectInventoryEntry[]
+  ) {
+    return yield* objectAvailability(objects, "collect");
   }
 );
 
@@ -98,23 +123,7 @@ export const validateObjectsPresent = Effect.fn("validateObjectsPresent")(
   function* validateObjectsPresentEffect(
     objects: readonly SnapshotObjectInventoryEntry[]
   ) {
-    const blobStore = yield* BlobStore;
-
-    for (const object of objects) {
-      if (!objectMatchesCanonicalKey(object)) {
-        return yield* Effect.fail("snapshot_object_mismatch" as const);
-      }
-
-      const head = yield* blobStore.head(object.key);
-
-      if (head === null) {
-        return yield* Effect.fail("snapshot_object_missing" as const);
-      }
-
-      if (head.size !== object.size) {
-        return yield* Effect.fail("snapshot_object_mismatch" as const);
-      }
-    }
+    yield* objectAvailability(objects, "fail");
   }
 );
 

@@ -2,7 +2,6 @@ import type {
   CommitSaveResponse,
   DenialReason,
   IdempotencyKey,
-  ManifestDescriptor,
   RunId,
   SnapshotId,
   SnapshotObjectInventoryEntry,
@@ -104,7 +103,7 @@ export interface AuditEvent extends RefTarget {
 }
 
 export interface WorkspaceTarget extends RefTarget {
-  readonly expiresAt?: string;
+  readonly preparedAt?: string;
   readonly producerActor?: string;
   readonly producerEvent?: string;
   readonly producerJob?: string;
@@ -134,6 +133,90 @@ export interface AuditEventQuery {
   readonly refName?: string;
   readonly workspaceId?: WorkspaceId;
   readonly runId?: RunId;
+}
+
+interface RefD1Row {
+  readonly generation: number;
+  readonly namespace: string;
+  readonly ref_name: string;
+  readonly snapshot_id: string;
+  readonly trust_class: string;
+  readonly updated_at: string;
+  readonly updated_by_actor: string | null;
+  readonly updated_by_run_id: string | null;
+}
+
+interface SnapshotD1Row {
+  readonly created_at: string;
+  readonly manifest_digest: string;
+  readonly manifest_key: string;
+  readonly manifest_size: number;
+  readonly namespace: string;
+  readonly parent_snapshot_id: string | null;
+  readonly producer_actor: string;
+  readonly producer_event: string;
+  readonly producer_job: string;
+  readonly producer_ref: string;
+  readonly producer_repository: string;
+  readonly producer_run_id: string;
+  readonly producer_sha: string;
+  readonly producer_workflow: string;
+  readonly safety_json: string;
+  readonly snapshot_id: string;
+  readonly stats_json: string;
+  readonly trust_class: string;
+  readonly workspace_id: string;
+}
+
+interface SnapshotObjectD1Row {
+  readonly object_digest: string;
+  readonly object_key: string;
+  readonly object_kind: string;
+  readonly size: number;
+  readonly snapshot_id: string;
+}
+
+interface WorkspaceTargetD1Row {
+  readonly namespace: string;
+  readonly prepared_at: string | null;
+  readonly producer_actor: string | null;
+  readonly producer_event: string | null;
+  readonly producer_job: string | null;
+  readonly producer_ref: string | null;
+  readonly producer_repository: string | null;
+  readonly producer_sha: string | null;
+  readonly producer_workflow: string | null;
+  readonly ref_name: string;
+  readonly run_id: string;
+  readonly trust_class: string;
+  readonly workspace_id: string;
+}
+
+interface IdempotentCommitD1Row {
+  readonly created_at: string;
+  readonly head_generation: number;
+  readonly idempotency_key: string;
+  readonly latest: number;
+  readonly manifest_digest: string;
+  readonly result_json: string;
+  readonly run_id: string;
+  readonly snapshot_id: string;
+  readonly workspace_id: string;
+}
+
+interface AuditEventD1Row {
+  readonly created_at: string;
+  readonly decision: string;
+  readonly event_type: string;
+  readonly id: string;
+  readonly namespace: string;
+  readonly payload_json: string | null;
+  readonly reason: string | null;
+  readonly ref_name: string;
+  readonly run_id: string | null;
+  readonly snapshot_id: string | null;
+  readonly trust_class: string | null;
+  readonly workspace_id: string | null;
 }
 
 export interface InMemoryMetadataSeed {
@@ -200,20 +283,17 @@ export class MetadataBackend extends Context.Service<
   }
 >()("stateful-ci/worker/MetadataBackend") {}
 
-const refKey = (target: RefTarget) => `${target.namespace}\n${target.refName}`;
+export const scopeKeyForRefTarget = (target: RefTarget) =>
+  `${target.namespace}\n${target.refName}`;
+
+export const workspaceIdForRefTarget = (target: RefTarget) =>
+  Schema.decodeSync(WorkspaceIdSchema)(
+    `ws:${target.namespace}:${target.refName}`
+  );
 
 export const currentIsoTimestamp = Clock.currentTimeMillis.pipe(
   Effect.map((millis) => new Date(millis).toISOString())
 );
-
-export const manifestDescriptorFromSnapshotHeader = (
-  snapshot: SnapshotHeader
-): ManifestDescriptor => ({
-  digest: snapshot.manifestDigest,
-  key: snapshot.manifestKey,
-  size: snapshot.manifestSize,
-  snapshotId: snapshot.snapshotId,
-});
 
 export const inventoryFromSnapshotRows = (
   objects: readonly SnapshotObjectRow[]
@@ -239,6 +319,68 @@ export const snapshotRowsFromInventory = (
     snapshotId,
   }));
 
+const byObjectKey = (left: SnapshotObjectRow, right: SnapshotObjectRow) =>
+  left.key.localeCompare(right.key);
+
+const snapshotHeaderMatches = (left: SnapshotHeader, right: SnapshotHeader) =>
+  left.manifestDigest === right.manifestDigest &&
+  left.manifestKey === right.manifestKey &&
+  left.manifestSize === right.manifestSize &&
+  left.namespace === right.namespace &&
+  left.parentSnapshotId === right.parentSnapshotId &&
+  left.producerActor === right.producerActor &&
+  left.producerEvent === right.producerEvent &&
+  left.producerJob === right.producerJob &&
+  left.producerRef === right.producerRef &&
+  left.producerRepository === right.producerRepository &&
+  left.producerRunId === right.producerRunId &&
+  left.producerSha === right.producerSha &&
+  left.producerWorkflow === right.producerWorkflow &&
+  left.safetyJson === right.safetyJson &&
+  left.snapshotId === right.snapshotId &&
+  left.statsJson === right.statsJson &&
+  left.trustClass === right.trustClass &&
+  left.workspaceId === right.workspaceId;
+
+const snapshotObjectMatches = (
+  left: SnapshotObjectRow,
+  right: SnapshotObjectRow
+) =>
+  left.digest === right.digest &&
+  left.key === right.key &&
+  left.kind === right.kind &&
+  left.size === right.size &&
+  left.snapshotId === right.snapshotId;
+
+export const snapshotObjectsMatch = (
+  left: readonly SnapshotObjectRow[],
+  right: readonly SnapshotObjectRow[]
+) => {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const leftSorted = left.toSorted(byObjectKey);
+  const rightSorted = right.toSorted(byObjectKey);
+
+  return leftSorted.every((object, index) => {
+    const other = rightSorted[index];
+    return other !== undefined && snapshotObjectMatches(object, other);
+  });
+};
+
+export const snapshotObjectConflict = (
+  existing: readonly SnapshotObjectRow[],
+  desired: readonly SnapshotObjectRow[]
+) => {
+  const desiredByKey = new Map(desired.map((object) => [object.key, object]));
+
+  return existing.some((object) => {
+    const match = desiredByKey.get(object.key);
+    return match === undefined || !snapshotObjectMatches(object, match);
+  });
+};
+
 const auditMatchesQuery = (event: AuditEvent, query: AuditEventQuery = {}) =>
   (query.namespace === undefined || event.namespace === query.namespace) &&
   (query.refName === undefined || event.refName === query.refName) &&
@@ -250,7 +392,7 @@ export const createInMemoryMetadataBackend = (
   seed: InMemoryMetadataSeed = {}
 ): MetadataBackend["Service"] => {
   const refs = new Map(
-    (seed.refs ?? []).map((ref) => [refKey(ref), ref] as const)
+    (seed.refs ?? []).map((ref) => [scopeKeyForRefTarget(ref), ref] as const)
   );
   const snapshots = new Map(
     (seed.snapshots ?? []).map(
@@ -293,7 +435,7 @@ export const createInMemoryMetadataBackend = (
       }),
     compareAndAdvanceRef: (namespace, refName, expectedGeneration, next) =>
       Effect.gen(function* compareAndAdvanceRefEffect() {
-        const key = refKey({ namespace, refName });
+        const key = scopeKeyForRefTarget({ namespace, refName });
         const previous = refs.get(key);
         const actualGeneration =
           previous?.generation ?? Schema.decodeSync(HeadGeneration)(0);
@@ -320,7 +462,9 @@ export const createInMemoryMetadataBackend = (
     getIdempotentCommit: (idempotencyKey) =>
       Effect.sync(() => idempotentCommits.get(idempotencyKey) ?? null),
     getRef: (namespace, refName) =>
-      Effect.sync(() => refs.get(refKey({ namespace, refName })) ?? null),
+      Effect.sync(
+        () => refs.get(scopeKeyForRefTarget({ namespace, refName })) ?? null
+      ),
     getSnapshotHeader: (snapshotId) =>
       Effect.sync(() => snapshots.get(snapshotId) ?? null),
     getSnapshotObjects: (snapshotId) =>
@@ -333,34 +477,36 @@ export const createInMemoryMetadataBackend = (
       ),
     putSnapshotHeader: (header) =>
       Effect.gen(function* putSnapshotHeaderInMemoryEffect() {
-        if (snapshots.has(header.snapshotId)) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "In-memory metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotHeader",
-            })
-          );
+        const existing = snapshots.get(header.snapshotId);
+
+        if (existing !== undefined) {
+          if (snapshotHeaderMatches(existing, header)) {
+            return;
+          }
+
+          return yield* new MetadataBackendError({
+            message:
+              "In-memory metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+            operation: "putSnapshotHeader",
+          });
         }
 
         snapshots.set(header.snapshotId, header);
       }),
     putSnapshotObjects: (snapshotId, objects) =>
       Effect.gen(function* putSnapshotObjectsInMemoryEffect() {
-        if ((snapshotObjects.get(snapshotId)?.length ?? 0) > 0) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "In-memory metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotObjects",
-            })
-          );
+        const desired = snapshotRowsFromInventory(snapshotId, objects);
+        const existing = snapshotObjects.get(snapshotId) ?? [];
+
+        if (snapshotObjectConflict(existing, desired)) {
+          return yield* new MetadataBackendError({
+            message:
+              "In-memory metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
+            operation: "putSnapshotObjects",
+          });
         }
 
-        snapshotObjects.set(
-          snapshotId,
-          snapshotRowsFromInventory(snapshotId, objects)
-        );
+        snapshotObjects.set(snapshotId, desired);
       }),
     releaseIdempotentCommit: (commit) =>
       Effect.sync(() => {
@@ -392,10 +538,10 @@ export const createInMemoryMetadataBackend = (
   });
 };
 
-const queryOne = <A>(
+const queryOne = <Row, A>(
   statement: D1PreparedStatement,
   operation: string,
-  map: (row: Record<string, unknown>) => A
+  map: (row: Row) => A
 ) =>
   Effect.tryPromise({
     catch: (cause) =>
@@ -405,7 +551,7 @@ const queryOne = <A>(
         operation,
       }),
     try: async () => {
-      const row = await statement.first<Record<string, unknown>>();
+      const row = await statement.first<Row>();
       return row === null ? null : map(row);
     },
   });
@@ -429,101 +575,46 @@ const changedRows = (result: D1Result<unknown>) => {
   return typeof changes === "number" ? changes : (rowsWritten ?? 0);
 };
 
-const stringColumn = (row: Record<string, unknown>, column: string) => {
-  const value = row[column];
-
-  if (typeof value !== "string") {
-    throw new TypeError(
-      `Invalid D1 metadata row: expected string column "${column}", got ${typeof value}. Check the D1 migration and stored metadata before retrying.`
-    );
-  }
-
-  return value;
-};
-
-const numberColumn = (row: Record<string, unknown>, column: string) => {
-  const value = row[column];
-
-  if (typeof value !== "number" || Number.isNaN(value)) {
-    throw new TypeError(
-      `Invalid D1 metadata row: expected number column "${column}", got ${typeof value}. Check the D1 migration and stored metadata before retrying.`
-    );
-  }
-
-  return value;
-};
-
-const nullableStringColumn = (row: Record<string, unknown>, column: string) => {
-  const value = row[column];
-  return typeof value === "string" ? value : null;
-};
-
-const nullableDecodedColumn = <S extends Schema.Decoder<unknown>>(
-  schema: S,
-  row: Record<string, unknown>,
-  column: string
-) => {
-  const value = nullableStringColumn(row, column);
-
-  return value === null ? null : Schema.decodeUnknownSync(schema)(value);
-};
-
-const refFromRow = (row: Record<string, unknown>): RefRow => ({
-  generation: Schema.decodeSync(HeadGeneration)(
-    numberColumn(row, "generation")
-  ),
-  namespace: stringColumn(row, "namespace"),
-  refName: stringColumn(row, "ref_name"),
-  snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(
-    stringColumn(row, "snapshot_id")
-  ),
-  trustClass: Schema.decodeUnknownSync(TrustClassSchema)(
-    stringColumn(row, "trust_class")
-  ),
-  updatedAt: stringColumn(row, "updated_at"),
-  updatedByActor: nullableStringColumn(row, "updated_by_actor"),
-  updatedByRunId: nullableDecodedColumn(RunIdSchema, row, "updated_by_run_id"),
+const refFromRow = (row: RefD1Row): RefRow => ({
+  generation: Schema.decodeSync(HeadGeneration)(row.generation),
+  namespace: row.namespace,
+  refName: row.ref_name,
+  snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(row.snapshot_id),
+  trustClass: Schema.decodeUnknownSync(TrustClassSchema)(row.trust_class),
+  updatedAt: row.updated_at,
+  updatedByActor: row.updated_by_actor,
+  updatedByRunId:
+    row.updated_by_run_id === null
+      ? null
+      : Schema.decodeUnknownSync(RunIdSchema)(row.updated_by_run_id),
 });
 
-const snapshotFromRow = (row: Record<string, unknown>): SnapshotHeader => ({
-  createdAt: stringColumn(row, "created_at"),
-  manifestDigest: Schema.decodeUnknownSync(Sha256Digest)(
-    stringColumn(row, "manifest_digest")
-  ),
-  manifestKey: Schema.decodeUnknownSync(ManifestKey)(
-    stringColumn(row, "manifest_key")
-  ),
-  manifestSize: numberColumn(row, "manifest_size"),
-  namespace: stringColumn(row, "namespace"),
-  parentSnapshotId: nullableDecodedColumn(
-    SnapshotIdSchema,
-    row,
-    "parent_snapshot_id"
-  ),
-  producerActor: stringColumn(row, "producer_actor"),
-  producerEvent: stringColumn(row, "producer_event"),
-  producerJob: stringColumn(row, "producer_job"),
-  producerRef: stringColumn(row, "producer_ref"),
-  producerRepository: stringColumn(row, "producer_repository"),
-  producerRunId: Schema.decodeUnknownSync(RunIdSchema)(
-    stringColumn(row, "producer_run_id")
-  ),
-  producerSha: stringColumn(row, "producer_sha"),
-  producerWorkflow: stringColumn(row, "producer_workflow"),
-  safetyJson: stringColumn(row, "safety_json"),
-  snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(
-    stringColumn(row, "snapshot_id")
-  ),
-  statsJson: stringColumn(row, "stats_json"),
-  trustClass: Schema.decodeUnknownSync(TrustClassSchema)(
-    stringColumn(row, "trust_class")
-  ),
-  workspaceId: Schema.decodeUnknownSync(WorkspaceIdSchema)(
-    stringColumn(row, "workspace_id")
-  ),
+const snapshotFromRow = (row: SnapshotD1Row): SnapshotHeader => ({
+  createdAt: row.created_at,
+  manifestDigest: Schema.decodeUnknownSync(Sha256Digest)(row.manifest_digest),
+  manifestKey: Schema.decodeUnknownSync(ManifestKey)(row.manifest_key),
+  manifestSize: row.manifest_size,
+  namespace: row.namespace,
+  parentSnapshotId:
+    row.parent_snapshot_id === null
+      ? null
+      : Schema.decodeUnknownSync(SnapshotIdSchema)(row.parent_snapshot_id),
+  producerActor: row.producer_actor,
+  producerEvent: row.producer_event,
+  producerJob: row.producer_job,
+  producerRef: row.producer_ref,
+  producerRepository: row.producer_repository,
+  producerRunId: Schema.decodeUnknownSync(RunIdSchema)(row.producer_run_id),
+  producerSha: row.producer_sha,
+  producerWorkflow: row.producer_workflow,
+  safetyJson: row.safety_json,
+  snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(row.snapshot_id),
+  statsJson: row.stats_json,
+  trustClass: Schema.decodeUnknownSync(TrustClassSchema)(row.trust_class),
+  workspaceId: Schema.decodeUnknownSync(WorkspaceIdSchema)(row.workspace_id),
 });
 
-const objectFromRow = (row: Record<string, unknown>): SnapshotObjectRow =>
+const objectFromRow = (row: SnapshotObjectD1Row): SnapshotObjectRow =>
   ({
     ...Schema.decodeUnknownSync(SnapshotObjectInventoryEntrySchema)({
       digest: row.object_digest,
@@ -534,56 +625,29 @@ const objectFromRow = (row: Record<string, unknown>): SnapshotObjectRow =>
     snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(row.snapshot_id),
   }) satisfies SnapshotObjectRow;
 
-const optionalStringField = <Key extends string>(
-  key: Key,
-  value: string | null
-) => (value === null ? {} : { [key]: value });
-
-const workspaceTargetFromRow = (
-  row: Record<string, unknown>
-): WorkspaceTarget =>
+const workspaceTargetFromRow = (row: WorkspaceTargetD1Row): WorkspaceTarget =>
   ({
-    namespace: stringColumn(row, "namespace"),
-    ...optionalStringField(
-      "expiresAt",
-      nullableStringColumn(row, "expires_at")
-    ),
-    ...optionalStringField(
-      "producerActor",
-      nullableStringColumn(row, "producer_actor")
-    ),
-    ...optionalStringField(
-      "producerEvent",
-      nullableStringColumn(row, "producer_event")
-    ),
-    ...optionalStringField(
-      "producerJob",
-      nullableStringColumn(row, "producer_job")
-    ),
-    ...optionalStringField(
-      "producerRef",
-      nullableStringColumn(row, "producer_ref")
-    ),
-    ...optionalStringField(
-      "producerRepository",
-      nullableStringColumn(row, "producer_repository")
-    ),
-    ...optionalStringField(
-      "producerSha",
-      nullableStringColumn(row, "producer_sha")
-    ),
-    ...optionalStringField(
-      "producerWorkflow",
-      nullableStringColumn(row, "producer_workflow")
-    ),
-    refName: stringColumn(row, "ref_name"),
-    runId: Schema.decodeUnknownSync(RunIdSchema)(stringColumn(row, "run_id")),
-    trustClass: Schema.decodeUnknownSync(TrustClassSchema)(
-      stringColumn(row, "trust_class")
-    ),
-    workspaceId: Schema.decodeUnknownSync(WorkspaceIdSchema)(
-      stringColumn(row, "workspace_id")
-    ),
+    namespace: row.namespace,
+    ...(row.prepared_at === null ? {} : { preparedAt: row.prepared_at }),
+    ...(row.producer_actor === null
+      ? {}
+      : { producerActor: row.producer_actor }),
+    ...(row.producer_event === null
+      ? {}
+      : { producerEvent: row.producer_event }),
+    ...(row.producer_job === null ? {} : { producerJob: row.producer_job }),
+    ...(row.producer_ref === null ? {} : { producerRef: row.producer_ref }),
+    ...(row.producer_repository === null
+      ? {}
+      : { producerRepository: row.producer_repository }),
+    ...(row.producer_sha === null ? {} : { producerSha: row.producer_sha }),
+    ...(row.producer_workflow === null
+      ? {}
+      : { producerWorkflow: row.producer_workflow }),
+    refName: row.ref_name,
+    runId: Schema.decodeUnknownSync(RunIdSchema)(row.run_id),
+    trustClass: Schema.decodeUnknownSync(TrustClassSchema)(row.trust_class),
+    workspaceId: Schema.decodeUnknownSync(WorkspaceIdSchema)(row.workspace_id),
   }) satisfies WorkspaceTarget;
 
 export const createD1MetadataBackend = (
@@ -671,29 +735,25 @@ export const createD1MetadataBackend = (
           .prepare("select * from idempotent_commits where idempotency_key = ?")
           .bind(idempotencyKey),
         "getIdempotentCommit",
-        (row): IdempotentCommit => ({
-          createdAt: stringColumn(row, "created_at"),
+        (row: IdempotentCommitD1Row): IdempotentCommit => ({
+          createdAt: row.created_at,
           headGeneration: Schema.decodeSync(HeadGeneration)(
-            numberColumn(row, "head_generation")
+            row.head_generation
           ),
           idempotencyKey: Schema.decodeUnknownSync(IdempotencyKeySchema)(
-            stringColumn(row, "idempotency_key")
+            row.idempotency_key
           ),
-          latest: numberColumn(row, "latest") === 1,
-          manifestDigest: Schema.decodeSync(Sha256Digest)(
-            stringColumn(row, "manifest_digest")
-          ),
-          result: Schema.decodeUnknownSync(CommitSaveResponseSchema)(
-            JSON.parse(stringColumn(row, "result_json")) as unknown
-          ),
-          runId: Schema.decodeUnknownSync(RunIdSchema)(
-            stringColumn(row, "run_id")
-          ),
+          latest: row.latest === 1,
+          manifestDigest: Schema.decodeSync(Sha256Digest)(row.manifest_digest),
+          result: Schema.decodeUnknownSync(
+            Schema.fromJsonString(CommitSaveResponseSchema)
+          )(row.result_json),
+          runId: Schema.decodeUnknownSync(RunIdSchema)(row.run_id),
           snapshotId: Schema.decodeUnknownSync(SnapshotIdSchema)(
-            stringColumn(row, "snapshot_id")
+            row.snapshot_id
           ),
           workspaceId: Schema.decodeUnknownSync(WorkspaceIdSchema)(
-            stringColumn(row, "workspace_id")
+            row.workspace_id
           ),
         })
       ),
@@ -728,7 +788,7 @@ export const createD1MetadataBackend = (
               "select * from snapshot_objects where snapshot_id = ? order by object_key"
             )
             .bind(snapshotId)
-            .all<Record<string, unknown>>();
+            .all<SnapshotObjectD1Row>();
           return result.results.map(objectFromRow);
         },
       }),
@@ -778,99 +838,104 @@ export const createD1MetadataBackend = (
               `select * from audit_events${where} order by created_at, id`
             )
             .bind(...predicates.map((predicate) => predicate.value))
-            .all<Record<string, unknown>>();
+            .all<AuditEventD1Row>();
           return result.results.map(
             (row): AuditEvent => ({
-              createdAt: stringColumn(row, "created_at"),
+              createdAt: row.created_at,
               decision: Schema.decodeUnknownSync(AuditDecisionSchema)(
-                stringColumn(row, "decision")
+                row.decision
               ),
               eventType: Schema.decodeUnknownSync(AuditEventTypeSchema)(
-                stringColumn(row, "event_type")
+                row.event_type
               ),
-              id: stringColumn(row, "id"),
-              namespace: stringColumn(row, "namespace"),
-              payloadJson: nullableStringColumn(row, "payload_json"),
-              reason: nullableDecodedColumn(DenialReasonSchema, row, "reason"),
-              refName: stringColumn(row, "ref_name"),
-              runId: nullableDecodedColumn(RunIdSchema, row, "run_id"),
-              snapshotId: nullableDecodedColumn(
-                SnapshotIdSchema,
-                row,
-                "snapshot_id"
-              ),
-              trustClass: nullableDecodedColumn(
-                TrustClassSchema,
-                row,
-                "trust_class"
-              ),
-              workspaceId: nullableDecodedColumn(
-                WorkspaceIdSchema,
-                row,
-                "workspace_id"
-              ),
+              id: row.id,
+              namespace: row.namespace,
+              payloadJson: row.payload_json,
+              reason:
+                row.reason === null
+                  ? null
+                  : Schema.decodeUnknownSync(DenialReasonSchema)(row.reason),
+              refName: row.ref_name,
+              runId:
+                row.run_id === null
+                  ? null
+                  : Schema.decodeUnknownSync(RunIdSchema)(row.run_id),
+              snapshotId:
+                row.snapshot_id === null
+                  ? null
+                  : Schema.decodeUnknownSync(SnapshotIdSchema)(row.snapshot_id),
+              trustClass:
+                row.trust_class === null
+                  ? null
+                  : Schema.decodeUnknownSync(TrustClassSchema)(row.trust_class),
+              workspaceId:
+                row.workspace_id === null
+                  ? null
+                  : Schema.decodeUnknownSync(WorkspaceIdSchema)(
+                      row.workspace_id
+                    ),
             })
           );
         },
       }),
     putSnapshotHeader: (header) =>
-      runStatement(
-        db
-          .prepare(
-            "insert into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          )
-          .bind(
-            header.snapshotId,
-            header.workspaceId,
-            header.namespace,
-            header.parentSnapshotId,
-            header.manifestKey,
-            header.manifestDigest,
-            header.manifestSize,
-            header.trustClass,
-            header.producerRepository,
-            header.producerWorkflow,
-            header.producerJob,
-            header.producerRef,
-            header.producerEvent,
-            header.producerSha,
-            header.producerActor,
-            header.producerRunId,
-            header.statsJson,
-            header.safetyJson,
-            header.createdAt
-          ),
-        "putSnapshotHeader"
-      ),
-    putSnapshotObjects: (snapshotId, objects) =>
-      Effect.gen(function* putSnapshotObjectsD1Effect() {
-        const existing = yield* queryOne(
+      Effect.gen(function* putSnapshotHeaderD1Effect() {
+        yield* runStatement(
           db
             .prepare(
-              "select object_key from snapshot_objects where snapshot_id = ? limit 1"
+              "insert or ignore into snapshots (snapshot_id, workspace_id, namespace, parent_snapshot_id, manifest_key, manifest_digest, manifest_size, trust_class, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor, producer_run_id, stats_json, safety_json, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
-            .bind(snapshotId),
-          "getSnapshotObjectsForWrite",
-          (row) => stringColumn(row, "object_key")
+            .bind(
+              header.snapshotId,
+              header.workspaceId,
+              header.namespace,
+              header.parentSnapshotId,
+              header.manifestKey,
+              header.manifestDigest,
+              header.manifestSize,
+              header.trustClass,
+              header.producerRepository,
+              header.producerWorkflow,
+              header.producerJob,
+              header.producerRef,
+              header.producerEvent,
+              header.producerSha,
+              header.producerActor,
+              header.producerRunId,
+              header.statsJson,
+              header.safetyJson,
+              header.createdAt
+            ),
+          "putSnapshotHeader"
         );
 
-        if (existing !== null) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "D1 metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotObjects",
-            })
-          );
+        const stored = yield* queryOne(
+          db
+            .prepare("select * from snapshots where snapshot_id = ?")
+            .bind(header.snapshotId),
+          "verifySnapshotHeaderWrite",
+          snapshotFromRow
+        );
+
+        if (stored === null || !snapshotHeaderMatches(stored, header)) {
+          return yield* new MetadataBackendError({
+            message:
+              "D1 metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+            operation: "putSnapshotHeader",
+          });
         }
+      }),
+    putSnapshotObjects: (snapshotId, objects) =>
+      Effect.gen(function* putSnapshotObjectsD1Effect() {
+        const desired = snapshotRowsFromInventory(snapshotId, objects);
 
         yield* Effect.forEach(
-          snapshotRowsFromInventory(snapshotId, objects),
+          desired,
           (object) =>
             runStatement(
               db
                 .prepare(
-                  "insert into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
+                  "insert or ignore into snapshot_objects (snapshot_id, object_key, object_digest, object_kind, size) values (?, ?, ?, ?, ?)"
                 )
                 .bind(
                   object.snapshotId,
@@ -883,6 +948,33 @@ export const createD1MetadataBackend = (
             ),
           { discard: true }
         );
+
+        const finalResult = yield* Effect.tryPromise({
+          catch: (cause) =>
+            new MetadataBackendError({
+              cause,
+              message:
+                "D1 metadata query failed during verifySnapshotObjectsWrite. Snapshot object rows could not be verified; retry after checking the D1 binding and migration state.",
+              operation: "verifySnapshotObjectsWrite",
+            }),
+          try: () =>
+            db
+              .prepare(
+                "select * from snapshot_objects where snapshot_id = ? order by object_key"
+              )
+              .bind(snapshotId)
+              .all<SnapshotObjectD1Row>(),
+        });
+
+        if (
+          !snapshotObjectsMatch(finalResult.results.map(objectFromRow), desired)
+        ) {
+          return yield* new MetadataBackendError({
+            message:
+              "D1 metadata write failed during putSnapshotObjects. Snapshot object rows were not fully persisted; retry after checking the D1 binding and migration state.",
+            operation: "putSnapshotObjects",
+          });
+        }
       }),
     releaseIdempotentCommit: (commit) =>
       runStatement(
@@ -915,7 +1007,9 @@ export const createD1MetadataBackend = (
               commit.manifestDigest,
               commit.headGeneration,
               commit.latest ? 1 : 0,
-              JSON.stringify(commit.result),
+              Schema.encodeUnknownSync(
+                Schema.fromJsonString(CommitSaveResponseSchema)
+              )(commit.result),
               commit.createdAt
             ),
           "rememberIdempotentCommit"
@@ -926,7 +1020,7 @@ export const createD1MetadataBackend = (
       runStatement(
         db
           .prepare(
-            "insert into workspace_targets (workspace_id, namespace, ref_name, run_id, trust_class, expires_at, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(workspace_id) do update set namespace = excluded.namespace, ref_name = excluded.ref_name, run_id = excluded.run_id, trust_class = excluded.trust_class, expires_at = excluded.expires_at, producer_repository = excluded.producer_repository, producer_workflow = excluded.producer_workflow, producer_job = excluded.producer_job, producer_ref = excluded.producer_ref, producer_event = excluded.producer_event, producer_sha = excluded.producer_sha, producer_actor = excluded.producer_actor"
+            "insert into workspace_targets (workspace_id, namespace, ref_name, run_id, trust_class, prepared_at, producer_repository, producer_workflow, producer_job, producer_ref, producer_event, producer_sha, producer_actor) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(workspace_id) do update set namespace = excluded.namespace, ref_name = excluded.ref_name, run_id = excluded.run_id, trust_class = excluded.trust_class, prepared_at = excluded.prepared_at, producer_repository = excluded.producer_repository, producer_workflow = excluded.producer_workflow, producer_job = excluded.producer_job, producer_ref = excluded.producer_ref, producer_event = excluded.producer_event, producer_sha = excluded.producer_sha, producer_actor = excluded.producer_actor"
           )
           .bind(
             target.workspaceId,
@@ -934,7 +1028,7 @@ export const createD1MetadataBackend = (
             target.refName,
             target.runId,
             target.trustClass,
-            target.expiresAt ?? null,
+            target.preparedAt ?? null,
             target.producerRepository ?? null,
             target.producerWorkflow ?? null,
             target.producerJob ?? null,

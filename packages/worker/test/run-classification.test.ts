@@ -1,168 +1,100 @@
 import { describe, expect, it } from "@effect/vitest";
-import { RestoreRequest } from "@stateful-ci/core";
-import { Schema } from "effect";
+import type { VerifiedGitHubActionsIdentity } from "@stateful-ci/core";
 
-import { classifyRunTrust } from "../src/run-classification";
+import { classifyVerifiedGitHubTrust } from "../src/run-classification";
 
-const restoreRequest = Schema.decodeSync(RestoreRequest)({
-  client: {
-    configHash:
-      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    version: "0.1.0",
-  },
-  git: {
-    baseRef: null,
-    headRef: null,
-    headRepo: null,
-    ref: "refs/heads/main",
-    sha: "abc123",
-  },
-  github: {
-    actor: "eersnington",
-    event: "push",
-    runId: "123456789",
-  },
-  identity: {
-    provider: "github-actions",
-    token: "oidc.jwt.token",
-  },
-  managedRoots: [".turbo"],
-  protocolVersion: 1,
-  workspace: {
-    job: "test",
-    repo: "eersnington/stateful-ci",
-    workflow: "ci.yml",
-  },
-});
+const identity = {
+  actor: "eersnington",
+  audience: "stateful-ci",
+  baseRef: null,
+  checkRunId: "987654321",
+  environment: null,
+  event: "push",
+  headRef: null,
+  issuer: "https://token.actions.githubusercontent.com",
+  jobWorkflowRef: null,
+  provider: "github-actions",
+  ref: "refs/heads/main",
+  refType: "branch",
+  repository: "eersnington/stateful-ci",
+  repositoryOwner: "eersnington",
+  runId: "123456789",
+  sha: "abc123",
+  subject: "repo:eersnington/stateful-ci:ref:refs/heads/main",
+  workflow: "ci.yml",
+  workflowRef:
+    "eersnington/stateful-ci/.github/workflows/ci.yml@refs/heads/main",
+} satisfies VerifiedGitHubActionsIdentity;
 
-describe("run classification", () => {
-  it("classifies push to refs/heads/main as trusted", () => {
-    expect(classifyRunTrust(restoreRequest)).toBe("trusted");
+describe("verified run classification", () => {
+  it("classifies trusted branch pushes", () => {
+    expect(classifyVerifiedGitHubTrust(identity)).toBe("trusted");
   });
 
-  it("classifies same-repo branch pushes as internal", () => {
+  it("classifies same-repository branch pushes as internal", () => {
     expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: { ...restoreRequest.git, ref: "refs/heads/feature" },
-      })
+      classifyVerifiedGitHubTrust({ ...identity, ref: "refs/heads/feature" })
     ).toBe("internal");
   });
 
-  it("does not assume every repository uses main as the only trusted branch", () => {
+  it("uses configured trusted refs", () => {
     expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: { ...restoreRequest.git, ref: "refs/heads/master" },
-      })
+      classifyVerifiedGitHubTrust(
+        { ...identity, ref: "refs/heads/release" },
+        { trustedRefs: ["refs/heads/release"] }
+      )
     ).toBe("trusted");
   });
 
-  it("classifies same-repo pull requests as internal", () => {
+  it("treats verified pull requests as external without repository metadata", () => {
     expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: {
-          ...restoreRequest.git,
-          baseRef: "main",
-          headRef: "feature",
-          headRepo: "eersnington/stateful-ci",
-          ref: "refs/pull/12/merge",
-        },
-        github: { ...restoreRequest.github, event: "pull_request" },
-      })
-    ).toBe("internal");
-  });
-
-  it("classifies fork pull requests as external", () => {
-    expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: {
-          ...restoreRequest.git,
-          baseRef: "main",
-          headRef: "feature",
-          headRepo: "contributor/stateful-ci",
-          ref: "refs/pull/12/merge",
-        },
-        github: { ...restoreRequest.github, event: "pull_request" },
+      classifyVerifiedGitHubTrust({
+        ...identity,
+        baseRef: "main",
+        event: "pull_request",
+        headRef: "feature",
+        ref: "refs/pull/12/merge",
+        subject: "repo:eersnington/stateful-ci:pull_request",
       })
     ).toBe("external");
   });
 
-  it("classifies pull_request_target as unknown because it is unsafe for state production", () => {
+  it("classifies pull_request_target and tag pushes as unknown", () => {
     expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: {
-          ...restoreRequest.git,
-          baseRef: "main",
-          headRef: "feature",
-          headRepo: "eersnington/stateful-ci",
-          ref: "refs/heads/main",
-        },
-        github: { ...restoreRequest.github, event: "pull_request_target" },
+      classifyVerifiedGitHubTrust({
+        ...identity,
+        event: "pull_request_target",
+      })
+    ).toBe("unknown");
+    expect(
+      classifyVerifiedGitHubTrust({
+        ...identity,
+        ref: "refs/tags/v1.0.0",
+        refType: "tag",
       })
     ).toBe("unknown");
   });
 
-  it("classifies release events on tag refs as privileged", () => {
+  it("classifies releases and deployments as privileged", () => {
     expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: { ...restoreRequest.git, ref: "refs/tags/v1.0.0" },
-        github: { ...restoreRequest.github, event: "release" },
+      classifyVerifiedGitHubTrust({
+        ...identity,
+        event: "release",
+        ref: "refs/tags/v1.0.0",
+        refType: "tag",
       })
+    ).toBe("privileged");
+    expect(
+      classifyVerifiedGitHubTrust({ ...identity, event: "deployment" })
     ).toBe("privileged");
   });
 
-  it("classifies tag refs without release events as unknown", () => {
-    expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: { ...restoreRequest.git, ref: "refs/tags/v1.0.0" },
-      })
-    ).toBe("unknown");
-  });
-
-  it("classifies release events without tag refs as unknown", () => {
-    expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        github: { ...restoreRequest.github, event: "release" },
-      })
-    ).toBe("unknown");
-  });
-
-  it("classifies pull requests with tag refs as unknown", () => {
-    expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: {
-          ...restoreRequest.git,
-          baseRef: "main",
-          headRef: "feature",
-          headRepo: "contributor/stateful-ci",
-          ref: "refs/tags/v1.0.0",
-        },
-        github: { ...restoreRequest.github, event: "pull_request" },
-      })
-    ).toBe("unknown");
-  });
-
-  it("classifies incomplete pull request metadata as unknown", () => {
-    expect(
-      classifyRunTrust({
-        ...restoreRequest,
-        git: {
-          ...restoreRequest.git,
-          baseRef: "main",
-          headRef: "feature",
-          headRepo: null,
-          ref: "refs/pull/12/merge",
-        },
-        github: { ...restoreRequest.github, event: "pull_request" },
-      })
-    ).toBe("unknown");
+  it("classifies incomplete identities as unknown", () => {
+    expect(classifyVerifiedGitHubTrust({ ...identity, event: "" })).toBe(
+      "unknown"
+    );
+    expect(classifyVerifiedGitHubTrust({ ...identity, repository: "" })).toBe(
+      "unknown"
+    );
   });
 });

@@ -145,6 +145,7 @@ describe("D1 metadata backend contract", () => {
     const restarted = createD1MetadataBackend(env.STATEFUL_CI_METADATA);
 
     await Effect.runPromise(metadata.putSnapshotHeader(snapshotHeader));
+    await Effect.runPromise(metadata.putSnapshotHeader(snapshotHeader));
 
     await expect(
       Effect.runPromise(restarted.getSnapshotHeader(snapshotId))
@@ -192,6 +193,7 @@ describe("D1 metadata backend contract", () => {
     ] as const;
 
     await Effect.runPromise(metadata.putSnapshotObjects(snapshotId, objects));
+    await Effect.runPromise(metadata.putSnapshotObjects(snapshotId, objects));
 
     const rows = await Effect.runPromise(
       metadata.getSnapshotObjects(snapshotId)
@@ -210,6 +212,41 @@ describe("D1 metadata backend contract", () => {
       "object_kind",
       "size",
       "snapshot_id",
+    ]);
+  });
+
+  it("completes snapshot object writes after partial retry state", async () => {
+    const metadata = createD1MetadataBackend(env.STATEFUL_CI_METADATA);
+    const manifestOnly = [
+      { digest: manifestDigest, key: manifestKey, kind: "manifest", size: 8 },
+    ] as const;
+    const full = [
+      ...manifestOnly,
+      { digest: packDigest, key: packKey, kind: "pack", size: 16 },
+    ] as const;
+
+    await Effect.runPromise(
+      metadata.putSnapshotObjects(snapshotId, manifestOnly)
+    );
+    await Effect.runPromise(metadata.putSnapshotObjects(snapshotId, full));
+
+    await expect(
+      Effect.runPromise(metadata.getSnapshotObjects(snapshotId))
+    ).resolves.toStrictEqual([
+      {
+        digest: manifestDigest,
+        key: manifestKey,
+        kind: "manifest",
+        size: 8,
+        snapshotId,
+      },
+      {
+        digest: packDigest,
+        key: packKey,
+        kind: "pack",
+        size: 16,
+        snapshotId,
+      },
     ]);
   });
 
@@ -246,8 +283,8 @@ describe("D1 metadata backend contract", () => {
 
     await Effect.runPromise(
       metadata.rememberWorkspaceTarget({
-        expiresAt: "2026-05-22T01:00:00.000Z",
         namespace,
+        preparedAt: "2026-05-22T01:00:00.000Z",
         producerActor: "eersnington",
         producerEvent: "push",
         producerJob: "test",
@@ -263,8 +300,8 @@ describe("D1 metadata backend contract", () => {
     );
     await Effect.runPromise(
       metadata.rememberWorkspaceTarget({
-        expiresAt: "2026-05-22T02:00:00.000Z",
         namespace,
+        preparedAt: "2026-05-22T02:00:00.000Z",
         refName,
         runId,
         trustClass: "trusted",
@@ -275,8 +312,8 @@ describe("D1 metadata backend contract", () => {
     await expect(
       Effect.runPromise(metadata.getWorkspaceTarget(workspaceId))
     ).resolves.toMatchObject({
-      expiresAt: "2026-05-22T02:00:00.000Z",
       namespace,
+      preparedAt: "2026-05-22T02:00:00.000Z",
       refName,
       runId,
       trustClass: "trusted",

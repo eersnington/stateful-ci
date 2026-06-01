@@ -139,11 +139,12 @@ const runDeployStep: DeployStepRunner = Effect.fn("runDeployStep")(
         cliFailure(
           `Deploy step failed while running bunx ${input.args.join(" ")}. Stateful CI backend resources may be partially provisioned; fix the reported Cloudflare/Wrangler issue and rerun stateful-ci deploy.${error instanceof Error ? `\nProcess error: ${error.message}` : ""}`
         ),
-      try: async (): Promise<DeployProcessResult> => {
+      try: async (signal): Promise<DeployProcessResult> => {
         const stdoutChunks: Uint8Array[] = [];
         const stderrChunks: Uint8Array[] = [];
         const child = spawn("bunx", [...input.args], {
           cwd: repositoryRootDirectory,
+          signal,
           stdio: "pipe",
         });
 
@@ -340,8 +341,7 @@ export const deployProgramWithRunner = (
       databaseId,
       devAuthEnabled:
         optionalEnv(env, "DEV_AUTH_ENABLED") ??
-        optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED") ??
-        optionalEnv(env, "STATEFUL_CI_DEV_AUTH"),
+        optionalEnv(env, "STATEFUL_CI_DEV_AUTH_ENABLED"),
       oidcAudience:
         optionalEnv(env, "OIDC_AUDIENCE") ??
         optionalEnv(env, "STATEFUL_CI_OIDC_AUDIENCE") ??

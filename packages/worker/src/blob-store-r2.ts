@@ -1,9 +1,9 @@
 import type { SnapshotObjectKey } from "@stateful-ci/core";
+import { sha256HexFromDigest } from "@stateful-ci/core";
 import { Effect } from "effect";
 
-import { BlobStore, unsupportedPresign } from "./blob-store";
+import { BlobStore } from "./blob-store";
 import { BlobStoreError } from "./blob-store-error";
-import { sha256BytesEffect } from "./object-hash";
 
 export interface R2BlobStoreBucket {
   readonly get: (
@@ -23,20 +23,6 @@ export interface R2BlobStoreBucket {
     options?: R2PutOptions
   ) => Promise<R2Object | null>;
 }
-
-const sameBytes = (left: Uint8Array, right: Uint8Array) => {
-  if (left.byteLength !== right.byteLength) {
-    return false;
-  }
-
-  for (let index = 0; index < left.byteLength; index += 1) {
-    if (left[index] !== right[index]) {
-      return false;
-    }
-  }
-
-  return true;
-};
 
 const missingObject = (key: SnapshotObjectKey) =>
   new BlobStoreError({
@@ -65,44 +51,7 @@ export const createR2BlobStore = (
           return yield* missingObject(key);
         }
 
-        return yield* Effect.tryPromise({
-          catch: () =>
-            new BlobStoreError({
-              key,
-              message: `Could not read snapshot object ${key} bytes from R2. Check the bucket binding and retry.`,
-              reason: "io_failed",
-            }),
-          try: async () => new Uint8Array(await object.arrayBuffer()),
-        });
-      }),
-    getRange: (key, offset, length) =>
-      Effect.gen(function* getRangeEffect() {
-        const object = yield* Effect.tryPromise({
-          catch: () =>
-            new BlobStoreError({
-              key,
-              message: `Could not read byte range ${offset}-${offset + length - 1} for snapshot object ${key} from R2.`,
-              reason: "io_failed",
-            }),
-          try: () =>
-            bucket.get(key, {
-              range: { length, offset },
-            }),
-        });
-
-        if (object === null) {
-          return yield* missingObject(key);
-        }
-
-        return yield* Effect.tryPromise({
-          catch: () =>
-            new BlobStoreError({
-              key,
-              message: `Could not read byte range ${offset}-${offset + length - 1} for snapshot object ${key} bytes from R2.`,
-              reason: "io_failed",
-            }),
-          try: async () => new Uint8Array(await object.arrayBuffer()),
-        });
+        return { body: object.body, size: object.size };
       }),
     head: (key) =>
       Effect.tryPromise({
@@ -115,31 +64,11 @@ export const createR2BlobStore = (
         try: async () => {
           const object = await bucket.head(key);
 
-          return object === null ? null : { key, size: object.size };
+          return object === null ? null : { size: object.size };
         },
       }),
-    presignGet: (key) => unsupportedPresign(key),
-    presignPut: (key) => unsupportedPresign(key),
     putIfAbsent: (input) =>
       Effect.gen(function* putIfAbsentEffect() {
-        if (input.body.byteLength !== input.expectedSize) {
-          return yield* new BlobStoreError({
-            key: input.key,
-            message: `Snapshot object ${input.key} upload size was ${input.body.byteLength}, but the backend expected ${input.expectedSize}.`,
-            reason: "size_mismatch",
-          });
-        }
-
-        const digest = yield* sha256BytesEffect(input.body);
-
-        if (digest !== input.expectedDigest) {
-          return yield* new BlobStoreError({
-            key: input.key,
-            message: `Snapshot object ${input.key} upload digest did not match the expected digest. The object was not stored.`,
-            reason: "digest_mismatch",
-          });
-        }
-
         const inserted = yield* Effect.tryPromise({
           catch: () =>
             new BlobStoreError({
@@ -150,11 +79,20 @@ export const createR2BlobStore = (
           try: () =>
             bucket.put(input.key, input.body, {
               onlyIf: new Headers({ "If-None-Match": "*" }),
+              sha256: sha256HexFromDigest(input.expectedDigest),
             }),
         });
 
         if (inserted !== null) {
-          return { status: "inserted" as const };
+          if (inserted.size !== input.expectedSize) {
+            return yield* new BlobStoreError({
+              key: input.key,
+              message: `Snapshot object ${input.key} upload stored ${inserted.size} bytes, but the backend expected ${input.expectedSize}.`,
+              reason: "size_mismatch",
+            });
+          }
+
+          return;
         }
 
         const existing = yield* Effect.tryPromise({
@@ -181,14 +119,25 @@ export const createR2BlobStore = (
           });
         }
 
-        if (!sameBytes(existing, input.body)) {
-          return yield* new BlobStoreError({
-            key: input.key,
-            message: `Snapshot object ${input.key} already exists in R2 with different bytes. Immutable snapshot objects cannot be overwritten.`,
-            reason: "conflict",
-          });
+        const conflict = new BlobStoreError({
+          key: input.key,
+          message: `Snapshot object ${input.key} already exists with different bytes. Immutable snapshot objects cannot be overwritten.`,
+          reason: "conflict",
+        });
+
+        if (existing.byteLength !== input.expectedSize) {
+          return yield* conflict;
         }
 
-        return { status: "already-present" as const };
+        const digestBytes = yield* Effect.promise(() =>
+          crypto.subtle.digest("SHA-256", existing)
+        );
+        const digest = [...new Uint8Array(digestBytes)]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("");
+
+        if (digest !== sha256HexFromDigest(input.expectedDigest)) {
+          return yield* conflict;
+        }
       }),
   });

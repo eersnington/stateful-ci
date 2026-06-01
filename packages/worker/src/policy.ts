@@ -42,13 +42,9 @@ export const evaluateRestorePolicy = (input: {
       : { allowed: false, reason: "restore_policy_denied" };
   }
 
-  if (producer.trustClass === "privileged") {
-    return consumer.trustClass === "privileged" && sameScope(producer, consumer)
-      ? { allowed: true }
-      : { allowed: false, reason: "restore_policy_denied" };
-  }
-
-  return { allowed: false, reason: "restore_policy_denied" };
+  return consumer.trustClass === "privileged" && sameScope(producer, consumer)
+    ? { allowed: true }
+    : { allowed: false, reason: "restore_policy_denied" };
 };
 
 export const evaluateSavePolicy = (target: PolicyScope): SavePolicyDecision => {

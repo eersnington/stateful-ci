@@ -11,7 +11,7 @@ import { restoreWorkspaceSnapshot } from "../snapshot-engine";
 import { cliFailure, failCliFailure } from "./failure";
 import {
   apiConfigFromEnv,
-  githubOidcIdentityFromEnv,
+  githubOidcIdentityFromEnvOptional,
   restoreRequestFromEnv,
 } from "./github-actions";
 import type { RuntimeEnv } from "./github-actions";
@@ -35,10 +35,8 @@ const restoreProgramEffect = Effect.fn("restoreProgram")(
     const loaded = yield* loadConfig(workspaceRoot);
     const api = yield* apiConfigFromEnv(env);
     const context = yield* restoreRequestFromEnv(env, loaded);
-    const request = {
-      ...context,
-      identity: yield* githubOidcIdentityFromEnv(env),
-    };
+    const identity = yield* githubOidcIdentityFromEnvOptional(env);
+    const request = identity === null ? context : { ...context, identity };
 
     yield* clearRestoreSession(workspaceRoot);
 

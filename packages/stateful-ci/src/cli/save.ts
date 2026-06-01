@@ -18,7 +18,7 @@ import { createWorkspaceSnapshot } from "../snapshot-engine";
 import { cliFailure, failCliFailure } from "./failure";
 import {
   apiConfigFromEnv,
-  githubOidcIdentityFromEnv,
+  githubOidcIdentityFromEnvOptional,
   restoreRequestFromEnv,
 } from "./github-actions";
 import type { RuntimeEnv } from "./github-actions";
@@ -121,8 +121,8 @@ const printSaveResponse = (
  * Runs the two-phase save protocol.
  *
  * The GitHub OIDC identity is intentionally resolved separately for prepare and
- * commit. `/v1/save/prepare` uses the first identity to authorize the save plan
- * and return any required object uploads. `/v1/save/commit` uses an identity
+ * commit. `/v1/prepare` uses the first identity to authorize the save plan
+ * and return any required object uploads. `/v1/commit` uses an identity
  * resolved after uploads to authorize the final metadata mutation and re-check
  * the GitHub run context.
  *
@@ -142,10 +142,11 @@ export const saveProgram = (env: RuntimeEnv) =>
       loaded,
       session
     );
-    const prepareRequest = {
-      ...localPrepareRequest,
-      identity: yield* githubOidcIdentityFromEnv(env),
-    };
+    const prepareIdentity = yield* githubOidcIdentityFromEnvOptional(env);
+    const prepareRequest =
+      prepareIdentity === null
+        ? localPrepareRequest
+        : { ...localPrepareRequest, identity: prepareIdentity };
     const prepareResponseText = yield* postProtocol(
       api,
       routes.prepareSave.path,
@@ -167,17 +168,18 @@ export const saveProgram = (env: RuntimeEnv) =>
       yield* uploadPlannedObject(api, plan, workspaceRoot);
     }
 
+    const commitIdentity = yield* githubOidcIdentityFromEnvOptional(env);
     const commitRequest = {
       baseSnapshotId: prepareResponse.baseSnapshotId,
       expectedHeadGeneration: prepareResponse.expectedHeadGeneration,
       idempotencyKey: prepareRequest.idempotencyKey,
-      identity: yield* githubOidcIdentityFromEnv(env),
       manifest: prepareRequest.manifest,
       objects: prepareRequest.objects,
       protocolVersion,
       runId: context.github.runId,
       target: prepareResponse.commitTarget,
       workspaceId: prepareResponse.workspaceId,
+      ...(commitIdentity === null ? {} : { identity: commitIdentity }),
     };
     const decodedCommitRequest =
       Schema.decodeUnknownExit(CommitSaveRequest)(commitRequest);

@@ -11,7 +11,6 @@ export class BlobStoreError extends Schema.TaggedErrorClass<BlobStoreError>()(
       "io_failed",
       "missing",
       "size_mismatch",
-      "unsupported",
     ]),
   }
 ) {}
