@@ -416,9 +416,10 @@ layer(TestLayer)("stateful-ci CLI", (it) => {
             (url) =>
               restoreProgram({
                 ...githubEnv,
+                DEV_AUTH_ENABLED: "true",
                 STATEFUL_CI_API_TOKEN: "test-token",
                 STATEFUL_CI_API_URL: url,
-                STATEFUL_CI_DEV_AUTH_ENABLED: "true",
+                STATEFUL_CI_DEV_AUTH_ENABLED: "false",
                 STATEFUL_CI_OIDC_TOKEN: undefined,
               })
           );

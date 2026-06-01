@@ -331,6 +331,71 @@ describe("snapshot coordinator", () => {
   );
 
   it.effect(
+    "rejects idempotent replay when producer metadata does not match the request",
+    () =>
+      Effect.gen(function* coordinatorRejectsMismatchedProducerReplayEffect() {
+        const metadata = createInMemoryMetadataBackend({
+          workspaceTargets: [testWorkspaceTarget],
+        });
+        const coordinator = createMetadataSnapshotCoordinator();
+
+        yield* coordinator
+          .commitSave(commitInput)
+          .pipe(Effect.provideService(MetadataBackend, metadata));
+
+        const replay = yield* coordinator
+          .commitSave({
+            ...commitInput,
+            producer: { ...commitInput.producer, actor: "mallory" },
+          })
+          .pipe(Effect.provideService(MetadataBackend, metadata));
+
+        assert.deepStrictEqual(replay, {
+          decision: "denied",
+          reason: "idempotency_conflict",
+        });
+      })
+  );
+
+  it.effect(
+    "rejects conflicting existing snapshot objects before idempotency is reserved",
+    () =>
+      Effect.gen(
+        function* coordinatorRejectsConflictingExistingObjectsEffect() {
+          const otherDigest = Schema.decodeSync(Sha256Digest)(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          );
+          const metadata = createInMemoryMetadataBackend({
+            snapshotObjects: [
+              {
+                digest: otherDigest,
+                key: manifestKey,
+                kind: "manifest",
+                size: 8,
+                snapshotId: commitInput.manifest.snapshotId,
+              },
+            ],
+            snapshots: [retryHeader],
+            workspaceTargets: [testWorkspaceTarget],
+          });
+          const coordinator = createMetadataSnapshotCoordinator();
+          const result = yield* coordinator
+            .commitSave(commitInput)
+            .pipe(Effect.provideService(MetadataBackend, metadata));
+          const idempotency = yield* metadata.getIdempotentCommit(
+            commitInput.idempotencyKey
+          );
+
+          assert.deepStrictEqual(result, {
+            decision: "denied",
+            reason: "invalid_protocol_payload",
+          });
+          assert.strictEqual(idempotency, null);
+        }
+      )
+  );
+
+  it.effect(
     "does not persist idempotency before snapshot metadata succeeds",
     () =>
       Effect.gen(function* coordinatorDoesNotPoisonIdempotencyEffect() {

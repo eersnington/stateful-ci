@@ -369,7 +369,7 @@ export const snapshotObjectsMatch = (
   });
 };
 
-const snapshotObjectConflict = (
+export const snapshotObjectConflict = (
   existing: readonly SnapshotObjectRow[],
   desired: readonly SnapshotObjectRow[]
 ) => {
