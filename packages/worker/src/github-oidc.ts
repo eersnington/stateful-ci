@@ -59,6 +59,11 @@ export const GitHubJwks = Schema.Struct({
   keys: Schema.Array(GitHubJwk),
 });
 
+const IdentityAuditPayload = Schema.Struct({
+  identity: Schema.NullOr(VerifiedGitHubActionsIdentitySchema),
+  reason: Schema.NullOr(DenialReasonSchema),
+});
+
 type JwtHeader = Schema.Schema.Type<typeof JwtHeader>;
 type GitHubOidcClaims = Schema.Schema.Type<typeof GitHubOidcClaims>;
 export type GitHubJwk = Schema.Schema.Type<typeof GitHubJwk>;
@@ -120,14 +125,16 @@ const decodeJsonSegment = <A>(
 ) =>
   Effect.gen(function* decodeJsonSegmentEffect() {
     const bytes = yield* base64UrlToBytes(source, segment);
-    const json = yield* Effect.try({
-      catch: () =>
+    const json = yield* Schema.decodeUnknownEffect(
+      Schema.UnknownFromJsonString
+    )(new TextDecoder().decode(bytes)).pipe(
+      Effect.mapError(() =>
         oidcError(
           "oidc_invalid",
           `GitHub OIDC token ${segment} is not valid JSON. Restore/save was denied because identity could not be verified.`
-        ),
-      try: () => JSON.parse(new TextDecoder().decode(bytes)),
-    });
+        )
+      )
+    );
     const decoded = Schema.decodeUnknownExit(schema)(json);
 
     return Exit.isFailure(decoded)
@@ -194,8 +201,8 @@ const fetchJwks = (jwksUrl: string) =>
           "oidc_invalid",
           "Could not fetch GitHub OIDC signing keys. Restore/save was denied because identity signatures could not be verified."
         ),
-      try: async () => {
-        const response = await fetch(jwksUrl);
+      try: async (signal) => {
+        const response = await fetch(jwksUrl, { signal });
 
         if (!response.ok) {
           throw new Error(`GitHub JWKS returned HTTP ${response.status}.`);
@@ -432,7 +439,7 @@ export const identityAuditPayload = (
   identity: VerifiedGitHubActionsIdentity | null,
   reason: DenialReason | null
 ) =>
-  JSON.stringify({
+  Schema.encodeUnknownSync(Schema.fromJsonString(IdentityAuditPayload))({
     identity,
     reason,
   });

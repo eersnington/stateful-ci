@@ -139,11 +139,12 @@ const runDeployStep: DeployStepRunner = Effect.fn("runDeployStep")(
         cliFailure(
           `Deploy step failed while running bunx ${input.args.join(" ")}. Stateful CI backend resources may be partially provisioned; fix the reported Cloudflare/Wrangler issue and rerun stateful-ci deploy.${error instanceof Error ? `\nProcess error: ${error.message}` : ""}`
         ),
-      try: async (): Promise<DeployProcessResult> => {
+      try: async (signal): Promise<DeployProcessResult> => {
         const stdoutChunks: Uint8Array[] = [];
         const stderrChunks: Uint8Array[] = [];
         const child = spawn("bunx", [...input.args], {
           cwd: repositoryRootDirectory,
+          signal,
           stdio: "pipe",
         });
 

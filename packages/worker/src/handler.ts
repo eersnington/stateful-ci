@@ -260,5 +260,6 @@ export const handleFetch = (
         onFailure: errorResponse,
         onSuccess: (response) => response,
       })
-    )
+    ),
+    { signal: request.signal }
   );

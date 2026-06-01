@@ -38,7 +38,7 @@ export const downloadPlannedObject = Effect.fn("downloadPlannedObject")(
         cliFailure(
           `Could not download backend-authorized snapshot object ${plan.object.key}. Restore did not mutate the workspace.`
         ),
-      try: () => fetch(url, { headers, method: "GET" }),
+      try: (signal) => fetch(url, { headers, method: "GET", signal }),
     });
 
     if (!response.ok) {
@@ -108,7 +108,8 @@ export const uploadPlannedObject = Effect.fn("uploadPlannedObject")(
         cliFailure(
           `Could not upload backend-requested snapshot object ${plan.object.key}. Save did not commit metadata.`
         ),
-      try: () => fetch(url, { body: bytes, headers, method: "PUT" }),
+      try: (signal) =>
+        fetch(url, { body: bytes, headers, method: "PUT", signal }),
     });
 
     if (!response.ok) {

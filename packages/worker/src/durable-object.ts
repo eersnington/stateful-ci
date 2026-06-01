@@ -115,6 +115,7 @@ const CoordinatorRequestSchema = Schema.Union([
 ]);
 
 type CoordinatorRequest = Schema.Schema.Type<typeof CoordinatorRequestSchema>;
+const CoordinatorRequestJson = Schema.fromJsonString(CoordinatorRequestSchema);
 
 interface CoordinatorRequestError {
   readonly _tag: "CoordinatorRequestError";
@@ -144,13 +145,20 @@ const coordinatorError = (operation: string, cause: unknown) =>
 const readCoordinatorRequest = (request: Request) =>
   Effect.tryPromise({
     catch: (cause) => coordinatorRequestError("readCoordinatorRequest", cause),
-    try: () => request.json(),
+    try: async (signal) => {
+      const text = await request.text();
+      if (signal.aborted) {
+        throw new DOMException("Request was aborted.", "AbortError");
+      }
+
+      return text;
+    },
   }).pipe(
-    Effect.flatMap((body) =>
+    Effect.flatMap((source) =>
       Effect.try({
         catch: (cause) =>
           coordinatorRequestError("decodeCoordinatorRequest", cause),
-        try: () => Schema.decodeUnknownSync(CoordinatorRequestSchema)(body),
+        try: () => Schema.decodeUnknownSync(CoordinatorRequestJson)(source),
       })
     )
   );
@@ -204,6 +212,14 @@ const PrepareSaveCoordinatorResultSchema = Schema.Union([
     reason: RestoreObjectDenialInputSchema.fields.reason,
   }),
 ]);
+const RestoreCoordinatorResultJson = Schema.fromJsonString(
+  RestoreCoordinatorResultSchema
+);
+const PrepareSaveCoordinatorResultJson = Schema.fromJsonString(
+  PrepareSaveCoordinatorResultSchema
+);
+const CommitSaveResponseJson = Schema.fromJsonString(CommitSaveResponseSchema);
+const VoidResponseJson = Schema.fromJsonString(VoidResponseSchema);
 
 export class WorkspaceSnapshotCoordinatorDurableObject {
   readonly #env: DurableObjectEnv;
@@ -284,7 +300,8 @@ export class WorkspaceSnapshotCoordinatorDurableObject {
                 : Response.json(error, { status: 500 }),
             onSuccess: (response) => response,
           })
-        )
+        ),
+        { signal: request.signal }
       )
     );
   }
@@ -294,20 +311,21 @@ const callCoordinator = <A>(
   namespace: DurableObjectNamespace,
   target: { readonly namespace: string; readonly refName: string },
   message: CoordinatorRequest,
-  decode: (body: unknown) => A
+  decode: (source: string) => A
 ) =>
   Effect.tryPromise({
     catch: (cause) => coordinatorError(message.action, cause),
-    try: async () => {
+    try: async (signal) => {
       const id = namespace.idFromName(`${target.namespace}\n${target.refName}`);
       const response = await namespace
         .get(id)
         .fetch("https://stateful-ci.internal/", {
-          body: JSON.stringify(message),
+          body: Schema.encodeUnknownSync(CoordinatorRequestJson)(message),
           method: "POST",
+          signal,
         });
 
-      const body = await response.json();
+      const body = await response.text();
 
       if (!response.ok) {
         throw body;
@@ -326,14 +344,14 @@ export const createDurableObjectSnapshotCoordinator = (
         namespace,
         input.target,
         { action: "authorizeRestore", input },
-        (body) => Schema.decodeUnknownSync(RestoreCoordinatorResultSchema)(body)
+        (body) => Schema.decodeUnknownSync(RestoreCoordinatorResultJson)(body)
       ),
     commitSave: (input) =>
       callCoordinator(
         namespace,
         input.target,
         { action: "commitSave", input },
-        (body) => Schema.decodeUnknownSync(CommitSaveResponseSchema)(body)
+        (body) => Schema.decodeUnknownSync(CommitSaveResponseJson)(body)
       ),
     prepareSave: (input) =>
       callCoordinator(
@@ -341,7 +359,7 @@ export const createDurableObjectSnapshotCoordinator = (
         input.target,
         { action: "prepareSave", input },
         (body) =>
-          Schema.decodeUnknownSync(PrepareSaveCoordinatorResultSchema)(body)
+          Schema.decodeUnknownSync(PrepareSaveCoordinatorResultJson)(body)
       ),
     recordRestoreAllowed: (input) =>
       callCoordinator(
@@ -349,7 +367,7 @@ export const createDurableObjectSnapshotCoordinator = (
         input.target,
         { action: "recordRestoreAllowed", input },
         (body) => {
-          Schema.decodeUnknownSync(VoidResponseSchema)(body);
+          Schema.decodeUnknownSync(VoidResponseJson)(body);
         }
       ),
     recordRestoreObjectDenial: (input) =>
@@ -358,7 +376,7 @@ export const createDurableObjectSnapshotCoordinator = (
         input.target,
         { action: "recordRestoreObjectDenial", input },
         (body) => {
-          Schema.decodeUnknownSync(VoidResponseSchema)(body);
+          Schema.decodeUnknownSync(VoidResponseJson)(body);
         }
       ),
   });

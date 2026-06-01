@@ -112,9 +112,10 @@ export const oidcTokenFromEnv = Effect.fn("oidcTokenFromEnv")(
         cliFailure(
           "Could not acquire a GitHub Actions OIDC token. Restore/save did not contact the backend; check id-token: write permissions and retry."
         ),
-      try: () =>
+      try: (signal) =>
         fetch(url, {
           headers: { authorization: `Bearer ${requestToken}` },
+          signal,
         }),
     });
 

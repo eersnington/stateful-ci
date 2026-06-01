@@ -53,47 +53,57 @@ export const createInMemoryBlobStore = (
     },
     putIfAbsent: (input) =>
       Effect.gen(function* putIfAbsentEffect() {
-        const reader = input.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let byteLength = 0;
+        const uploadBody = yield* Effect.scoped(
+          Effect.gen(function* readObjectBodyEffect() {
+            const bodyReader = yield* Effect.acquireRelease(
+              Effect.sync(() => input.body.getReader()),
+              (activeReader) =>
+                Effect.promise(() => activeReader.cancel()).pipe(Effect.orDie)
+            );
+            const chunks: Uint8Array[] = [];
+            let byteLength = 0;
 
-        for (;;) {
-          const chunk = yield* Effect.tryPromise({
-            catch: () =>
-              new BlobStoreError({
-                key: input.key,
-                message: `Could not read snapshot object ${input.key} stream. The object was not stored.`,
-                reason: "io_failed",
-              }),
-            try: () => reader.read(),
-          });
+            for (;;) {
+              const chunk = yield* Effect.tryPromise({
+                catch: () =>
+                  new BlobStoreError({
+                    key: input.key,
+                    message: `Could not read snapshot object ${input.key} stream. The object was not stored.`,
+                    reason: "io_failed",
+                  }),
+                try: () => bodyReader.read(),
+              });
 
-          if (chunk.done) {
-            break;
-          }
+              if (chunk.done) {
+                break;
+              }
 
-          byteLength += chunk.value.byteLength;
-          chunks.push(chunk.value);
-        }
+              byteLength += chunk.value.byteLength;
+              chunks.push(chunk.value);
+            }
 
-        const body = new Uint8Array(byteLength);
-        let offset = 0;
+            const bytes = new Uint8Array(byteLength);
+            let offset = 0;
 
-        for (const chunk of chunks) {
-          body.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
+            for (const chunk of chunks) {
+              bytes.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
 
-        if (body.byteLength !== input.expectedSize) {
+            return bytes;
+          })
+        );
+
+        if (uploadBody.byteLength !== input.expectedSize) {
           return yield* new BlobStoreError({
             key: input.key,
-            message: `Snapshot object ${input.key} upload size was ${body.byteLength}, but the backend expected ${input.expectedSize}.`,
+            message: `Snapshot object ${input.key} upload size was ${uploadBody.byteLength}, but the backend expected ${input.expectedSize}.`,
             reason: "size_mismatch",
           });
         }
 
         const digestBytes = yield* Effect.promise(() =>
-          crypto.subtle.digest("SHA-256", body)
+          crypto.subtle.digest("SHA-256", uploadBody)
         );
         const digest = `sha256:${[...new Uint8Array(digestBytes)]
           .map((byte) => byte.toString(16).padStart(2, "0"))
@@ -111,12 +121,12 @@ export const createInMemoryBlobStore = (
 
         if (existing !== undefined) {
           return yield* validateExistingObjectBytes(
-            { body, key: input.key },
+            { body: uploadBody, key: input.key },
             existing
           );
         }
 
-        objects.set(input.key, new Uint8Array(body));
+        objects.set(input.key, new Uint8Array(uploadBody));
       }),
   });
 };

@@ -25,73 +25,85 @@ export const decodeProtocolRequest = Effect.fn("decodeProtocolRequest")(
       });
     }
 
-    const reader = request.body?.getReader();
-    const chunks: Uint8Array[] = [];
-    let byteLength = 0;
+    const requestReader = request.body?.getReader();
 
-    if (reader === undefined) {
+    if (requestReader === undefined) {
       return yield* new InvalidJsonBody({
         message:
           "The request body was not valid JSON. Send a JSON object that matches Stateful CI protocol v1.",
       });
     }
 
-    for (;;) {
-      const chunk = yield* Effect.tryPromise({
-        catch: () =>
-          new InvalidJsonBody({
+    const decodedPayload = yield* Effect.scoped(
+      Effect.gen(function* readProtocolRequestBodyEffect() {
+        const bodyReader = yield* Effect.acquireRelease(
+          Effect.succeed(requestReader),
+          (activeReader) =>
+            Effect.promise(() => activeReader.cancel()).pipe(Effect.orDie)
+        );
+        const chunks: Uint8Array[] = [];
+        let byteLength = 0;
+
+        for (;;) {
+          const chunk = yield* Effect.tryPromise({
+            catch: () =>
+              new InvalidJsonBody({
+                message:
+                  "The request body was not valid JSON. Send a JSON object that matches Stateful CI protocol v1.",
+              }),
+            try: () => bodyReader.read(),
+          });
+
+          if (chunk.done) {
+            break;
+          }
+
+          byteLength += chunk.value.byteLength;
+
+          if (byteLength > maxProtocolBodyBytes) {
+            return yield* new RequestBodyTooLarge({
+              limitBytes: maxProtocolBodyBytes,
+              message:
+                "The request body exceeded the Stateful CI protocol limit. Restore/save requests are metadata-only; upload snapshot bytes through the object-store data plane.",
+            });
+          }
+
+          chunks.push(chunk.value);
+        }
+
+        const bytes = new Uint8Array(byteLength);
+        let offset = 0;
+
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+
+        const source = new TextDecoder().decode(bytes);
+        const decoded = Schema.decodeUnknownExit(Schema.UnknownFromJsonString)(
+          source
+        );
+
+        if (Exit.isFailure(decoded)) {
+          return yield* new InvalidJsonBody({
             message:
               "The request body was not valid JSON. Send a JSON object that matches Stateful CI protocol v1.",
-          }),
-        try: () => reader.read(),
-      });
+          });
+        }
 
-      if (chunk.done) {
-        break;
-      }
+        const decodedSchema = Schema.decodeUnknownExit(schema)(decoded.value);
 
-      byteLength += chunk.value.byteLength;
+        if (Exit.isFailure(decodedSchema)) {
+          return yield* new InvalidProtocolPayload({
+            message:
+              "The request body was valid JSON but did not match Stateful CI protocol v1. Check the client version and request payload.",
+          });
+        }
 
-      if (byteLength > maxProtocolBodyBytes) {
-        return yield* new RequestBodyTooLarge({
-          limitBytes: maxProtocolBodyBytes,
-          message:
-            "The request body exceeded the Stateful CI protocol limit. Restore/save requests are metadata-only; upload snapshot bytes through the object-store data plane.",
-        });
-      }
-
-      chunks.push(chunk.value);
-    }
-
-    const bytes = new Uint8Array(byteLength);
-    let offset = 0;
-
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-
-    const source = new TextDecoder().decode(bytes);
-    const decoded = Schema.decodeUnknownExit(Schema.UnknownFromJsonString)(
-      source
+        return decodedSchema.value;
+      })
     );
 
-    if (Exit.isFailure(decoded)) {
-      return yield* new InvalidJsonBody({
-        message:
-          "The request body was not valid JSON. Send a JSON object that matches Stateful CI protocol v1.",
-      });
-    }
-
-    const payload = Schema.decodeUnknownExit(schema)(decoded.value);
-
-    if (Exit.isFailure(payload)) {
-      return yield* new InvalidProtocolPayload({
-        message:
-          "The request body was valid JSON but did not match Stateful CI protocol v1. Check the client version and request payload.",
-      });
-    }
-
-    return payload.value;
+    return decodedPayload;
   }
 );

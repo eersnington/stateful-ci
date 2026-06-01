@@ -36,11 +36,12 @@ export const postProtocol = Effect.fn("postProtocol")(
         cliFailure(
           `Could not reach Stateful CI backend at ${api.url.href}. Check STATEFUL_CI_API_URL and network access.`
         ),
-      try: () =>
+      try: (signal) =>
         fetch(new URL(route, api.url), {
           body,
           headers,
           method: "POST",
+          signal,
         }),
     });
 

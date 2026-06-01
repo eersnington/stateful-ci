@@ -484,13 +484,11 @@ export const createInMemoryMetadataBackend = (
             return;
           }
 
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "In-memory metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotHeader",
-            })
-          );
+          return yield* new MetadataBackendError({
+            message:
+              "In-memory metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+            operation: "putSnapshotHeader",
+          });
         }
 
         snapshots.set(header.snapshotId, header);
@@ -501,13 +499,11 @@ export const createInMemoryMetadataBackend = (
         const existing = snapshotObjects.get(snapshotId) ?? [];
 
         if (snapshotObjectConflict(existing, desired)) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "In-memory metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotObjects",
-            })
-          );
+          return yield* new MetadataBackendError({
+            message:
+              "In-memory metadata write failed during putSnapshotObjects. Snapshot object rows are immutable; choose a new snapshot ID before retrying.",
+            operation: "putSnapshotObjects",
+          });
         }
 
         snapshotObjects.set(snapshotId, desired);
@@ -922,13 +918,11 @@ export const createD1MetadataBackend = (
         );
 
         if (stored === null || !snapshotHeaderMatches(stored, header)) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "D1 metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
-              operation: "putSnapshotHeader",
-            })
-          );
+          return yield* new MetadataBackendError({
+            message:
+              "D1 metadata write failed during putSnapshotHeader. Snapshot IDs are immutable; choose a new snapshot ID before retrying.",
+            operation: "putSnapshotHeader",
+          });
         }
       }),
     putSnapshotObjects: (snapshotId, objects) =>
@@ -975,13 +969,11 @@ export const createD1MetadataBackend = (
         if (
           !snapshotObjectsMatch(finalResult.results.map(objectFromRow), desired)
         ) {
-          return yield* Effect.fail(
-            new MetadataBackendError({
-              message:
-                "D1 metadata write failed during putSnapshotObjects. Snapshot object rows were not fully persisted; retry after checking the D1 binding and migration state.",
-              operation: "putSnapshotObjects",
-            })
-          );
+          return yield* new MetadataBackendError({
+            message:
+              "D1 metadata write failed during putSnapshotObjects. Snapshot object rows were not fully persisted; retry after checking the D1 binding and migration state.",
+            operation: "putSnapshotObjects",
+          });
         }
       }),
     releaseIdempotentCommit: (commit) =>
@@ -1015,7 +1007,9 @@ export const createD1MetadataBackend = (
               commit.manifestDigest,
               commit.headGeneration,
               commit.latest ? 1 : 0,
-              JSON.stringify(commit.result),
+              Schema.encodeUnknownSync(
+                Schema.fromJsonString(CommitSaveResponseSchema)
+              )(commit.result),
               commit.createdAt
             ),
           "rememberIdempotentCommit"
