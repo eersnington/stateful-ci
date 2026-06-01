@@ -435,7 +435,7 @@ export const createMetadataSnapshotCoordinator =
                     },
                     producer: {
                       scopeKey: scopeKeyForRefTarget(candidate),
-                      trustClass: snapshot.trustClass ?? ref.trustClass,
+                      trustClass: snapshot.trustClass,
                     },
                   })
                 : ({

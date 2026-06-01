@@ -293,9 +293,11 @@ const importVerificationKey = (jwk: GitHubJwk) =>
       ),
   });
 
-const normalizeIdentity = (claims: GitHubOidcClaims) => {
-  const decoded = Schema.decodeUnknownExit(VerifiedGitHubActionsIdentitySchema)(
-    {
+const normalizeIdentity = Effect.fn("normalizeIdentity")(
+  function* normalizeIdentityEffect(claims: GitHubOidcClaims) {
+    return yield* Schema.decodeUnknownEffect(
+      VerifiedGitHubActionsIdentitySchema
+    )({
       actor: claims.actor,
       audience: claims.aud,
       baseRef: claims.base_ref ?? null,
@@ -315,11 +317,16 @@ const normalizeIdentity = (claims: GitHubOidcClaims) => {
       subject: claims.sub,
       workflow: claims.workflow,
       workflowRef: claims.workflow_ref ?? null,
-    }
-  );
-
-  return Exit.isFailure(decoded) ? null : decoded.value;
-};
+    }).pipe(
+      Effect.mapError(() =>
+        oidcError(
+          "oidc_invalid",
+          "GitHub OIDC token claims could not be normalized. Restore/save was denied because identity could not be verified."
+        )
+      )
+    );
+  }
+);
 
 export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
   function* verifyGitHubOidcTokenEffect(
@@ -417,14 +424,7 @@ export const verifyGitHubOidcToken = Effect.fn("verifyGitHubOidcToken")(
       );
     }
 
-    const identity = normalizeIdentity(claims);
-
-    return identity === null
-      ? yield* oidcError(
-          "oidc_invalid",
-          "GitHub OIDC token claims could not be normalized. Restore/save was denied because identity could not be verified."
-        )
-      : identity;
+    return yield* normalizeIdentity(claims);
   }
 );
 

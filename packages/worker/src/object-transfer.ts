@@ -44,11 +44,21 @@ const constantTimeEqual = (actual: string, expected: string) => {
     return false;
   }
 
+  const actualView = new DataView(
+    actualBytes.buffer,
+    actualBytes.byteOffset,
+    actualBytes.byteLength
+  );
+  const expectedView = new DataView(
+    expectedBytes.buffer,
+    expectedBytes.byteOffset,
+    expectedBytes.byteLength
+  );
   let difference = 0;
 
   for (let index = 0; index < expectedBytes.byteLength; index += 1) {
     difference += Math.abs(
-      (actualBytes[index] ?? 0) - (expectedBytes[index] ?? 0)
+      actualView.getUint8(index) - expectedView.getUint8(index)
     );
   }
 
@@ -329,13 +339,6 @@ export const handleObjectRoute = Effect.fn("handleObjectRoute")(
     }
 
     if (method === "GET") {
-      if (
-        !devAuthEnabled(env) &&
-        expectedObjectFromHeaders(key, request.headers) === null
-      ) {
-        return invalidObjectUploadPlanResponse(path);
-      }
-
       const object = yield* blobStore.get(key);
 
       return new Response(object.body, {

@@ -257,38 +257,24 @@ export class WorkspaceSnapshotCoordinatorDurableObject {
         Effect.gen(function* coordinatorFetchEffect() {
           const message = yield* readCoordinatorRequest(request);
 
-          switch (message.action) {
-            case "authorizeRestore": {
-              return Response.json(
-                yield* coordinator.authorizeRestore(message.input)
-              );
-            }
-            case "commitSave": {
-              return Response.json(
-                yield* coordinator.commitSave(message.input)
-              );
-            }
-            case "prepareSave": {
-              return Response.json(
-                yield* coordinator.prepareSave(message.input)
-              );
-            }
-            case "recordRestoreAllowed": {
-              yield* coordinator.recordRestoreAllowed(message.input);
-              return Response.json({ ok: true });
-            }
-            case "recordRestoreObjectDenial": {
-              yield* coordinator.recordRestoreObjectDenial(message.input);
-              return Response.json({ ok: true });
-            }
-            default: {
-              const unhandled: never = message;
-              return Response.json(
-                { message: "Unknown coordinator action.", unhandled },
-                { status: 400 }
-              );
-            }
+          if (message.action === "authorizeRestore") {
+            return Response.json(
+              yield* coordinator.authorizeRestore(message.input)
+            );
           }
+          if (message.action === "commitSave") {
+            return Response.json(yield* coordinator.commitSave(message.input));
+          }
+          if (message.action === "prepareSave") {
+            return Response.json(yield* coordinator.prepareSave(message.input));
+          }
+          if (message.action === "recordRestoreAllowed") {
+            yield* coordinator.recordRestoreAllowed(message.input);
+            return Response.json({ ok: true });
+          }
+
+          yield* coordinator.recordRestoreObjectDenial(message.input);
+          return Response.json({ ok: true });
         }).pipe(
           Effect.provideService(MetadataBackend, metadata),
           Effect.match({

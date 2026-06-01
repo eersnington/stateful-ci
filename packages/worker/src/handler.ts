@@ -183,32 +183,17 @@ const handleRequest = (
   );
 };
 
-const apiErrorStatus = (error: ApiErrorType) => {
-  switch (error._tag) {
-    case "InvalidJsonBody":
-    case "InvalidProtocolPayload": {
-      return 400;
-    }
-    case "MethodNotAllowed": {
-      return 405;
-    }
-    case "RequestBodyTooLarge": {
-      return 413;
-    }
-    case "RouteNotFound": {
-      return 404;
-    }
-    case "Unauthorized": {
-      return 401;
-    }
-    case "Forbidden": {
-      return 403;
-    }
-    default: {
-      return 500;
-    }
-  }
-};
+const apiErrorStatuses = {
+  Forbidden: 403,
+  InvalidJsonBody: 400,
+  InvalidProtocolPayload: 400,
+  MethodNotAllowed: 405,
+  RequestBodyTooLarge: 413,
+  RouteNotFound: 404,
+  Unauthorized: 401,
+} satisfies Record<ApiErrorType["_tag"], number>;
+
+const apiErrorStatus = (error: ApiErrorType) => apiErrorStatuses[error._tag];
 
 const apiErrorResponse = (error: ApiErrorType) =>
   error._tag === "MethodNotAllowed"
